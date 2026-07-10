@@ -1,0 +1,36 @@
+* text=auto
+
+# Source and documentation
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.spec text eol=lf
+*.ps1 text eol=crlf
+
+# Binary assets and packaged files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.pyd binary
+*.mp3 binary
+*.m4a binary
+*.aac binary
+*.flac binary
+*.wav binary
+*.ogg binary
+*.opus binary
+*.webm binary
+*.wma binary
+*.zip binary
+*.7z binary
+*.tar binary
+*.gz binary
+*.tgz binary
+*.rar binary

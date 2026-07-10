@@ -1,0 +1,33 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime requirements
+        run: python -m pip install -r requirements.txt
+
+      - name: Verify source
+        run: python -B tools/verify_music_vault.py
+
+      - name: Compile application module
+        run: python -B -m py_compile music_vault/app.py
+
+      - name: Import application module
+        run: python -B -c "import music_vault.app as app; print(app.__file__)"
+
+      - name: Check publication safety
+        run: python -B tools/security/pre_public_commit_check.py

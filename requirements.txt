@@ -1,0 +1,5 @@
+PySide6>=6.7
+mutagen>=1.47
+musicbrainzngs>=0.7.1
+requests>=2.32
+yt-dlp>=2026.1.1

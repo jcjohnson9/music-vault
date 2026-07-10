@@ -1,0 +1,93 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local development tools
+.codex/
+.agents/
+.idea/
+.vscode/
+*.code-workspace
+.pip-cache/
+
+# Build and packaged output
+build/
+dist/
+*.zip
+*.7z
+*.tar
+*.gz
+*.tgz
+*.rar
+
+# Runtime and private data
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Explicit runtime/private paths (defense in depth)
+data/youtube_api_key.txt
+data/music_vault.sqlite3*
+data/music_vault_config.json
+data/music_vault_status.json*
+data/youtube_download_archive.txt
+data/youtube_failed_ids.txt
+data/youtube_downloads/
+data/covers/
+data/artist_images/
+data/metadata_reports/
+data/backups/
+
+# Archived local material
+_archive/
+
+# Databases and sidecars anywhere
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+
+# Audio and downloaded media anywhere
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.wav
+*.ogg
+*.opus
+*.webm
+*.wma
+
+# Local secrets and credentials
+.env
+.env.*
+*.pem
+*.pfx
+*.p12
+*.key
+
+# Runtime logs and temporary files
+*.log
+*.tmp
+*.bak
+*.part
+
+# Windows and macOS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
+*.lnk
