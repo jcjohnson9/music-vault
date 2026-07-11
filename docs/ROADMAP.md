@@ -53,7 +53,7 @@ safe playback preferences and resume state.
 **Non-goals:** No replacement playback engine and no expansion of the manual
 queue into a new queue product.
 
-**Status:** Next.
+**Status:** Complete.
 
 ## Batch 4 — Premium UI System Overhaul
 
@@ -68,7 +68,7 @@ sanitized demo presentation.
 A richer editable queue interface is later work and must preserve the working
 FIFO queue and base-context resume behavior.
 
-**Status:** Planned.
+**Status:** Next.
 
 ## Batch 5 — Album/Artist Performance and Artist Identity
 

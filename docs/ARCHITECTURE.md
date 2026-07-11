@@ -15,6 +15,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/youtube_sync.py` | Public/unlisted API enumeration, authoritative video-ID reconciliation, and anonymous yt-dlp/FFmpeg acquisition. |
 | `music_vault/core/sync_result.py` | Typed synchronization outcome shared by engine, UI, status, logging, and tests. |
 | `music_vault/core/safety.py` | Secret redaction, video-ID extraction, source-date normalization, and safe output paths. |
+| `music_vault/core/playback_state.py` | Pure volume normalization/config filtering and track-ID-to-table-row helpers. |
 | `music_vault/core/paths.py` | Central project, runtime-data, asset, and frozen-application path resolution. |
 | `music_vault/core/app_status.py` | Versioned, read-only-for-consumers neutral App Status JSON export. |
 | `music_vault/core/watchtower_status.py` | Temporary compatibility re-export for the former module name. |
@@ -74,6 +75,16 @@ YouTube and the YouTube Data API provide source-playlist information. yt-dlp
 and FFmpeg handle authorized media processing. MusicBrainz and Cover Art
 Archive can provide metadata and artwork. The application should continue to
 separate these integrations from local library ownership and persistence.
+
+## Playback state boundary
+
+`current_track_id` is the authoritative now-playing identity and remains
+independent from ordinary table selection. Each table rebuild creates a
+database-track-ID-to-row map, allowing the active-row treatment to follow
+automatic, shuffled, queued, next, previous, and error-continuation playback
+without changing pages or queue/base context. Volume is normalized in memory,
+applied consistently to the slider and audio output, and persisted through a
+short debounce with a final close-time flush.
 
 ## Known architectural debt
 

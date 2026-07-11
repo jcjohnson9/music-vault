@@ -25,6 +25,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   retaining the compatibility import shim and existing status filename/schema.
 - Added explicit confirmation and confidence display before MusicBrainz changes.
 - Added synthetic pytest coverage for migrations, sync truth, safety, and identity.
+- Persisted normalized 0–100 volume settings with immediate audio updates,
+  debounced config writes, and close-time flushing.
+- Separated authoritative now-playing track identity from ordinary table
+  selection and restored the active-row treatment through track-ID-based view
+  rebuilds.
+- Kept the active row synchronized across Auto, Shuffle, manual Queue, queue
+  return, Next, Previous, Repeat All, and playback-error continuation while
+  preserving FIFO queue and base-context behavior.
 
 ## 1.0.0-rc.1 - Unreleased RC baseline
 
