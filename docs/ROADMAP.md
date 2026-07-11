@@ -68,7 +68,7 @@ sanitized demo presentation.
 A richer editable queue interface is later work and must preserve the working
 FIFO queue and base-context resume behavior.
 
-**Status:** Next.
+**Status:** Complete.
 
 ## Batch 5 — Album/Artist Performance and Artist Identity
 
@@ -82,7 +82,7 @@ bottlenecks.
 **Non-goals:** No automatic bulk metadata rewrite and no speculative database
 replacement.
 
-**Status:** Planned.
+**Status:** Next.
 
 ## Batch 6 — Metadata Foundation and Manual Correction
 

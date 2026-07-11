@@ -19,6 +19,10 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/paths.py` | Central project, runtime-data, asset, and frozen-application path resolution. |
 | `music_vault/core/app_status.py` | Versioned, read-only-for-consumers neutral App Status JSON export. |
 | `music_vault/core/watchtower_status.py` | Temporary compatibility re-export for the former module name. |
+| `music_vault/ui/theme.py` | Central colors, spacing, radii, typography, shared QSS, and guarded native dark-title-bar integration. |
+| `music_vault/ui/icons.py` | Safe source/frozen lookup plus cached, tinted, high-DPI rendering for original SVG UI assets. |
+| `music_vault/ui/components.py` | Focused reusable controls for icon buttons, elided text, search, overflow actions, headers, and empty states. |
+| `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
 | `music_vault/metadata/musicbrainz_enricher.py` | Optional MusicBrainz metadata lookup. |
 | `music_vault/metadata/cover_art.py` | Optional Cover Art Archive artwork retrieval. |
 | `MusicVault.spec` | PyInstaller configuration for the packaged Windows application. |
@@ -85,6 +89,21 @@ automatic, shuffled, queued, next, previous, and error-continuation playback
 without changing pages or queue/base context. Volume is normalized in memory,
 applied consistently to the slider and audio output, and persisted through a
 short debounce with a final close-time flush.
+
+## UI system and review boundary
+
+The premium visual system is centralized under `music_vault/ui/`; `app.py`
+retains page orchestration and established behavior while consuming shared
+tokens, static QSS, cached original SVG icons, and narrowly reusable controls.
+Responsive browser-card reflow reuses existing widgets and does not repeat
+database grouping or artwork decoding on each resize.
+
+`tools/dev/capture_ui_review.py` creates a temporary marker-valid project root,
+synthetic schema-v2 data, generated artwork, and non-media sentinel files. The
+packaged/source capture hook activates only when its explicit review environment
+variable and validated plan are present. Visible paths are neutralized before
+capture, the runtime is deleted afterward, and screenshot output remains an
+ignored local review artifact rather than product or personal data.
 
 ## Known architectural debt
 

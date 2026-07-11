@@ -33,6 +33,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Kept the active row synchronized across Auto, Shuffle, manual Queue, queue
   return, Next, Previous, Repeat All, and playback-error continuation while
   preserving FIFO queue and base-context behavior.
+- Added centralized design tokens, reusable UI components, and a static premium
+  dark theme with transparent label backgrounds and consistent focus states.
+- Added 34 original, cached, high-DPI SVG interface icons plus a guarded native
+  Windows dark-title-bar treatment.
+- Refined the sidebar, summary cards, search field, library table, album and
+  artist cards, Sync Center, Settings, menus, tooltips, and custom scrollbars.
+- Reworked the Library header into primary actions plus an accessible overflow
+  menu without removing any existing action.
+- Rebalanced the player bar around precisely centered icon transport controls,
+  premium timeline/volume controls, and compact mode and queue status.
+- Added responsive layouts, keyboard/accessibility polish, empty states, and a
+  reusable isolated synthetic UI review harness for three desktop sizes.
 
 ## 1.0.0-rc.1 - Unreleased RC baseline
 

@@ -18,6 +18,9 @@ htmlcov/
 .vscode/
 *.code-workspace
 .pip-cache/
+.ui-review/
+ui-review-output/
+music-vault-ui-review-*.png
 
 # Build and packaged output
 build/
