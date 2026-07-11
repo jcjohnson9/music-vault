@@ -9,6 +9,8 @@ future branch rather than a V1 requirement.
 The roadmap uses implementation batches. A batch is complete only when its own
 acceptance checks pass; a label does not imply that later batches have begun.
 
+**Current public product status:** Music Vault v1.0.0 Release Candidate.
+
 ## Batch 1 — GitHub and Source-Control Safety Baseline
 
 **Objective:** Establish a safe, professional, source-only Git baseline for the
@@ -22,9 +24,7 @@ commit.
 **Non-goals:** No app behavior, schema, runtime-path, packaging, metadata,
 playback, sync, or UI changes; no EXE upload; no release tag.
 
-**Status:** Complete only if the local baseline commit succeeds. Remote
-publication status must be reported separately and is not implied by local
-completion.
+**Status:** Complete and Published.
 
 ## Batch 2 — V1 Trust, Sync Correctness, and Safety
 
@@ -39,7 +39,7 @@ names, and retain proof of a clean incremental-sync acceptance test.
 **Non-goals:** No private-playlist OAuth, multiple-source system, broad metadata
 editor, mobile application, Prime interface, radio system, or app-wide rewrite.
 
-**Status:** Planned; next after Batch 1.
+**Status:** Complete.
 
 ## Batch 3 — Playback State and Now-Playing Accuracy
 
@@ -53,7 +53,7 @@ safe playback preferences and resume state.
 **Non-goals:** No replacement playback engine and no expansion of the manual
 queue into a new queue product.
 
-**Status:** Planned.
+**Status:** Next.
 
 ## Batch 4 — Premium UI System Overhaul
 

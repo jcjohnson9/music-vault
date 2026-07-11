@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 
 from mutagen import File as MutagenFile
@@ -10,9 +11,17 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import Picture
 
 from .paths import covers_dir
+from .safety import normalize_source_upload_date
 
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac"}
+
+
+@dataclass(frozen=True)
+class ImportSourceContext:
+    source_kind: str
+    source_video_id: str | None = None
+    source_upload_date: str | None = None
 
 
 def _clean_text(value) -> str | None:
@@ -163,7 +172,11 @@ def extract_embedded_cover(path: str | Path) -> str | None:
     return None
 
 
-def import_file(db, path: str | Path) -> bool:
+def import_file(
+    db,
+    path: str | Path,
+    source: ImportSourceContext | None = None,
+) -> bool:
     path = Path(path)
 
     if path.suffix.lower() not in AUDIO_EXTENSIONS:
@@ -172,6 +185,16 @@ def import_file(db, path: str | Path) -> bool:
     resolved_path = str(path.resolve())
     metadata = read_audio_metadata(path)
     cover_path = extract_embedded_cover(path)
+    source_upload_date = None
+    canonical_year = metadata["year"]
+
+    if source is not None and source.source_kind == "youtube":
+        # yt-dlp commonly writes the source upload date to the generic date tag.
+        # That date is useful provenance, but it is not a canonical release year.
+        source_upload_date = normalize_source_upload_date(
+            source.source_upload_date or metadata["year"]
+        )
+        canonical_year = None
 
     db.upsert_track(
         resolved_path,
@@ -179,6 +202,9 @@ def import_file(db, path: str | Path) -> bool:
         artist=metadata["artist"],
         album=metadata["album"],
         duration_seconds=metadata["duration_seconds"],
+        source_kind=source.source_kind if source else None,
+        source_video_id=source.source_video_id if source else None,
+        source_upload_date=source_upload_date,
     )
 
     row = db.conn.execute(
@@ -189,8 +215,8 @@ def import_file(db, path: str | Path) -> bool:
     if row:
         updates = {}
 
-        if metadata["year"]:
-            updates["year"] = metadata["year"]
+        if canonical_year:
+            updates["year"] = canonical_year
 
         if cover_path:
             updates["cover_path"] = cover_path

@@ -23,7 +23,7 @@ class AuthorizedSourceAdapter(ABC):
     - Creative Commons catalog
     - your own uploads
     - artist-provided downloads
-    - future Watchtower-controlled local drop folder
+    - future user-controlled local drop folder
 
     This starter intentionally does not implement a copyrighted YouTube ripper.
     """

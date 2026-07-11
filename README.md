@@ -20,8 +20,11 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 ## Core capabilities
 
 - Public and unlisted YouTube playlist synchronization through the YouTube Data API
+- Anonymous yt-dlp extraction with no silent browser-cookie access
 - Full API pagination for large playlists
-- Incremental acquisition based on stable YouTube video IDs
+- Incremental acquisition reconciled from stable video IDs and real local files
+- Truthful complete, complete-with-issues, and failed synchronization outcomes
+- Structured failed-item history with retry on the next manual sync
 - Authorized media acquisition with yt-dlp and FFmpeg
 - Persistent local library backed by SQLite
 - Embedded artwork extraction and artwork display
@@ -34,6 +37,7 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Local settings for the API key, download folder, and audio quality
 - PyInstaller-based Windows EXE workflow with a custom icon
 - Source verification, build, launch, and publication-safety tooling
+- Versioned, neutral App Status JSON for optional local consumers
 
 Music Vault does not currently provide private-playlist OAuth, multiple source
 playlists, Android support, Prime control, radio stations, AcoustID matching, or
@@ -93,14 +97,24 @@ Launch the source application with:
 
 Music Vault enumerates the playlist through the YouTube Data API, compares
 stable video IDs with local state, acquires missing authorized items, and imports
-the resulting local files into the library.
+only the resulting new or newly discovered local files into the library. Public
+and unlisted playlists are supported; Music Vault does not silently inspect
+browser cookie stores. Failed items are reported and retried on the next manual
+sync rather than permanently suppressed.
+
+YouTube upload dates are stored as source provenance. They are not presented as
+canonical musical release years. Local imports may continue to use legitimate
+embedded release-year metadata, and explicit MusicBrainz enrichment can supply
+canonical metadata after user confirmation.
 
 See [Authorized Use](docs/AUTHORIZED_USE.md) before using synchronization.
 
 ## Local configuration and privacy
 
 The YouTube Data API key, database, configuration, status, artwork, archives,
-and downloaded media are stored locally under the runtime data area. These files
+downloaded media, and pre-migration database backups are stored locally under
+the runtime data area. Database backups are written to `data/backups/` before a
+non-empty older schema is upgraded. These files
 are intentionally excluded from Git and are not part of a source checkout.
 
 Download-folder and audio-quality choices are local settings. Never paste API
@@ -123,6 +137,12 @@ virtual environment:
 .\tools\dev\check_status.ps1
 .\tools\dev\rebuild_and_run.ps1
 .\tools\dev\v1_sanity_check.ps1
+```
+
+Run the synthetic regression suite with:
+
+```powershell
+.\.venv\Scripts\python.exe -B -m pytest -q
 ```
 
 Build the one-folder Windows application with:
@@ -148,10 +168,8 @@ checked-in specification:
 See [Architecture](docs/ARCHITECTURE.md) for the current code and data flow, and
 [Contributing](CONTRIBUTING.md) before proposing a change.
 
-## Known release-candidate limitations
+## Remaining release-candidate gates
 
-- Source upload dates can currently appear as release years.
-- Some partial synchronization failures can be reported inaccurately.
 - Manual metadata correction is not yet complete.
 - The interface still requires its planned premium UI pass.
 - A clean, blank V1 distribution has not yet been published.

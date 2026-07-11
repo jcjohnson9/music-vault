@@ -19,6 +19,11 @@ Credentials and runtime data are stored locally and are excluded from Git by
 the repository rules. Those rules do not make it safe to share an arbitrary
 copy of a working data directory.
 
+Synchronization sanitizes external error text before it reaches the activity
+log, structured failure history, or App Status. Common Google API keys, query
+tokens, bearer/authorization values, and private-key blocks are redacted. The
+supported public/unlisted workflow does not silently access browser cookies.
+
 ## Reporting a vulnerability
 
 If GitHub private vulnerability reporting is enabled for the repository, use
