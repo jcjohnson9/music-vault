@@ -9,8 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtTest import QTest
@@ -48,6 +48,7 @@ EXPECTED_REQUIRED_ICONS = {
     "downloaded",
     "albums",
     "artists",
+    "artist-unknown",
     "playlists",
     "sync",
     "settings",
@@ -686,24 +687,30 @@ def test_window_pages_empty_states_and_long_synthetic_names(
     window.pages.setCurrentWidget(window.library_page)
     window.current_view_kind = "albums"
     window.show_album_browser()
-    qapp.processEvents()
+    for _ in range(100):
+        qapp.processEvents()
+        if window.album_browser_model.rowCount():
+            break
+        QTest.qWait(10)
     assert window.browser_title.text() == "Albums"
-    assert window._browser_cards
     assert any(
-        isinstance(label, ElidedLabel) and label.fullText() == LONG_ALBUM
-        for card in window._browser_cards
-        for label in card.findChildren(ElidedLabel)
+        item.title == LONG_ALBUM for item in window.album_browser_model.items()
     )
+    assert not window.findChildren(QObject, "BrowserCard")
 
     window.current_view_kind = "artists"
     window.show_artist_browser()
-    qapp.processEvents()
+    for _ in range(100):
+        qapp.processEvents()
+        if window.artist_browser_model.rowCount():
+            break
+        QTest.qWait(10)
     assert window.browser_title.text() == "Artists"
-    assert window._browser_cards
     assert any(
-        isinstance(label, ElidedLabel) and label.fullText() == LONG_ARTIST
-        for card in window._browser_cards
-        for label in card.findChildren(ElidedLabel)
+        item.title == LONG_ARTIST for item in window.artist_browser_model.items()
+    )
+    assert all(
+        item.artwork_path is None for item in window.artist_browser_model.items()
     )
 
     window.load_library([], "Empty Synthetic Playlist", "Synthetic empty state")
@@ -715,6 +722,280 @@ def test_window_pages_empty_states_and_long_synthetic_names(
     QTest.keyClick(window.search_box, Qt.Key.Key_Escape)
     assert window.search_box.text() == ""
     assert window.library_body_stack.currentWidget() is window.library_table
+
+
+def _wait_for_browser_rows(qapp, model, minimum: int = 1) -> None:
+    for _ in range(150):
+        qapp.processEvents()
+        if model.rowCount() >= minimum:
+            return
+        QTest.qWait(10)
+    assert model.rowCount() >= minimum
+
+
+def test_artist_browser_never_queries_blank_unknown_identity(
+    isolated_ui_window,
+    qapp,
+):
+    from music_vault.metadata.artist_images import ArtistImageResult, ArtistImageStatus
+
+    window = isolated_ui_window.window
+    calls: list[str] = []
+
+    class OfflineProvider:
+        def resolve(self, identity, _cancel_event=None):
+            calls.append(identity.display_name)
+            return ArtistImageResult(ArtistImageStatus.NO_MATCH, identity)
+
+    window.artist_image_service.provider = OfflineProvider()
+    window.config["artist_image_fetch_enabled"] = True
+    window.pages.setCurrentWidget(window.library_page)
+    window.show_artist_browser()
+    _wait_for_browser_rows(qapp, window.artist_browser_model)
+    blank = next(
+        summary
+        for summary in window._browser_summary_maps["artists"].values()
+        if not summary.key.normalized_name
+    )
+    window.load_visible_browser_images((blank.browser_key,))
+    QTest.qWait(80)
+    qapp.processEvents()
+
+    assert "Unknown Artist" not in calls
+    assert blank.browser_key not in window._pending_artist_image_keys
+    window.config["artist_image_fetch_enabled"] = False
+    window.artist_image_service.cancel_all()
+
+
+def test_artist_result_maps_to_dedicated_photo_not_album_cover(
+    isolated_ui_window,
+    qapp,
+):
+    from music_vault.metadata.artist_images import (
+        ArtistIdentity,
+        ArtistImageResult,
+        ArtistImageStatus,
+    )
+
+    fixture = isolated_ui_window
+    window = fixture.window
+    window.pages.setCurrentWidget(window.library_page)
+    window.show_artist_browser()
+    _wait_for_browser_rows(qapp, window.artist_browser_model)
+    summary = next(
+        value
+        for value in window._browser_summary_maps["artists"].values()
+        if value.key.normalized_name
+    )
+    portrait = fixture.root / "data" / "artist_images" / "files" / "portrait.png"
+    portrait.parent.mkdir(parents=True, exist_ok=True)
+    image = QImage(64, 64, QImage.Format.Format_ARGB32)
+    image.fill(QColor("#1DB954"))
+    assert image.save(str(portrait), "PNG")
+
+    window._artist_image_result(
+        summary.browser_key,
+        ArtistImageResult(
+            ArtistImageStatus.RESOLVED,
+            ArtistIdentity.from_display_name(f"  {summary.display_name}  "),
+            cache_file=portrait,
+        ),
+    )
+    item = window.artist_browser_model.item_for_key(summary.browser_key)
+    assert item.artwork_path == str(portrait)
+    assert item.has_cached_image is True
+    assert item.artwork_path not in {
+        album.representative_cover_path
+        for album in window._browser_summary_maps["albums"].values()
+    }
+
+
+def test_artist_request_cancellation_resets_all_loading_cards(
+    isolated_ui_window,
+    qapp,
+    monkeypatch,
+):
+    window = isolated_ui_window.window
+    window.pages.setCurrentWidget(window.library_page)
+    window.show_artist_browser()
+    _wait_for_browser_rows(qapp, window.artist_browser_model, 2)
+    keys = [
+        summary.browser_key
+        for summary in window._browser_summary_maps["artists"].values()
+        if summary.key.normalized_name
+    ][:2]
+    assert len(keys) == 2
+    for key in keys:
+        window.artist_browser_model.replace_item(
+            key,
+            artwork_path=None,
+            image_state="loading",
+        )
+    window._pending_artist_image_keys.update(keys)
+    monkeypatch.setattr(window.artist_image_service, "clear_cache", lambda _identity: None)
+    window.current_view_kind = "library"
+    window._active_browser_kind = None
+
+    window.clear_cached_artist_photo(keys[0])
+
+    assert window._pending_artist_image_keys == set()
+    assert all(
+        window.artist_browser_model.item_for_key(key).image_state.value == "missing"
+        for key in keys
+    )
+
+
+def test_disabling_during_artist_refresh_restores_ready_state_and_status(
+    isolated_ui_window,
+    qapp,
+):
+    window = isolated_ui_window.window
+    window.show_artist_browser()
+    _wait_for_browser_rows(qapp, window.artist_browser_model)
+    key = next(
+        summary.browser_key
+        for summary in window._browser_summary_maps["artists"].values()
+        if summary.key.normalized_name
+    )
+    window.artist_browser_model.replace_item(
+        key,
+        artwork_path="synthetic-cached-artist-photo.png",
+        image_state="loading",
+        has_cached_image=True,
+    )
+    window.config["artist_image_fetch_enabled"] = True
+
+    window.on_artist_image_setting_clicked(False)
+
+    assert window.config["artist_image_fetch_enabled"] is False
+    assert window.artist_browser_model.item_for_key(key).image_state.value == "ready"
+    assert "Disabled" in window.artist_images_status.text()
+
+
+def test_browser_activation_uses_exact_stable_album_and_artist_keys(
+    isolated_ui_window,
+    qapp,
+):
+    from music_vault.core.library_browser import query_album_tracks, query_artist_tracks
+
+    window = isolated_ui_window.window
+    window.pages.setCurrentWidget(window.library_page)
+    window.show_album_browser()
+    _wait_for_browser_rows(qapp, window.album_browser_model)
+    album = next(iter(window._browser_summary_maps["albums"].values()))
+    expected_album_ids = {row["id"] for row in query_album_tracks(window.db.conn, album.key)}
+
+    window.open_album(album.browser_key)
+
+    actual_album_ids = {
+        window.library_table.item(row, 0).data(Qt.UserRole)
+        for row in range(window.library_table.rowCount())
+    }
+    assert actual_album_ids == expected_album_ids
+    assert window.current_view_kind == "album_tracks"
+
+    window.show_artist_browser()
+    _wait_for_browser_rows(qapp, window.artist_browser_model)
+    artist = next(
+        value
+        for value in window._browser_summary_maps["artists"].values()
+        if value.key.normalized_name
+    )
+    expected_artist_ids = {row["id"] for row in query_artist_tracks(window.db.conn, artist.key)}
+
+    window.open_artist(artist.browser_key)
+
+    actual_artist_ids = {
+        window.library_table.item(row, 0).data(Qt.UserRole)
+        for row in range(window.library_table.rowCount())
+    }
+    assert actual_artist_ids == expected_artist_ids
+    assert window.current_view_kind == "artist_tracks"
+
+
+def test_artist_context_actions_are_consent_cache_and_source_gated(
+    isolated_ui_window,
+    qapp,
+    monkeypatch,
+):
+    window = isolated_ui_window.window
+    window.show_artist_browser()
+    _wait_for_browser_rows(qapp, window.artist_browser_model)
+    artist = next(
+        value
+        for value in window._browser_summary_maps["artists"].values()
+        if value.key.normalized_name
+    )
+    menus: list[list[str]] = []
+
+    class FakeAction:
+        def __init__(self, text):
+            self.text = text
+            self.triggered = SimpleNamespace(connect=lambda _callback: None)
+
+    class FakeMenu:
+        def __init__(self, _parent=None):
+            self.texts: list[str] = []
+
+        def addAction(self, _icon, text):
+            self.texts.append(text)
+            return FakeAction(text)
+
+        def addSeparator(self):
+            return None
+
+        def exec(self, _position):
+            menus.append(list(self.texts))
+
+    monkeypatch.setattr(isolated_ui_window.app_module, "QMenu", FakeMenu)
+    before_changes = window.db.conn.total_changes
+
+    window.config["artist_image_fetch_enabled"] = False
+    window.show_browser_context_menu(artist.browser_key, QPoint())
+    assert menus[-1] == ["Open Artist"]
+
+    window.config["artist_image_fetch_enabled"] = True
+    window.show_browser_context_menu(artist.browser_key, QPoint())
+    assert menus[-1] == ["Open Artist", "Refresh Artist Photo"]
+
+    window.artist_browser_model.replace_item(
+        artist.browser_key,
+        has_cached_image=True,
+        source_url="https://en.wikipedia.org/wiki/Synthetic_artist",
+    )
+    window.show_browser_context_menu(artist.browser_key, QPoint())
+    assert menus[-1] == [
+        "Open Artist",
+        "Refresh Artist Photo",
+        "Clear Cached Artist Photo",
+        "View Image Source",
+    ]
+    assert window.db.conn.total_changes == before_changes
+
+
+def test_accepted_artist_photo_consent_persists_without_credentials(
+    isolated_ui_window,
+    monkeypatch,
+):
+    fixture = isolated_ui_window
+    window = fixture.window
+    monkeypatch.setattr(
+        fixture.app_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: fixture.app_module.QMessageBox.Yes,
+    )
+    monkeypatch.setattr(window, "load_visible_browser_images", lambda _keys: None)
+    window.config["artist_image_fetch_enabled"] = False
+
+    window.confirm_enable_artist_photos()
+
+    saved = json.loads(
+        (fixture.root / "data" / "music_vault_config.json").read_text(encoding="utf-8")
+    )
+    assert saved["artist_image_fetch_enabled"] is True
+    assert window.settings_artist_images_enabled.isChecked()
+    assert not any("api_key" in key.casefold() for key in saved)
+    assert not (fixture.root / "data" / "youtube_api_key.txt").exists()
 
 
 def test_window_preserves_now_playing_selection_modes_queue_and_volume(
@@ -810,14 +1091,14 @@ def test_ui_review_plan_validation_accepts_only_safe_explicit_matrix(tmp_path: P
         ],
         "scenes": list(DEFAULT_REVIEW_SCENES),
         "settle_ms": 100,
-        "expected_capture_count": 18,
+        "expected_capture_count": 3 * len(DEFAULT_REVIEW_SCENES),
     }
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
 
     plan = load_review_plan(plan_path)
     assert plan.runtime_root == runtime.resolve()
     assert plan.output_dir == output.resolve()
-    assert plan.capture_count == 18
+    assert plan.capture_count == 3 * len(DEFAULT_REVIEW_SCENES)
     assert [(size.width, size.height) for size in plan.sizes] == [
         (1100, 720),
         (1440, 900),

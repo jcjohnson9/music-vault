@@ -278,33 +278,29 @@ QFrame#PlayerBar {{
     border-radius: {r['panel']}px;
 }}
 
-QLabel#CoverArt,
-QLabel#BrowserCover {{
+QLabel#CoverArt {{
     background: {c['subtle_surface']};
     border: 1px solid {c['border']};
     border-radius: {r['artwork']}px;
     color: {c['accent']};
 }}
 
-QFrame#BrowserCard {{
-    background: {c['card_surface']};
-    border: 1px solid {c['border']};
-    border-radius: {r['card']}px;
+QListView#MediaGridView {{
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0;
+    selection-background-color: transparent;
 }}
 
-QFrame#BrowserCard:hover {{
-    background: {c['hover_surface']};
-    border-color: {c['strong_border']};
-}}
-
-QFrame#BrowserCard:focus {{
-    border: 2px solid {c['focus_ring']};
-}}
-
-QLabel#BrowserCardTitle {{
-    color: {c['text_primary']};
-    font-size: {t['body_size']}px;
-    font-weight: 650;
+QListView#MediaGridView::item,
+QListView#MediaGridView::item:hover,
+QListView#MediaGridView::item:selected,
+QListView#MediaGridView::item:focus {{
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0;
 }}
 
 QFrame#EmptyState {{

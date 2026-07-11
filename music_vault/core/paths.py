@@ -75,6 +75,18 @@ def covers_dir() -> Path:
     return data_dir() / "covers"
 
 
+def artist_images_dir() -> Path:
+    return data_dir() / "artist_images"
+
+
+def artist_image_files_dir() -> Path:
+    return artist_images_dir() / "files"
+
+
+def artist_image_index_path() -> Path:
+    return artist_images_dir() / "index.json"
+
+
 def default_downloads_dir() -> Path:
     return data_dir() / "youtube_downloads"
 

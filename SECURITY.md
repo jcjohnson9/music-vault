@@ -24,6 +24,30 @@ log, structured failure history, or App Status. Common Google API keys, query
 tokens, bearer/authorization values, and private-key blocks are redacted. The
 supported public/unlisted workflow does not silently access browser cookies.
 
+## Optional artist-image requests
+
+Artist-photo lookup is disabled by default and requires explicit user opt-in.
+It uses no provider API key and never copies or transmits the YouTube API key.
+When enabled, artist names may be sent to public MusicBrainz services and a
+high-confidence match may lead to Wikidata, English Wikipedia, Wikimedia
+Commons, or Wikimedia image requests.
+
+Artist-image networking runs outside the GUI thread with bounded concurrency,
+timeouts, MusicBrainz rate limiting, and request coalescing. Only HTTPS URLs on
+an explicit provider whitelist are accepted. Redirect targets are revalidated,
+DNS answers resolving to loopback, private, local, or other non-global
+addresses are rejected, and environment proxy inheritance is disabled. JSON
+and image responses have byte limits; image MIME type, encoded format,
+dimensions, and decodability are validated before storage. Provider errors are
+reduced to sanitized codes instead of exposing raw URLs or local paths.
+
+Downloaded photos and provenance are private runtime data under
+`data/artist_images/`. The manifest is written atomically, cached filenames use
+content hashes, and cache-clear operations remain inside that directory.
+Source-page URLs open only after an explicit user action and only when they
+match the safe public-source policy. Do not commit or publicly attach the
+cache, its manifest, or downloaded third-party photographs.
+
 ## Reporting a vulnerability
 
 If GitHub private vulnerability reporting is enabled for the repository, use

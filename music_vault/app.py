@@ -4,6 +4,7 @@ import sys
 import random
 import json
 import math
+from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QSize, QTimer, QRectF
@@ -58,6 +59,18 @@ from music_vault.core.importer import (
     import_folder,
     refresh_covers_for_library,
 )
+from music_vault.core.library_browser import (
+    AlbumSummary,
+    ArtistSummary,
+    BrowserInvalidationReason,
+    BrowserKind,
+    BrowserSummaryCache,
+    browser_revision,
+    load_album_summaries,
+    load_artist_summaries,
+    query_album_tracks,
+    query_artist_tracks,
+)
 from music_vault.core.playback_errors import playback_error_message
 from music_vault.core.playback_state import (
     DEFAULT_VOLUME_PERCENT,
@@ -68,6 +81,7 @@ from music_vault.core.playback_state import (
 )
 from music_vault.core.paths import (
     app_status_path,
+    artist_images_dir,
     config_path,
     data_dir,
     database_path,
@@ -82,6 +96,15 @@ from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
 from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
 from music_vault.metadata.musicbrainz_enricher import search_recording
 from music_vault.metadata.cover_art import download_front_cover
+from music_vault.metadata.artist_images import (
+    ArtistIdentity,
+    ArtistImageCache,
+    ArtistImageResult,
+    ArtistImageService,
+    ArtistImageStatus,
+    create_artist_image_provider,
+    is_safe_artist_source_url,
+)
 from music_vault.ui.components import (
     ElidedLabel,
     EmptyState,
@@ -89,9 +112,20 @@ from music_vault.ui.components import (
     OverflowActionButton,
     SearchField,
 )
+from music_vault.ui.browser_loader import BrowserSummaryLoader
 from music_vault.ui.icons import render_icon_pixmap, ui_icon
+from music_vault.ui.media_grid import (
+    MediaFilterProxyModel,
+    MediaGridModel,
+    MediaGridState,
+    MediaGridView,
+    MediaImageState,
+    MediaItem,
+    MediaKind,
+)
 from music_vault.ui.review import schedule_ui_review
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
+from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
 
 
 NOW_PLAYING_ROLE = int(Qt.UserRole) + 1
@@ -156,6 +190,13 @@ class MusicVaultWindow(QMainWindow):
             youtube_download_root=self.config.get("download_folder"),
             legacy_failure_file=youtube_failed_ids_path(),
         )
+        self.artist_image_cache = ArtistImageCache()
+        self.artist_image_service = ArtistImageService(
+            create_artist_image_provider(),
+            self.artist_image_cache,
+            parent=self,
+        )
+        self._pending_artist_image_keys: set[str] = set()
         self.current_track_id: int | None = None
         self.sync_worker: YouTubeSyncWorker | None = None
         self.is_seeking = False
@@ -173,12 +214,21 @@ class MusicVaultWindow(QMainWindow):
         self._styled_now_playing_track_id: int | None = None
         self._dark_title_bar_applied = False
         self._dark_title_bar_attempted = False
-        self._browser_cards: list[QWidget] = []
-        self._browser_column_count = 0
-        self._browser_reflow_timer = QTimer(self)
-        self._browser_reflow_timer.setSingleShot(True)
-        self._browser_reflow_timer.setInterval(80)
-        self._browser_reflow_timer.timeout.connect(self.reflow_browser_cards)
+        self.browser_summary_cache = BrowserSummaryCache()
+        self.browser_summary_loader = BrowserSummaryLoader(self)
+        self.browser_summary_loader.loaded.connect(self._browser_summaries_loaded)
+        self.browser_summary_loader.failed.connect(self._browser_summaries_failed)
+        self.thumbnail_cache = ThumbnailCache(parent=self)
+        self._browser_summary_maps: dict[str, dict[str, AlbumSummary | ArtistSummary]] = {
+            "albums": {},
+            "artists": {},
+        }
+        self._browser_model_revisions: dict[str, object | None] = {
+            "albums": None,
+            "artists": None,
+        }
+        self._browser_scroll_positions = {"albums": 0, "artists": 0}
+        self._active_browser_kind: str | None = None
 
         self.app_sync_status: dict | None = None
 
@@ -221,6 +271,7 @@ class MusicVaultWindow(QMainWindow):
             "download_folder": str(default_downloads_dir()),
             "audio_quality": "320",
             "volume_percent": DEFAULT_VOLUME_PERCENT,
+            "artist_image_fetch_enabled": False,
         }
 
     def load_config(self) -> dict:
@@ -239,6 +290,11 @@ class MusicVaultWindow(QMainWindow):
         config["volume_percent"] = normalize_volume_percent(
             config.get("volume_percent"),
             DEFAULT_VOLUME_PERCENT,
+        )
+        # Only the JSON boolean true opts in. Strings and numeric values must
+        # never silently enable an external artist-name lookup.
+        config["artist_image_fetch_enabled"] = (
+            config.get("artist_image_fetch_enabled") is True
         )
         return config
 
@@ -673,21 +729,30 @@ class MusicVaultWindow(QMainWindow):
         browser_header.addStretch(1)
         browser_header.addWidget(self.browser_hint)
 
-        self.browser_scroll = QScrollArea()
-        self.browser_scroll.setObjectName("BrowserScroll")
-        self.browser_scroll.setWidgetResizable(True)
+        self.browser_action_btn = self.make_action_button(
+            "Enable Artist Photos",
+            "artists",
+            self.confirm_enable_artist_photos,
+        )
+        self.browser_action_btn.setVisible(False)
+        browser_header.insertWidget(2, self.browser_action_btn)
 
-        self.browser_container = QWidget()
-        self.browser_grid = QGridLayout(self.browser_container)
-        self.browser_grid.setContentsMargins(4, 4, 4, 4)
-        self.browser_grid.setHorizontalSpacing(16)
-        self.browser_grid.setVerticalSpacing(16)
-        self.browser_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.album_browser_model = MediaGridModel(parent=browser_page)
+        self.artist_browser_model = MediaGridModel(parent=browser_page)
+        self.album_browser_proxy = MediaFilterProxyModel(browser_page)
+        self.artist_browser_proxy = MediaFilterProxyModel(browser_page)
+        self.album_browser_proxy.setSourceModel(self.album_browser_model)
+        self.artist_browser_proxy.setSourceModel(self.artist_browser_model)
+        self.album_browser_model.bind_thumbnail_cache(self.thumbnail_cache)
+        self.artist_browser_model.bind_thumbnail_cache(self.thumbnail_cache)
 
-        self.browser_scroll.setWidget(self.browser_container)
+        self.browser_view = MediaGridView(browser_page)
+        self.browser_view.item_opened.connect(self.open_browser_item)
+        self.browser_view.item_context_requested.connect(self.show_browser_context_menu)
+        self.browser_view.visible_items_changed.connect(self.load_visible_browser_images)
 
         browser_layout.addLayout(browser_header)
-        browser_layout.addWidget(self.browser_scroll, 1)
+        browser_layout.addWidget(self.browser_view, 1)
 
         self.library_content_stack = QStackedWidget()
         self.library_content_stack.addWidget(table_card)
@@ -1014,6 +1079,48 @@ class MusicVaultWindow(QMainWindow):
         save_btn.setAccessibleName("Save Music Vault settings")
         save_btn.clicked.connect(self.save_settings_from_ui)
 
+        artist_images_title = QLabel("Artist Photos")
+        artist_images_title.setObjectName("CardTitle")
+        artist_images_description = QLabel(
+            "Optional public metadata lookup for visible artists. Cached photos "
+            "remain local and no provider API key is required."
+        )
+        artist_images_description.setObjectName("MutedLabel")
+        artist_images_description.setWordWrap(True)
+
+        self.settings_artist_images_enabled = QCheckBox(
+            "Enable external artist-photo fetching"
+        )
+        self.settings_artist_images_enabled.setAccessibleName(
+            "Enable external artist-photo fetching"
+        )
+        self.settings_artist_images_enabled.setChecked(
+            self.config.get("artist_image_fetch_enabled") is True
+        )
+        self.settings_artist_images_enabled.clicked.connect(
+            self.on_artist_image_setting_clicked
+        )
+
+        artist_images_row = QHBoxLayout()
+        clear_artist_images_btn = self.make_action_button(
+            "Clear Artist Photos",
+            "remove",
+            self.clear_artist_image_cache,
+            object_name="DangerButton",
+        )
+        open_artist_images_btn = self.make_action_button(
+            "Open Artist Cache",
+            "folder",
+            self.open_artist_image_cache_folder,
+        )
+        artist_images_row.addWidget(clear_artist_images_btn)
+        artist_images_row.addWidget(open_artist_images_btn)
+        artist_images_row.addStretch(1)
+
+        self.artist_images_status = QLabel()
+        self.artist_images_status.setObjectName("StatusLine")
+        self.artist_images_status.setWordWrap(True)
+
         maintenance_title = QLabel("Maintenance")
         maintenance_title.setObjectName("CardTitle")
 
@@ -1071,6 +1178,12 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(quality_label)
         settings_layout.addWidget(self.settings_quality)
         settings_layout.addWidget(save_btn)
+        settings_layout.addSpacing(10)
+        settings_layout.addWidget(artist_images_title)
+        settings_layout.addWidget(artist_images_description)
+        settings_layout.addWidget(self.settings_artist_images_enabled)
+        settings_layout.addLayout(artist_images_row)
+        settings_layout.addWidget(self.artist_images_status)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(maintenance_title)
         settings_layout.addLayout(maintenance_row)
@@ -1425,6 +1538,8 @@ class MusicVaultWindow(QMainWindow):
         )
 
     def load_library(self, tracks=None, title: str | None = None, subtitle: str | None = None) -> None:
+        self._remember_browser_scroll()
+        self._active_browser_kind = None
         if hasattr(self, "library_content_stack"):
             self.library_content_stack.setCurrentIndex(0)
 
@@ -1527,32 +1642,6 @@ class MusicVaultWindow(QMainWindow):
             add_sidebar_item(playlist["name"], "custom", playlist["id"])
 
 
-    def clear_browser_grid(self, *, delete_widgets: bool = True) -> None:
-        while self.browser_grid.count():
-            item = self.browser_grid.takeAt(0)
-            widget = item.widget()
-
-            if delete_widgets and widget is not None:
-                widget.deleteLater()
-        if delete_widgets:
-            self._browser_cards = []
-        self._browser_column_count = 0
-
-    def browser_column_count(self) -> int:
-        width = self.browser_scroll.viewport().width() if hasattr(self, "browser_scroll") else 0
-        return max(1, int(max(width, 200) // 200))
-
-    def reflow_browser_cards(self) -> None:
-        if not self._browser_cards:
-            return
-        columns = self.browser_column_count()
-        if columns == self._browser_column_count and self.browser_grid.count():
-            return
-        self.clear_browser_grid(delete_widgets=False)
-        for index, card in enumerate(self._browser_cards):
-            self.browser_grid.addWidget(card, index // columns, index % columns)
-        self._browser_column_count = columns
-
     def rounded_cover_pixmap(
         self,
         source: QPixmap,
@@ -1598,227 +1687,454 @@ class MusicVaultWindow(QMainWindow):
         target.setDevicePixelRatio(pixel_ratio)
         return target
 
-    def make_browser_card(
-        self,
-        title: str,
-        subtitle: str,
-        cover_path: str | None,
-        callback,
-        *,
-        placeholder_icon: str = "albums",
-    ) -> QFrame:
-        card = QFrame()
-        card.setObjectName("BrowserCard")
-        card.setFixedSize(184, 232)
-        card.setCursor(Qt.PointingHandCursor)
-        card.setFocusPolicy(Qt.StrongFocus)
-        card.setAccessibleName(f"Open {title}")
+    def _browser_model(self, kind: str) -> MediaGridModel:
+        return self.album_browser_model if kind == "albums" else self.artist_browser_model
 
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+    def _browser_proxy(self, kind: str) -> MediaFilterProxyModel:
+        return self.album_browser_proxy if kind == "albums" else self.artist_browser_proxy
 
-        cover = QLabel()
-        cover.setObjectName("BrowserCover")
-        cover.setFixedSize(156, 156)
-        cover.setAlignment(Qt.AlignCenter)
-
-        if cover_path and Path(cover_path).exists():
-            pixmap = QPixmap(cover_path)
-
-            if not pixmap.isNull():
-                cover.setPixmap(self.rounded_cover_pixmap(pixmap, 156))
-            else:
-                cover.setPixmap(
-                    render_icon_pixmap(placeholder_icon, 42, COLORS["text_muted"])
-                )
-        else:
-            cover.setPixmap(
-                render_icon_pixmap(placeholder_icon, 42, COLORS["text_muted"])
+    def _remember_browser_scroll(self) -> None:
+        if self._active_browser_kind and hasattr(self, "browser_view"):
+            self._browser_scroll_positions[self._active_browser_kind] = (
+                self.browser_view.verticalScrollBar().value()
             )
 
-        title_label = ElidedLabel(title)
-        title_label.setObjectName("BrowserCardTitle")
+    def _activate_browser_view(self, kind: str) -> None:
+        if self._active_browser_kind != kind:
+            self._remember_browser_scroll()
+        self._active_browser_kind = kind
+        proxy = self._browser_proxy(kind)
+        if self.browser_view.model() is not proxy:
+            self.browser_view.setModel(proxy)
+        self.browser_view.setAccessibleName(
+            "Album browser" if kind == "albums" else "Artist browser"
+        )
+        scroll_position = self._browser_scroll_positions.get(kind, 0)
 
-        subtitle_label = ElidedLabel(subtitle)
-        subtitle_label.setObjectName("MutedLabel")
+        def restore_scroll() -> None:
+            if self._active_browser_kind == kind and self.browser_view.model() is proxy:
+                self.browser_view.verticalScrollBar().setValue(scroll_position)
 
-        layout.addWidget(cover)
-        layout.addWidget(title_label)
-        layout.addWidget(subtitle_label)
-        layout.addStretch(1)
+        QTimer.singleShot(0, restore_scroll)
 
-        def handle_click(event):
-            if event.button() == Qt.LeftButton:
-                callback()
+    def _request_browser_summaries(self, kind: str) -> None:
+        revision = browser_revision(self.db.conn)
+        browser_kind = BrowserKind(kind)
+        cached = self.browser_summary_cache.get(browser_kind, revision)
+        if cached is not None:
+            self._apply_browser_summaries(kind, cached, revision)
+            return
 
-        def handle_key(event):
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
-                callback()
-                event.accept()
-                return
-            QFrame.keyPressEvent(card, event)
+        self.browser_view.set_view_state(
+            MediaGridState.LOADING,
+            f"Loading {kind.title()}",
+            "Preparing your local library summary.",
+            "albums" if kind == "albums" else "artist-unknown",
+        )
+        token = self.browser_summary_cache.token(browser_kind, revision)
+        db_path = Path(getattr(self.db, "db_path", database_path()))
+        query = (
+            partial(load_album_summaries, db_path)
+            if kind == "albums"
+            else partial(load_artist_summaries, db_path)
+        )
+        self.browser_summary_loader.request(kind, token, query)
 
-        card.mousePressEvent = handle_click
-        card.keyPressEvent = handle_key
+    def _browser_summaries_loaded(
+        self,
+        kind: str,
+        _request_token: int,
+        cache_token: object,
+        summaries: object,
+    ) -> None:
+        try:
+            accepted = self.browser_summary_cache.put(cache_token, tuple(summaries))
+        except (TypeError, ValueError):
+            accepted = False
+        if not accepted or self._active_browser_kind != kind:
+            return
+        if self.current_view_kind != kind:
+            return
+        self._apply_browser_summaries(kind, tuple(summaries), cache_token.revision)
 
-        return card
+    def _browser_summaries_failed(
+        self,
+        kind: str,
+        _request_token: int,
+        _cache_token: object,
+        message: str,
+    ) -> None:
+        if self._active_browser_kind != kind or self.current_view_kind != kind:
+            return
+        self.track_count_card.value_label.setText("0")
+        self.browser_view.set_view_state(
+            MediaGridState.ERROR,
+            f"Could not load {kind.title()}",
+            message,
+            "error",
+        )
 
-    def album_groups(self) -> list[dict]:
-        rows = self.db.conn.execute("""
-            SELECT album, artist, cover_path
-            FROM tracks
-            ORDER BY album COLLATE NOCASE, artist COLLATE NOCASE
-        """).fetchall()
+    @staticmethod
+    def _track_count_text(count: int) -> str:
+        return f"{count} track" if int(count) == 1 else f"{count} tracks"
 
-        groups = {}
+    def _album_media_item(self, summary: AlbumSummary) -> MediaItem:
+        details = [summary.album_artist]
+        if summary.canonical_year:
+            details.append(summary.canonical_year)
+        details.append(self._track_count_text(summary.track_count))
+        cover_path = summary.representative_cover_path
+        return MediaItem(
+            key=summary.browser_key,
+            kind=MediaKind.ALBUM,
+            title=summary.album_title,
+            subtitle=" • ".join(details),
+            artwork_path=cover_path,
+            image_state=(MediaImageState.LOADING if cover_path else MediaImageState.MISSING),
+        )
 
-        for row in rows:
-            album = (row["album"] or "Unknown Album").strip() or "Unknown Album"
-            artist = (row["artist"] or "Unknown Artist").strip() or "Unknown Artist"
-            key = album.lower()
+    def _artist_media_item(self, summary: ArtistSummary) -> MediaItem:
+        # Artist cards deliberately start with no track cover. A dedicated
+        # artist-image cache may supply an artwork path later.
+        return MediaItem(
+            key=summary.browser_key,
+            kind=MediaKind.ARTIST,
+            title=summary.display_name,
+            subtitle=self._track_count_text(summary.track_count),
+            artwork_path=None,
+            image_state=MediaImageState.MISSING,
+        )
 
-            if key not in groups:
-                groups[key] = {
-                    "album": album,
-                    "artist": artist,
-                    "count": 0,
-                    "cover_path": None,
-                }
+    def _apply_browser_summaries(
+        self,
+        kind: str,
+        summaries: tuple[AlbumSummary | ArtistSummary, ...],
+        revision: object,
+    ) -> None:
+        model = self._browser_model(kind)
+        proxy = self._browser_proxy(kind)
+        changed = self._browser_model_revisions.get(kind) != revision
+        self._browser_summary_maps[kind] = {
+            summary.browser_key: summary for summary in summaries
+        }
+        if changed:
+            items = (
+                tuple(self._album_media_item(summary) for summary in summaries)
+                if kind == "albums"
+                else tuple(self._artist_media_item(summary) for summary in summaries)
+            )
+            model.set_items(items)
+            model.set_thumbnail_generation(self.thumbnail_cache.generation)
+            self._browser_model_revisions[kind] = revision
+            self._browser_scroll_positions[kind] = 0
+            self.browser_view.clearSelection()
 
-            groups[key]["count"] += 1
-
-            if not groups[key]["cover_path"] and row["cover_path"]:
-                groups[key]["cover_path"] = row["cover_path"]
-
-        return sorted(groups.values(), key=lambda item: item["album"].lower())
-
-    def artist_groups(self) -> list[dict]:
-        rows = self.db.conn.execute("""
-            SELECT artist, cover_path
-            FROM tracks
-            ORDER BY artist COLLATE NOCASE
-        """).fetchall()
-
-        groups = {}
-
-        for row in rows:
-            artist = (row["artist"] or "Unknown Artist").strip() or "Unknown Artist"
-            key = artist.lower()
-
-            if key not in groups:
-                groups[key] = {
-                    "artist": artist,
-                    "count": 0,
-                    "cover_path": None,
-                }
-
-            groups[key]["count"] += 1
-
-            if not groups[key]["cover_path"] and row["cover_path"]:
-                groups[key]["cover_path"] = row["cover_path"]
-
-        return sorted(groups.values(), key=lambda item: item["artist"].lower())
+        proxy.set_filter_text(self.search_box.text() if hasattr(self, "search_box") else "")
+        self.track_count_card.value_label.setText(str(proxy.rowCount()))
+        if not summaries:
+            title = "No albums yet" if kind == "albums" else "No artists yet"
+            description = (
+                "Imported tracks with album metadata will appear here."
+                if kind == "albums"
+                else "Imported artist metadata will appear here."
+            )
+            self.browser_view.set_view_state(
+                MediaGridState.EMPTY,
+                title,
+                description,
+                "albums" if kind == "albums" else "artist-unknown",
+            )
+        elif proxy.rowCount() == 0:
+            self.browser_view.set_view_state(
+                MediaGridState.EMPTY,
+                "No matching cards",
+                "Try a shorter album or artist search.",
+                "search",
+            )
+        else:
+            self.browser_view.set_view_state(MediaGridState.CONTENT)
+        self.browser_view.schedule_visible_items()
 
     def show_album_browser(self) -> None:
+        self.current_view_kind = "albums"
         self.library_content_stack.setCurrentIndex(1)
         self.page_title.setText("Albums")
         self.page_subtitle.setText("Browse your collection by album.")
         self.browser_title.setText("Albums")
         self.browser_hint.setText("Click an album to view its tracks")
-        self.clear_browser_grid()
-
-        albums = self.album_groups()
-        self.track_count_card.value_label.setText(str(len(albums)))
-
-        if not albums:
-            self._browser_cards = [EmptyState(
-                "albums",
-                "No albums yet",
-                "Imported tracks with album metadata will appear here.",
-                parent=self.browser_container,
-            )]
-            self.reflow_browser_cards()
-            return
-
-        for index, album in enumerate(albums):
-            card = self.make_browser_card(
-                album["album"],
-                f'{album["artist"]} • {album["count"]} tracks',
-                album["cover_path"],
-                lambda album_name=album["album"]: self.open_album(album_name)
-            )
-            self._browser_cards.append(card)
-        self.reflow_browser_cards()
+        self.browser_action_btn.setVisible(False)
+        self._activate_browser_view("albums")
+        self._request_browser_summaries("albums")
 
     def show_artist_browser(self) -> None:
+        self.current_view_kind = "artists"
         self.library_content_stack.setCurrentIndex(1)
         self.page_title.setText("Artists")
         self.page_subtitle.setText("Browse your collection by artist.")
         self.browser_title.setText("Artists")
         self.browser_hint.setText("Click an artist to view their tracks")
-        self.clear_browser_grid()
+        self.browser_action_btn.setVisible(
+            not bool(self.config.get("artist_image_fetch_enabled", False))
+        )
+        self._activate_browser_view("artists")
+        self._request_browser_summaries("artists")
 
-        artists = self.artist_groups()
-        self.track_count_card.value_label.setText(str(len(artists)))
+    def open_browser_item(self, browser_key: str) -> None:
+        if self._active_browser_kind == "albums":
+            self.open_album(browser_key)
+        elif self._active_browser_kind == "artists":
+            self.open_artist(browser_key)
 
-        if not artists:
-            self._browser_cards = [EmptyState(
-                "artists",
-                "No artists yet",
-                "Imported artist metadata will appear here.",
-                parent=self.browser_container,
-            )]
-            self.reflow_browser_cards()
+    def show_browser_context_menu(self, browser_key: str, global_position) -> None:
+        summary = self._browser_summary_maps.get(self._active_browser_kind or "", {}).get(
+            browser_key
+        )
+        if summary is None:
+            return
+        menu = QMenu(self)
+        action = menu.addAction(
+            ui_icon("albums" if self._active_browser_kind == "albums" else "artists", 18),
+            "Open Album" if self._active_browser_kind == "albums" else "Open Artist",
+        )
+        action.triggered.connect(lambda: self.open_browser_item(browser_key))
+        if self._active_browser_kind == "artists":
+            item = self.artist_browser_model.item_for_key(browser_key)
+            if item is not None:
+                menu.addSeparator()
+                if self.config.get("artist_image_fetch_enabled") is True:
+                    summary = self._browser_summary_maps["artists"].get(browser_key)
+                    if (
+                        isinstance(summary, ArtistSummary)
+                        and summary.key.normalized_name
+                    ):
+                        refresh_action = menu.addAction(
+                            ui_icon("refresh", 18),
+                            "Refresh Artist Photo",
+                        )
+                        refresh_action.triggered.connect(
+                            lambda: self.refresh_artist_photo(browser_key)
+                        )
+                if item.has_cached_image:
+                    clear_action = menu.addAction(
+                        ui_icon("remove", 18),
+                        "Clear Cached Artist Photo",
+                    )
+                    clear_action.triggered.connect(
+                        lambda: self.clear_cached_artist_photo(browser_key)
+                    )
+                if item.source_url and is_safe_artist_source_url(item.source_url):
+                    source_action = menu.addAction(
+                        ui_icon("folder", 18),
+                        "View Image Source",
+                    )
+                    source_action.triggered.connect(
+                        lambda: self.open_artist_image_source(browser_key)
+                    )
+        menu.exec(global_position)
+
+    def load_visible_browser_images(self, browser_keys: tuple[str, ...]) -> None:
+        kind = self._active_browser_kind
+        if kind not in {"albums", "artists"}:
+            return
+        model = self._browser_model(kind)
+        dpr = self.browser_view.devicePixelRatioF()
+        crop = "square" if kind == "albums" else "portrait"
+        generation = self.thumbnail_cache.generation
+        model.set_thumbnail_generation(generation)
+        for browser_key in browser_keys:
+            item = model.item_for_key(browser_key)
+            if (
+                item is None
+                or not item.artwork_path
+                or item.image_state is MediaImageState.FAILED
+            ):
+                continue
+            thumbnail_key = make_thumbnail_key(item.artwork_path, 156, dpr, crop)
+            model.bind_thumbnail(browser_key, thumbnail_key)
+            self.thumbnail_cache.request(
+                item.artwork_path,
+                156,
+                dpr,
+                crop=crop,
+                generation=generation,
+            )
+
+        if kind != "artists":
+            return
+        network_enabled = self.config.get("artist_image_fetch_enabled") is True
+        for browser_key in browser_keys:
+            item = self.artist_browser_model.item_for_key(browser_key)
+            summary = self._browser_summary_maps["artists"].get(browser_key)
+            if (
+                item is None
+                or not isinstance(summary, ArtistSummary)
+                or not summary.key.normalized_name
+                or item.artwork_path
+                or browser_key in self._pending_artist_image_keys
+            ):
+                continue
+            self._pending_artist_image_keys.add(browser_key)
+            if network_enabled:
+                self.artist_browser_model.replace_item(
+                    browser_key,
+                    image_state=MediaImageState.LOADING,
+                )
+            self.artist_image_service.request(
+                item.title,
+                lambda result, key=browser_key: self._artist_image_result(key, result),
+                network_enabled=network_enabled,
+            )
+
+    def _artist_image_result(
+        self,
+        browser_key: str,
+        result: ArtistImageResult,
+    ) -> None:
+        self._pending_artist_image_keys.discard(browser_key)
+        summary = self._browser_summary_maps["artists"].get(browser_key)
+        item = self.artist_browser_model.item_for_key(browser_key)
+        if not isinstance(summary, ArtistSummary) or item is None:
+            return
+        if result.identity.normalized_key != summary.key.normalized_name:
             return
 
-        for index, artist in enumerate(artists):
-            card = self.make_browser_card(
-                artist["artist"],
-                f'{artist["count"]} tracks',
-                artist["cover_path"],
-                lambda artist_name=artist["artist"]: self.open_artist(artist_name),
-                placeholder_icon="artists",
+        if (
+            result.status is ArtistImageStatus.RESOLVED
+            and result.cache_file is not None
+            and result.cache_file.is_file()
+        ):
+            self.artist_browser_model.replace_item(
+                browser_key,
+                artwork_path=str(result.cache_file),
+                image_state=MediaImageState.LOADING,
+                has_cached_image=True,
+                source_url=(
+                    result.source_page_url
+                    if is_safe_artist_source_url(result.source_page_url)
+                    else None
+                ),
             )
-            self._browser_cards.append(card)
-        self.reflow_browser_cards()
+            if browser_key in self.browser_view.visible_item_keys():
+                self.load_visible_browser_images((browser_key,))
+            return
 
-    def open_album(self, album_name: str) -> None:
-        rows = self.db.conn.execute("""
-            SELECT id, title, artist, album, year, path, cover_path, duration_seconds, created_at
-            FROM tracks
-            WHERE COALESCE(NULLIF(album, ''), 'Unknown Album') = ?
-            ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE
-        """, (album_name,)).fetchall()
+        self.artist_browser_model.replace_item(
+            browser_key,
+            artwork_path=None,
+            image_state=(
+                MediaImageState.FAILED
+                if result.status
+                in {ArtistImageStatus.TEMPORARY_ERROR, ArtistImageStatus.UNAVAILABLE}
+                else MediaImageState.MISSING
+            ),
+            has_cached_image=False,
+            source_url=None,
+        )
 
+    def refresh_artist_photo(self, browser_key: str) -> None:
+        if self.config.get("artist_image_fetch_enabled") is not True:
+            return
+        summary = self._browser_summary_maps["artists"].get(browser_key)
+        item = self.artist_browser_model.item_for_key(browser_key)
+        if (
+            not isinstance(summary, ArtistSummary)
+            or not summary.key.normalized_name
+            or item is None
+            or browser_key in self._pending_artist_image_keys
+        ):
+            return
+        self._pending_artist_image_keys.add(browser_key)
+        self.artist_browser_model.replace_item(
+            browser_key,
+            image_state=MediaImageState.LOADING,
+        )
+        self.artist_image_service.request(
+            item.title,
+            lambda result, key=browser_key: self._artist_image_result(key, result),
+            force=True,
+            network_enabled=True,
+        )
+
+    def clear_cached_artist_photo(self, browser_key: str) -> None:
+        summary = self._browser_summary_maps["artists"].get(browser_key)
+        item = self.artist_browser_model.item_for_key(browser_key)
+        if not isinstance(summary, ArtistSummary) or item is None:
+            return
+        if item.artwork_path:
+            self.thumbnail_cache.invalidate_source(item.artwork_path)
+        self.artist_image_service.clear_cache(
+            ArtistIdentity.from_display_name(summary.display_name)
+        )
+        self._pending_artist_image_keys.clear()
+        self._reset_abandoned_artist_image_states()
+        self.artist_browser_model.replace_item(
+            browser_key,
+            artwork_path=None,
+            image_state=MediaImageState.MISSING,
+            has_cached_image=False,
+            source_url=None,
+        )
+        if self.current_view_kind == "artists":
+            self.load_visible_browser_images(
+                tuple(
+                    key
+                    for key in self.browser_view.visible_item_keys()
+                    if key != browser_key
+                )
+            )
+        self.refresh_artist_cache_status()
+
+    def open_artist_image_source(self, browser_key: str) -> None:
+        item = self.artist_browser_model.item_for_key(browser_key)
+        if item is None or not is_safe_artist_source_url(item.source_url):
+            return
+        QDesktopServices.openUrl(QUrl(str(item.source_url)))
+
+    def invalidate_browser_data(
+        self,
+        reason: BrowserInvalidationReason | str,
+    ) -> None:
+        """Invalidate only browser data affected by a real library mutation."""
+        plan = self.browser_summary_cache.invalidate(reason)
+        if plan.album_summaries:
+            self.browser_summary_loader.invalidate("albums")
+            self._browser_model_revisions["albums"] = None
+        if plan.artist_summaries:
+            self.browser_summary_loader.invalidate("artists")
+            self._browser_model_revisions["artists"] = None
+        if plan.album_thumbnails:
+            for item in self.album_browser_model.items():
+                if item.artwork_path:
+                    self.thumbnail_cache.invalidate_source(item.artwork_path)
+        if plan.artist_thumbnails:
+            for item in self.artist_browser_model.items():
+                if item.artwork_path:
+                    self.thumbnail_cache.invalidate_source(item.artwork_path)
+
+    def open_album(self, browser_key: str) -> None:
+        summary = self._browser_summary_maps["albums"].get(str(browser_key))
+        if not isinstance(summary, AlbumSummary):
+            return
+        self._remember_browser_scroll()
+        rows = query_album_tracks(self.db.conn, summary.key)
         self.current_view_kind = "album_tracks"
-        self.current_playlist_name = album_name
+        self.current_playlist_name = summary.album_title
+        self.load_library(rows, summary.album_title, "Album view")
 
-        self.load_library(
-            rows,
-            album_name,
-            "Album view"
-        )
-
-    def open_artist(self, artist_name: str) -> None:
-        rows = self.db.conn.execute("""
-            SELECT id, title, artist, album, year, path, cover_path, duration_seconds, created_at
-            FROM tracks
-            WHERE COALESCE(NULLIF(artist, ''), 'Unknown Artist') = ?
-            ORDER BY album COLLATE NOCASE, title COLLATE NOCASE
-        """, (artist_name,)).fetchall()
-
+    def open_artist(self, browser_key: str) -> None:
+        summary = self._browser_summary_maps["artists"].get(str(browser_key))
+        if not isinstance(summary, ArtistSummary):
+            return
+        self._remember_browser_scroll()
+        rows = query_artist_tracks(self.db.conn, summary.key)
         self.current_view_kind = "artist_tracks"
-        self.current_playlist_name = artist_name
-
-        self.load_library(
-            rows,
-            artist_name,
-            "Artist view"
-        )
+        self.current_playlist_name = summary.display_name
+        self.load_library(rows, summary.display_name, "Artist view")
 
     def refresh_artwork(self) -> None:
         updated = refresh_covers_for_library(self.db)
+        if updated:
+            self.invalidate_browser_data(BrowserInvalidationReason.ARTWORK_REFRESH)
         self.refresh_current_view()
 
         if updated:
@@ -1990,6 +2306,8 @@ class MusicVaultWindow(QMainWindow):
             return
 
         count = import_folder(self.db, folder)
+        if count:
+            self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
         self.refresh_current_view()
 
         QMessageBox.information(self, "Import complete", f"Imported or refreshed {count} audio files.")
@@ -2115,6 +2433,8 @@ class MusicVaultWindow(QMainWindow):
                 )
 
         result.finish_imports(imported_count)
+        if imported_count:
+            self.invalidate_browser_data(BrowserInvalidationReason.YOUTUBE_IMPORT)
         for failure in result.failures:
             if not failure.video_id:
                 continue
@@ -2732,6 +3052,8 @@ class MusicVaultWindow(QMainWindow):
             **{key: value for key, value in updates.items() if value not in (None, "")},
         )
 
+        self.invalidate_browser_data(BrowserInvalidationReason.METADATA_ENRICHMENT)
+
         self.refresh_current_view()
 
         QMessageBox.information(
@@ -2741,6 +3063,43 @@ class MusicVaultWindow(QMainWindow):
         )
 
     def filter_library(self, text: str) -> None:
+        if (
+            self.current_view_kind in {"albums", "artists"}
+            and getattr(self, "_active_browser_kind", None) == self.current_view_kind
+            and hasattr(self, "browser_view")
+        ):
+            kind = self.current_view_kind
+            proxy = self._browser_proxy(kind)
+            source_count = proxy.sourceModel().rowCount() if proxy.sourceModel() else 0
+            proxy.set_filter_text(text)
+            self.track_count_card.value_label.setText(str(proxy.rowCount()))
+            if self.browser_view.view_state() not in {
+                MediaGridState.LOADING,
+                MediaGridState.ERROR,
+            }:
+                if source_count and proxy.rowCount() == 0:
+                    self.browser_view.set_view_state(
+                        MediaGridState.EMPTY,
+                        "No matching cards",
+                        "Try a shorter album or artist search.",
+                        "search",
+                    )
+                elif source_count:
+                    self.browser_view.set_view_state(MediaGridState.CONTENT)
+                else:
+                    self.browser_view.set_view_state(
+                        MediaGridState.EMPTY,
+                        "No albums yet" if kind == "albums" else "No artists yet",
+                        (
+                            "Imported tracks with album metadata will appear here."
+                            if kind == "albums"
+                            else "Imported artist metadata will appear here."
+                        ),
+                        "albums" if kind == "albums" else "artist-unknown",
+                    )
+            self.browser_view.schedule_visible_items()
+            return
+
         needle = text.lower().strip()
         visible_count = 0
 
@@ -2785,6 +3144,7 @@ class MusicVaultWindow(QMainWindow):
         self.db.conn.executemany("DELETE FROM tracks WHERE id=?", missing)
         self.db.conn.commit()
 
+        self.invalidate_browser_data(BrowserInvalidationReason.REMOVE_MISSING)
         self.refresh_current_view()
         self.write_app_status()
 
@@ -2835,6 +3195,125 @@ class MusicVaultWindow(QMainWindow):
         if folder:
             self.settings_download_folder.setText(folder)
 
+    def confirm_enable_artist_photos(self) -> None:
+        if self.config.get("artist_image_fetch_enabled") is True:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Enable Artist Photos?",
+            "When enabled, Music Vault sends visible artist names to public "
+            "MusicBrainz and Wikimedia/Wikipedia services and caches image "
+            "results locally. No API key is used. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            if hasattr(self, "settings_artist_images_enabled"):
+                self.settings_artist_images_enabled.setChecked(False)
+            return
+        self.config["artist_image_fetch_enabled"] = True
+        if hasattr(self, "settings_artist_images_enabled"):
+            self.settings_artist_images_enabled.setChecked(True)
+        self.save_config()
+        self.refresh_artist_cache_status()
+        if hasattr(self, "browser_action_btn"):
+            self.browser_action_btn.setVisible(False)
+        if self.current_view_kind == "artists":
+            self.load_visible_browser_images(self.browser_view.visible_item_keys())
+
+    def on_artist_image_setting_clicked(self, checked: bool) -> None:
+        if checked:
+            self.confirm_enable_artist_photos()
+            return
+        self.config["artist_image_fetch_enabled"] = False
+        self.artist_image_service.cancel_all()
+        self._pending_artist_image_keys.clear()
+        self._reset_abandoned_artist_image_states()
+        self.save_config()
+        self.refresh_artist_cache_status()
+        if self.current_view_kind == "artists":
+            self.browser_action_btn.setVisible(True)
+
+    def _reset_abandoned_artist_image_states(self) -> None:
+        for item in self.artist_browser_model.items():
+            if item.image_state is not MediaImageState.LOADING:
+                continue
+            self.artist_browser_model.replace_item(
+                item.key,
+                image_state=(
+                    MediaImageState.READY
+                    if item.artwork_path
+                    else MediaImageState.MISSING
+                ),
+            )
+
+    def clear_artist_image_cache(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Clear artist-photo cache?",
+            "Delete cached artist photos and lookup results only? Your music, "
+            "metadata, database, and album artwork will not be changed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        for item in self.artist_browser_model.items():
+            if item.artwork_path:
+                self.thumbnail_cache.invalidate_source(item.artwork_path)
+        self.artist_image_service.clear_cache()
+        self._pending_artist_image_keys.clear()
+        for item in self.artist_browser_model.items():
+            self.artist_browser_model.replace_item(
+                item.key,
+                artwork_path=None,
+                image_state=MediaImageState.MISSING,
+                has_cached_image=False,
+                source_url=None,
+            )
+        self.refresh_artist_cache_status()
+        QMessageBox.information(
+            self,
+            "Artist photos cleared",
+            "The local artist-photo cache was cleared.",
+        )
+
+    def open_artist_image_cache_folder(self) -> None:
+        folder = artist_images_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
+    @staticmethod
+    def _format_cache_bytes(value: int) -> str:
+        size = max(0, int(value))
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / (1024 * 1024):.1f} MB"
+
+    def refresh_artist_cache_status(self) -> None:
+        if not hasattr(self, "artist_images_status"):
+            return
+        try:
+            stats = self.artist_image_cache.statistics()
+            self.artist_images_status.setText(
+                "Artist Photo Fetching: "
+                + (
+                    "Enabled"
+                    if self.config.get("artist_image_fetch_enabled") is True
+                    else "Disabled"
+                )
+                + f"\nCached Results: {stats['entry_count']}"
+                + f"\nCached Images: {stats['file_count']} "
+                + f"({self._format_cache_bytes(stats['total_bytes'])})"
+                + f"\nCache Folder: {artist_images_dir()}"
+            )
+        except Exception:
+            self.artist_images_status.setText(
+                "Artist Photo Cache: Status unavailable"
+            )
+
     def save_settings_from_ui(self) -> None:
         data_dir().mkdir(parents=True, exist_ok=True)
 
@@ -2852,6 +3331,10 @@ class MusicVaultWindow(QMainWindow):
 
         self.config["download_folder"] = str(Path(download_folder).resolve())
         self.config["audio_quality"] = self.settings_quality.currentText()
+        self.config["artist_image_fetch_enabled"] = bool(
+            self.settings_artist_images_enabled.isChecked()
+            and self.config.get("artist_image_fetch_enabled") is True
+        )
         self.save_config()
 
         if hasattr(self, "youtube_output"):
@@ -2955,10 +3438,18 @@ class MusicVaultWindow(QMainWindow):
         if hasattr(self, "settings_api_key") and not self.settings_api_key.text().strip():
             self.settings_api_key.setText(self.read_saved_api_key())
 
+        if hasattr(self, "settings_artist_images_enabled"):
+            previous = self.settings_artist_images_enabled.blockSignals(True)
+            try:
+                self.settings_artist_images_enabled.setChecked(
+                    self.config.get("artist_image_fetch_enabled") is True
+                )
+            finally:
+                self.settings_artist_images_enabled.blockSignals(previous)
+        self.refresh_artist_cache_status()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._browser_cards:
-            self._browser_reflow_timer.start()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -2968,6 +3459,9 @@ class MusicVaultWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.flush_pending_volume_save()
+        self.browser_summary_loader.close()
+        self.thumbnail_cache.close()
+        self.artist_image_service.shutdown()
         super().closeEvent(event)
 
     def find_ffmpeg_bin(self) -> str | None:

@@ -45,6 +45,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   premium timeline/volume controls, and compact mode and queue status.
 - Added responsive layouts, keyboard/accessibility polish, empty states, and a
   reusable isolated synthetic UI review harness for three desktop sizes.
+- Replaced eager Album and Artist card widget trees with a delegate-painted,
+  responsive model/view grid that preserves keyboard activation and filtering.
+- Added SQL-aggregated album and artist summaries, stable identity keys,
+  exact key-based track lookup, revision-aware summary caching, centralized
+  invalidation, and read-only background summary loading.
+- Added a bounded, coalescing thumbnail cache that decodes local images away
+  from the GUI thread and requests only visible or near-visible artwork.
+- Separated artist identity from album artwork. Artist cards now use a
+  dedicated original unknown-artist placeholder unless a credible cached
+  artist photo is available.
+- Added optional artist-photo lookup behind an explicit, disabled-by-default
+  setting, using a no-key MusicBrainz and Wikimedia provider path with strict
+  match confidence, HTTPS destination validation, local provenance, negative
+  caching, and safe cache-clear controls.
+- Added a synthetic media-browser profiler for 300, 1,000, and 5,000 tracks;
+  representative post-change queries remained below 30 ms, revisits below
+  0.01 ms, and eager per-card QWidget creation remained zero.
 
 ## 1.0.0-rc.1 - Unreleased RC baseline
 
