@@ -28,7 +28,11 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Authorized media acquisition with yt-dlp and FFmpeg
 - Persistent local library backed by SQLite
 - Embedded artwork extraction and artwork display
-- Album and artist browsing
+- Fast SQL-backed Album and Artist model/view browsers with cached summaries,
+  visible-range high-DPI thumbnails, and exact same-title album separation
+- Album cards retain album artwork; Artist cards use a dedicated unknown-artist
+  placeholder or an optional credible cached artist photo, never an album-cover
+  fallback
 - Custom local playlists
 - Local playback with seek and persisted volume controls
 - Independent now-playing identity with active-row tracking across automatic,
@@ -126,6 +130,13 @@ keys, private playlist details, database files, status files, or unsanitized
 local paths into an issue. See [Data and Privacy](docs/DATA_AND_PRIVACY.md) and
 [Security](SECURITY.md).
 
+Artist-photo lookup is a separate opt-in setting and is disabled by default.
+When enabled, visible artist names may be sent to public MusicBrainz,
+Wikidata/Wikipedia, and Wikimedia services; no API key is required. Photos and
+provenance are cached only under `data/artist_images/`, remain ignored by Git,
+and can be cleared from Music Vault. Disabling fetching prevents new requests
+while allowing an existing valid cache to remain visible.
+
 ## Developer workflow
 
 The PowerShell helpers resolve the project root and use the project-local
@@ -142,6 +153,7 @@ virtual environment:
 .\tools\dev\rebuild_and_run.ps1
 .\tools\dev\v1_sanity_check.ps1
 .\tools\dev\capture_ui_review.ps1
+.\tools\dev\profile_media_browsers.ps1
 ```
 
 Run the synthetic regression suite with:
@@ -154,6 +166,12 @@ The UI review helper creates an isolated synthetic runtime and sanitized
 screenshots outside the repository by default. It never uses the personal
 database, API key, media, artwork cache, or network services. Screenshot output
 is for local review only and is not committed automatically.
+
+The media-browser profiler likewise creates temporary schema-v2 synthetic
+libraries at 300, 1,000, and 5,000 tracks. It reports SQL-summary, model,
+first-render, cached-revisit, widget, and thumbnail metrics without reading the
+personal library or using network services. Timing variance is informational;
+structural failures produce a nonzero result.
 
 Build the one-folder Windows application with:
 

@@ -75,14 +75,16 @@ FIFO queue and base-context resume behavior.
 **Objective:** Keep album and artist browsing accurate and responsive as the
 library grows.
 
-**Scope:** Define stable artist/album grouping rules, remove title-only grouping
-ambiguities, measure current rendering/query costs, and optimize the proven
-bottlenecks.
+**Scope:** Aggregate album and artist summaries in SQLite, use stable
+album/artist browser identities, replace eager card widgets with a delegate
+model/view grid, cache unchanged summaries and visible thumbnails, load work in
+the background, and separate optional artist photos from album artwork through
+an explicit privacy-aware opt-in and runtime-only cache.
 
 **Non-goals:** No automatic bulk metadata rewrite and no speculative database
 replacement.
 
-**Status:** Next.
+**Status:** Complete.
 
 ## Batch 6 — Metadata Foundation and Manual Correction
 
@@ -95,7 +97,7 @@ and protection for user overrides.
 **Non-goals:** No automatic rewrite of the existing personal library and no
 AcoustID requirement unless separately approved.
 
-**Status:** Planned.
+**Status:** Next.
 
 ## Batch 7 — Existing Library Metadata Remediation
 

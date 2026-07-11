@@ -30,6 +30,7 @@ REQUIRED_ICONS: Final[tuple[str, ...]] = (
     "downloaded",
     "albums",
     "artists",
+    "artist-unknown",
     "playlists",
     "sync",
     "settings",

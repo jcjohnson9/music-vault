@@ -16,16 +16,22 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/sync_result.py` | Typed synchronization outcome shared by engine, UI, status, logging, and tests. |
 | `music_vault/core/safety.py` | Secret redaction, video-ID extraction, source-date normalization, and safe output paths. |
 | `music_vault/core/playback_state.py` | Pure volume normalization/config filtering and track-ID-to-table-row helpers. |
+| `music_vault/core/library_browser.py` | SQL-aggregated album/artist summaries, stable browser identities, exact track lookup, revision fingerprints, and summary-cache invalidation. |
 | `music_vault/core/paths.py` | Central project, runtime-data, asset, and frozen-application path resolution. |
 | `music_vault/core/app_status.py` | Versioned, read-only-for-consumers neutral App Status JSON export. |
 | `music_vault/core/watchtower_status.py` | Temporary compatibility re-export for the former module name. |
 | `music_vault/ui/theme.py` | Central colors, spacing, radii, typography, shared QSS, and guarded native dark-title-bar integration. |
 | `music_vault/ui/icons.py` | Safe source/frozen lookup plus cached, tinted, high-DPI rendering for original SVG UI assets. |
 | `music_vault/ui/components.py` | Focused reusable controls for icon buttons, elided text, search, overflow actions, headers, and empty states. |
+| `music_vault/ui/browser_loader.py` | Token-guarded background summary jobs using short-lived read-only database connections. |
+| `music_vault/ui/media_grid.py` | Reusable album/artist models, filter proxy, delegate-painted responsive grid, state presentation, and visible-range discovery. |
+| `music_vault/ui/thumbnail_cache.py` | Bounded memory LRU, coalesced background QImage decoding, high-DPI thumbnail keys, and stale-generation protection. |
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
+| `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/musicbrainz_enricher.py` | Optional MusicBrainz metadata lookup. |
 | `music_vault/metadata/cover_art.py` | Optional Cover Art Archive artwork retrieval. |
 | `MusicVault.spec` | PyInstaller configuration for the packaged Windows application. |
+| `tools/dev/profile_media_browsers.py` | Synthetic-only 300/1,000/5,000-track query, model, render, thumbnail, and revisit profiler. |
 
 Music Vault has no Watchtower runtime dependency or integration. Active code
 uses `app_status.py`; `watchtower_status.py` only preserves import compatibility.
@@ -50,7 +56,10 @@ for the supported public/unlisted workflow and does not inspect browser cookie
 profiles. yt-dlp and FFmpeg perform
 authorized acquisition and audio processing. Mutagen reads media metadata and
 embedded artwork. MusicBrainz and Cover Art Archive are optional enrichment
-services. None of these external services owns the local Music Vault library.
+services. When separately enabled by the user, artist-photo lookup uses
+MusicBrainz identity followed by public Wikidata, Wikipedia, or Wikimedia
+image metadata. None of these external services owns the local Music Vault
+library.
 
 ## Data and artifact boundaries
 
@@ -64,8 +73,9 @@ code must not contain credentials or private library content.
 
 The local `data/` directory contains user-specific state such as the SQLite
 database, configuration, API-key file, synchronization state, media, artwork,
-status export, reports, and migration backups under `data/backups/`. Runtime data is private and excluded from source
-control and public packages.
+artist-image files and provenance under `data/artist_images/`, status export,
+reports, and migration backups under `data/backups/`. Runtime data is private
+and excluded from source control and public packages.
 
 ### Build output
 
@@ -90,13 +100,69 @@ without changing pages or queue/base context. Volume is normalized in memory,
 applied consistently to the slider and audio output, and persisted through a
 short debounce with a final close-time flush.
 
+## Media-browser performance boundary
+
+Albums and Artists use lightweight immutable summaries rather than
+materializing every track and constructing a QWidget tree per card. Album
+identity combines trimmed/case-folded album title, album artist with a
+conservative track-artist fallback, and canonical year. Artist identity trims
+and case-folds the complete credit without splitting collaborations or
+guessing canonical people. The same keys drive exact track lookup, preventing
+same-title releases from collapsing merely because their titles match.
+
+Summary work runs through a short-lived query-only SQLite connection and is
+applied only while its request token and library revision remain current.
+Revision-aware caches are invalidated after imports, successful sync imports,
+missing-track removal, enrichment, and artwork changes, but not after playback,
+queue, volume, search, or App Status changes. Album artwork is decoded as QImage
+work in a bounded worker pool; QPixmap creation and model updates stay on the
+GUI thread. Only visible and near-visible keys request thumbnails, and duplicate
+requests coalesce.
+
+The committed profiler uses temporary schema-v2 synthetic databases and no
+network or personal files. A representative post-change run measured:
+
+| Synthetic scale | Albums query | Artists query | Album/artist summaries |
+| --- | ---: | ---: | ---: |
+| 300 tracks | 1.863 ms | 1.413 ms | 100 / 200 |
+| 1,000 tracks | 5.428 ms | 3.795 ms | 300 / 600 |
+| 5,000 tracks | 23.833 ms | 14.274 ms | 1,000 / 2,000 |
+
+Cached revisits were at most 0.007 ms, the grid created zero per-card QWidgets,
+and only the 25 visible/near-visible entries were considered for artwork.
+These measurements are development-machine evidence, not hard timing promises;
+structural profiler failures are gates while timing variance is informational.
+
+## Artist-image boundary
+
+Album cards use album covers. Artist cards never substitute an album cover for
+an artist portrait: they use a dedicated original unknown-artist asset until a
+credible cached artist photo exists. External fetching is controlled by the
+`artist_image_fetch_enabled` setting and defaults to false. Valid cached photos
+can still render while fetching is disabled.
+
+The initial provider is accessed through a provider-neutral interface. It
+requires one unique high-confidence exact normalized-name MusicBrainz match,
+then follows validated MusicBrainz relations to Wikidata or English Wikipedia
+and obtains image metadata from Wikimedia services. Ambiguous or low-confidence
+results remain unknown. Requests are background, capped, rate-limited, HTTPS
+only, host-whitelisted, DNS-checked against private/local destinations, bounded
+by time and response size, and content-validated before caching.
+
+`data/artist_images/index.json` is a versioned atomic manifest containing
+normalized request identity, match/provenance fields, safe source URLs, status,
+and retry timestamps. Content-addressed files live below
+`data/artist_images/files/`. Negative matches are cached longer than temporary
+network failures. Clearing this cache does not modify tracks, the database, or
+neighboring runtime data.
+
 ## UI system and review boundary
 
 The premium visual system is centralized under `music_vault/ui/`; `app.py`
 retains page orchestration and established behavior while consuming shared
-tokens, static QSS, cached original SVG icons, and narrowly reusable controls.
-Responsive browser-card reflow reuses existing widgets and does not repeat
-database grouping or artwork decoding on each resize.
+tokens, static QSS, cached original SVG icons, narrowly reusable controls, and
+the delegate-painted media browser. Resizing reflows the item view without
+constructing card widgets or repeating database grouping.
 
 `tools/dev/capture_ui_review.py` creates a temporary marker-valid project root,
 synthetic schema-v2 data, generated artwork, and non-media sentinel files. The

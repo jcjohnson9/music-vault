@@ -23,5 +23,8 @@
 - Never run a real YouTube sync unless a future batch explicitly authorizes it.
 - Preserve the existing working queue behavior unless a batch explicitly
   changes it.
+- Browser-performance changes must run
+  `tools/dev/profile_media_browsers.ps1`; it uses synthetic temporary data only,
+  and generated benchmark JSON or screenshots must not be committed.
 - Music Vault is standalone and has no Watchtower relationship. Prime
   interoperability remains optional and external.

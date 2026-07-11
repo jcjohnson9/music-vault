@@ -5,12 +5,13 @@ import json
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QTimer, Qt
 
 
 REVIEW_ENV = "MUSIC_VAULT_UI_REVIEW"
@@ -19,7 +20,8 @@ REVIEW_SCHEMA_VERSION = 1
 DEFAULT_REVIEW_SCENES = (
     "library",
     "albums",
-    "artists",
+    "artists_fetch_disabled",
+    "artists_fetch_enabled",
     "sync_center",
     "settings",
     "empty_playlist",
@@ -29,6 +31,8 @@ SCENE_LABELS = {
     "library": "Library",
     "albums": "Albums",
     "artists": "Artists",
+    "artists_fetch_disabled": "Artists — Fetch Disabled",
+    "artists_fetch_enabled": "Artists — Synthetic Fetch Enabled",
     "sync_center": "Sync Center",
     "settings": "Settings",
     "empty_playlist": "Empty Playlist",
@@ -201,6 +205,8 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         raise ReviewPlanError("Synthetic configuration is unavailable or malformed.") from exc
     if not isinstance(config, dict) or config.get("volume_percent") != 23:
         raise ReviewPlanError("Synthetic configuration did not preserve volume 23.")
+    if config.get("artist_image_fetch_enabled") is not False:
+        raise ReviewPlanError("Synthetic artist-image fetching must default to disabled.")
     download_folder = _absolute_path(config.get("download_folder"), "download_folder")
     _ensure_under_runtime(download_folder, plan.runtime_root, "download_folder")
 
@@ -230,6 +236,7 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         "schema_version": schema_version,
         "status_generated": True,
         "config_volume_percent": 23,
+        "artist_image_fetch_enabled_by_default": False,
         "api_key_present": False,
     }
 
@@ -258,6 +265,14 @@ def sanitize_review_paths(window: object) -> None:
         ),
     )
     _set_label_text(window, "app_status_line", rf"App Status: {_DISPLAY_DATA_ROOT}\music_vault_status.json")
+    _set_label_text(
+        window,
+        "artist_images_status",
+        "Artist Photo Fetching: Disabled\n"
+        "Cached Results: 0\n"
+        "Cached Images: 0 (0 B)\n"
+        rf"Cache Folder: {_DISPLAY_DATA_ROOT}\artist_images",
+    )
     _set_label_text(window, "ffmpeg_status", "FFmpeg: Synthetic review environment")
     _set_label_text(window, "api_key_status", "YouTube API Key: Missing (synthetic review)")
 
@@ -317,6 +332,29 @@ def _set_page(window: object, page_attribute: str) -> None:
     pages.setCurrentWidget(page)
 
 
+def _set_review_artist_fetch_state(window: object, enabled: bool) -> None:
+    """Set review-only in-memory consent without persisting synthetic config."""
+
+    config = getattr(window, "config", None)
+    if isinstance(config, dict):
+        config["artist_image_fetch_enabled"] = bool(enabled)
+    for attribute in (
+        "settings_artist_images_enabled",
+        "settings_artist_image_fetch",
+        "settings_artist_photos_enabled",
+        "artist_image_fetch_checkbox",
+    ):
+        checkbox = getattr(window, attribute, None)
+        if checkbox is None or not hasattr(checkbox, "setChecked"):
+            continue
+        previous = checkbox.blockSignals(True) if hasattr(checkbox, "blockSignals") else False
+        try:
+            checkbox.setChecked(bool(enabled))
+        finally:
+            if hasattr(checkbox, "blockSignals"):
+                checkbox.blockSignals(previous)
+
+
 def prepare_review_scene(window: object, scene: str) -> None:
     if scene == "library":
         _set_page(window, "library_page")
@@ -351,8 +389,9 @@ def prepare_review_scene(window: object, scene: str) -> None:
         window.current_playlist_id = None
         window.current_playlist_name = "Albums"
         window.show_album_browser()
-    elif scene == "artists":
+    elif scene in {"artists", "artists_fetch_disabled", "artists_fetch_enabled"}:
         _set_page(window, "library_page")
+        _set_review_artist_fetch_state(window, scene == "artists_fetch_enabled")
         window.current_view_kind = "artists"
         window.current_playlist_id = None
         window.current_playlist_name = "Artists"
@@ -392,6 +431,146 @@ def prepare_review_scene(window: object, scene: str) -> None:
     sanitize_review_paths(window)
 
 
+_BROWSER_REVIEW_SCENES = frozenset(
+    {"albums", "artists", "artists_fetch_disabled", "artists_fetch_enabled"}
+)
+
+
+def _review_browser_kind(scene: str) -> str | None:
+    if scene == "albums":
+        return "albums"
+    if scene in {"artists", "artists_fetch_disabled", "artists_fetch_enabled"}:
+        return "artists"
+    return None
+
+
+def review_scene_ready(window: object, scene: str) -> bool:
+    """Return whether asynchronous browser content is safe to capture."""
+
+    kind = _review_browser_kind(scene)
+    if kind is None:
+        return True
+    view = getattr(window, "browser_view", None)
+    model = getattr(window, f"{kind[:-1]}_browser_model", None)
+    if view is None or model is None or not hasattr(model, "rowCount"):
+        return False
+    if model.rowCount() <= 0:
+        return False
+    state = view.view_state() if hasattr(view, "view_state") else None
+    state_value = getattr(state, "value", state)
+    if str(state_value) != "content":
+        return False
+    visible = view.visible_item_keys(near_rows=0) if hasattr(view, "visible_item_keys") else ()
+    if not visible:
+        return False
+    thumbnail_cache = getattr(window, "thumbnail_cache", None)
+    if thumbnail_cache is not None and int(getattr(thumbnail_cache, "pending_count", 0)):
+        return False
+    if kind == "artists":
+        service = getattr(window, "artist_image_service", None)
+        if service is not None and int(getattr(service, "pending_count", 0)):
+            return False
+    return True
+
+
+def finalize_review_scene(window: object, scene: str) -> None:
+    """Apply deterministic focus/loading presentation after async work settles."""
+
+    kind = _review_browser_kind(scene)
+    if kind is None:
+        return
+    view = getattr(window, "browser_view", None)
+    proxy = getattr(window, f"{kind[:-1]}_browser_proxy", None)
+    model = getattr(window, f"{kind[:-1]}_browser_model", None)
+    if view is not None and proxy is not None and proxy.rowCount() > 1:
+        view.setCurrentIndex(proxy.index(1, 0))
+        view.setFocus(Qt.FocusReason.OtherFocusReason)
+    if scene != "artists_fetch_enabled" or model is None or not hasattr(model, "items"):
+        return
+    # Preserve one explicit per-card loading state for deterministic visual
+    # review even though the no-network synthetic provider resolves quickly.
+    for item in model.items():
+        if "loading" in str(item.title).casefold():
+            model.replace_item(
+                item.key,
+                artwork_path=None,
+                image_state="loading",
+                has_cached_image=False,
+            )
+            break
+
+
+def browser_review_metrics(window: object, scene: str) -> dict[str, Any] | None:
+    """Return aggregate path/name-free evidence for a synthetic browser capture."""
+
+    kind = _review_browser_kind(scene)
+    if kind is None:
+        return None
+    model = getattr(window, f"{kind[:-1]}_browser_model", None)
+    proxy = getattr(window, f"{kind[:-1]}_browser_proxy", None)
+    view = getattr(window, "browser_view", None)
+    if model is None or proxy is None or view is None:
+        raise ReviewPlanError("Synthetic browser metrics are unavailable.")
+
+    visible = tuple(view.visible_item_keys()) if hasattr(view, "visible_item_keys") else ()
+    visible_digest = hashlib.sha256("\n".join(visible).encode("utf-8")).hexdigest()
+    index_widgets = sum(
+        1
+        for row in range(proxy.rowCount())
+        if view.indexWidget(proxy.index(row, 0)) is not None
+    )
+    states: dict[str, int] = {}
+    if hasattr(model, "items"):
+        for item in model.items():
+            value = getattr(getattr(item, "image_state", None), "value", None)
+            normalized = str(value or "unknown")
+            states[normalized] = states.get(normalized, 0) + 1
+
+    cache_metrics: dict[str, int] = {}
+    thumbnail_cache = getattr(window, "thumbnail_cache", None)
+    stats = getattr(thumbnail_cache, "stats", None)
+    for attribute in (
+        "requests",
+        "hits",
+        "misses",
+        "coalesced",
+        "decodes",
+        "failures",
+        "evictions",
+        "entries",
+        "bytes_used",
+        "pending",
+    ):
+        value = getattr(stats, attribute, 0)
+        cache_metrics[attribute] = int(value) if isinstance(value, int) else 0
+
+    service = getattr(window, "artist_image_service", None)
+    provider = getattr(window, "artist_image_provider", None) or getattr(service, "provider", None)
+    calls = getattr(provider, "calls", ())
+    provider_call_count = len(calls) if isinstance(calls, (list, tuple)) else 0
+    synthetic_mode = (
+        os.environ.get("MUSIC_VAULT_ARTIST_IMAGE_PROVIDER", "").strip().casefold()
+        in {"synthetic", "fake"}
+    )
+    return {
+        "kind": kind,
+        "model_rows": int(model.rowCount()),
+        "filtered_rows": int(proxy.rowCount()),
+        "per_item_widget_count": index_widgets,
+        "visible_key_count": len(visible),
+        "visible_key_sha256": visible_digest,
+        "image_states": states,
+        "thumbnail_cache": cache_metrics,
+        "artist_fetch_enabled": bool(
+            isinstance(getattr(window, "config", None), dict)
+            and window.config.get("artist_image_fetch_enabled") is True
+        ),
+        "synthetic_provider_active": synthetic_mode,
+        "synthetic_provider_call_count": provider_call_count if synthetic_mode else 0,
+        "public_provider_call_count": 0 if synthetic_mode else provider_call_count,
+    }
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -418,6 +597,7 @@ class UIReviewController(QObject):
         self.captures: list[dict[str, Any]] = []
         self.runtime_checks: dict[str, Any] = {}
         self.started_at = _utc_now()
+        self._ready_deadline = 0.0
 
     def start(self) -> None:
         try:
@@ -442,9 +622,8 @@ class UIReviewController(QObject):
             # switching stacked pages while resizing can otherwise leave stale
             # regions in Qt's backing store even after a synchronous repaint.
             # This path is reachable only through the explicit review hook.
-            if self.job_index:
-                self.window.hide()
-                self.app.processEvents()
+            self.window.hide()
+            self.app.processEvents()
             self.window.resize(size.width, size.height)
             prepare_review_scene(self.window, scene)
             self.window.showNormal()
@@ -457,7 +636,29 @@ class UIReviewController(QObject):
         except Exception as exc:
             self._fail(exc)
             return
-        QTimer.singleShot(self.plan.settle_ms, self._prime_current_render)
+        self._ready_deadline = time.monotonic() + 15.0
+        QTimer.singleShot(40, self._wait_for_scene_ready)
+
+    def _wait_for_scene_ready(self) -> None:
+        _size, scene = self.jobs[self.job_index]
+        try:
+            if review_scene_ready(self.window, scene):
+                finalize_review_scene(self.window, scene)
+                self.window.repaint()
+                self.app.processEvents()
+                QTimer.singleShot(self.plan.settle_ms, self._prime_current_render)
+                return
+            browser_view = getattr(self.window, "browser_view", None)
+            if browser_view is not None and hasattr(browser_view, "schedule_visible_items"):
+                browser_view.schedule_visible_items()
+            if time.monotonic() >= self._ready_deadline:
+                raise ReviewPlanError(
+                    "Synthetic browser content did not become ready before capture."
+                )
+        except Exception as exc:
+            self._fail(exc)
+            return
+        QTimer.singleShot(40, self._wait_for_scene_ready)
 
     def _prime_current_render(self) -> None:
         """Render once before saving so every child surface is polished."""
@@ -478,18 +679,15 @@ class UIReviewController(QObject):
         size, scene = self.jobs[self.job_index]
         try:
             sanitize_review_paths(self.window)
-            from PySide6.QtGui import QColor, QPixmap
             from PySide6.QtWidgets import QToolTip
 
             QToolTip.hideText()
             self.window.repaint()
             self.app.processEvents()
-            # Each capture is normally isolated in its own process by the
-            # developer harness. Rendering the complete widget tree avoids
-            # copying compositor artifacts and also works in offscreen tests.
-            pixmap = QPixmap(self.window.size())
-            pixmap.fill(QColor("#06090E"))
-            self.window.render(pixmap)
+            # QWidget.grab() captures the fully composed hierarchy and remains
+            # reliable when asynchronous thumbnail updates and fractional
+            # device scaling invalidate Qt's backing store.
+            pixmap = self.window.grab()
             if pixmap.isNull():
                 raise ReviewPlanError("Qt returned an empty screenshot.")
 
@@ -498,18 +696,20 @@ class UIReviewController(QObject):
             if not pixmap.save(str(destination), "PNG"):
                 raise ReviewPlanError("Qt could not save a review screenshot.")
 
-            self.captures.append(
-                {
-                    "file": filename,
-                    "page": SCENE_LABELS[scene],
-                    "scene": scene,
-                    "requested_width": size.width,
-                    "requested_height": size.height,
-                    "captured_width": pixmap.width(),
-                    "captured_height": pixmap.height(),
-                    "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-                }
-            )
+            capture = {
+                "file": filename,
+                "page": SCENE_LABELS[scene],
+                "scene": scene,
+                "requested_width": size.width,
+                "requested_height": size.height,
+                "captured_width": pixmap.width(),
+                "captured_height": pixmap.height(),
+                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            }
+            metrics = browser_review_metrics(self.window, scene)
+            if metrics is not None:
+                capture["browser_metrics"] = metrics
+            self.captures.append(capture)
         except Exception as exc:
             self._fail(exc)
             return

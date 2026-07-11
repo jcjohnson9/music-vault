@@ -18,12 +18,13 @@ DEFAULT_SIZES = ((1100, 720), (1440, 900), (1920, 1080))
 DEFAULT_SCENES = (
     "library",
     "albums",
-    "artists",
+    "artists_fetch_disabled",
+    "artists_fetch_enabled",
     "sync_center",
     "settings",
     "empty_playlist",
 )
-RUNTIME_PREFIX = "MusicVault_Batch4_UI_Runtime_"
+RUNTIME_PREFIX = "MusicVault_Batch5_UI_Runtime_"
 OUTPUT_PREFIX = "MusicVault_UI_Review_Output_"
 
 
@@ -61,8 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--page",
         action="append",
-        choices=(*DEFAULT_SCENES, "no_results"),
-        help="Repeatable review scene. Defaults to the six-page review matrix.",
+        choices=(*DEFAULT_SCENES, "artists", "no_results"),
+        help="Repeatable review scene. Defaults to the Batch 5 review matrix.",
     )
     parser.add_argument(
         "--offscreen",
@@ -173,12 +174,13 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         "download_folder": str(downloads),
         "audio_quality": "320",
         "volume_percent": 23,
+        "artist_image_fetch_enabled": False,
     }
     (data / "music_vault_config.json").write_text(
         json.dumps(config, indent=2) + "\n", encoding="utf-8"
     )
 
-    for index in range(7):
+    for index in range(18):
         generated_artwork(covers / f"synthetic_cover_{index + 1}.png", index)
 
     previous_environment = {
@@ -207,26 +209,21 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
             backup_dir=data / "backups",
             youtube_download_root=downloads,
         )
-        artists = (
-            "The Local Archive",
-            "Neon Cartographers",
+        special_artists = (
+            "Aster Resolved Artist",
+            "Boreal No Match Artist",
+            "Cinder Ambiguous Artist",
+            "Distant Loading Artist",
+            "Eclipse Temporary Artist",
+            "Fallow Corrupt Artist",
+            "Synthetic Ensemble With A Deliberately Long Artist Name That Must Elide",
             "Cedar & Signal",
-            "Static Gardens",
-            "Northbound Echo",
-            "Glass District",
-            "The Quiet Current",
-            "Synthetic Ensemble With A Deliberately Long Artist Name",
+            "Northbound Echo featuring The Quiet Current",
             None,
         )
-        albums = (
-            "Midnight Index",
-            "Rooms Without Clocks",
-            "Green Lines",
-            "Signals From Home",
-            "City Atlas",
-            "Field Notes",
-            "A Very Long Synthetic Album Name Designed To Exercise Safe Elision",
-            None,
+        artists = special_artists + tuple(
+            f"Synthetic Artist {index:03d}"
+            for index in range(len(special_artists), 200)
         )
         titles = (
             "Midnight Signal",
@@ -239,14 +236,36 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         )
 
         track_ids: list[int] = []
-        for index in range(24):
-            sentinel = media / f"track_{index + 1:02d}.synthetic-audio"
+        for index in range(300):
+            sentinel = media / f"track_{index + 1:04d}.synthetic-audio"
             sentinel.write_bytes(b"synthetic-review-sentinel\n")
+            if index == 0:
+                album = "A Shared Synthetic Album Title"
+                album_artist = "Aster Resolved Artist"
+                canonical_year = "2001"
+            elif index == 1:
+                album = "A Shared Synthetic Album Title"
+                album_artist = "Boreal No Match Artist"
+                canonical_year = "2001"
+            elif index == 2:
+                album = (
+                    "A Very Long Synthetic Album Name Designed To Exercise Safe "
+                    "Elision Without Overlap"
+                )
+                album_artist = "Cinder Ambiguous Artist"
+                canonical_year = "1999"
+            else:
+                album_index = (index - 3) % 97
+                album = f"Synthetic Album {album_index:03d}"
+                album_artist = f"Synthetic Album Artist {album_index % 60:03d}"
+                canonical_year = (
+                    str(1980 + album_index % 44) if album_index % 4 else None
+                )
             db.upsert_track(
                 sentinel,
-                title=f"{titles[index % len(titles)]} {index + 1:02d}",
+                title=f"{titles[index % len(titles)]} {index + 1:04d}",
                 artist=artists[index % len(artists)],
-                album=albums[index % len(albums)],
+                album=album,
                 duration_seconds=150 + index * 3,
                 source_kind="youtube" if index % 5 == 0 else "local",
             )
@@ -257,10 +276,11 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
             track_ids.append(track_id)
             db.update_track_metadata(
                 track_id,
-                year=1990 + index if index % 4 else None,
+                album_artist=album_artist,
+                year=canonical_year,
                 cover_path=(
-                    str((covers / f"synthetic_cover_{index % 7 + 1}.png").resolve())
-                    if index % 3 != 0
+                    str((covers / f"synthetic_cover_{index % 18 + 1}.png").resolve())
+                    if index % 11 != 0
                     else None
                 ),
             )
@@ -297,7 +317,13 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
 
     if (data / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
-    return {"track_count": len(track_ids), "playlist_count": len(playlist_specs)}
+    return {
+        "track_count": len(track_ids),
+        "playlist_count": len(playlist_specs),
+        "synthetic_album_target": 100,
+        "synthetic_artist_target": 200,
+        "artist_image_fetch_enabled_by_default": False,
+    }
 
 
 def write_review_plan(
@@ -425,6 +451,40 @@ def validate_output(
                 f"Synthetic screenshot is missing shared application chrome: {filename}"
             )
 
+        scene = capture.get("scene")
+        if scene in {
+            "albums",
+            "artists",
+            "artists_fetch_disabled",
+            "artists_fetch_enabled",
+        }:
+            metrics = capture.get("browser_metrics")
+            if not isinstance(metrics, dict):
+                raise RuntimeError("Synthetic browser capture lacks aggregate metrics.")
+            if int(metrics.get("model_rows", 0)) <= 0:
+                raise RuntimeError("Synthetic browser model did not populate.")
+            if int(metrics.get("visible_key_count", 0)) <= 0:
+                raise RuntimeError("Synthetic browser reported no visible items.")
+            if int(metrics.get("per_item_widget_count", -1)) != 0:
+                raise RuntimeError("Synthetic browser created per-item QWidget cards.")
+            if int(metrics.get("public_provider_call_count", -1)) != 0:
+                raise RuntimeError("Synthetic review attempted a public artist provider call.")
+            if not metrics.get("synthetic_provider_active"):
+                raise RuntimeError("Synthetic artist provider safety mode was not active.")
+            if scene in {"artists", "artists_fetch_disabled"}:
+                if metrics.get("artist_fetch_enabled"):
+                    raise RuntimeError("Disabled artist-photo review unexpectedly enabled fetching.")
+                if int(metrics.get("synthetic_provider_call_count", 0)) != 0:
+                    raise RuntimeError("Disabled artist-photo review made a provider request.")
+            if scene == "artists_fetch_enabled" and not metrics.get("artist_fetch_enabled"):
+                raise RuntimeError("Enabled artist-photo review did not enable in-memory consent.")
+            if scene == "artists_fetch_enabled":
+                states = metrics.get("image_states") or {}
+                if int(states.get("ready", 0)) <= 0:
+                    raise RuntimeError(
+                        "Enabled artist-photo review did not render a resolved cached portrait."
+                    )
+
     database = runtime / "data" / "music_vault.sqlite3"
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
     try:
@@ -436,6 +496,11 @@ def validate_output(
         raise RuntimeError("Synthetic database failed final validation.")
     if (runtime / "data" / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
+    config = json.loads(
+        (runtime / "data" / "music_vault_config.json").read_text(encoding="utf-8")
+    )
+    if config.get("artist_image_fetch_enabled") is not False:
+        raise RuntimeError("Synthetic runtime persisted artist-photo fetching as enabled.")
     return payload
 
 
@@ -520,6 +585,10 @@ def main() -> int:
                 "MUSIC_VAULT_PROJECT_ROOT": str(runtime),
                 "HOME": str(runtime / "profile"),
                 "USERPROFILE": str(runtime / "profile"),
+                # The provider factory accepts this only alongside the explicit
+                # isolated review plan/root. It guarantees review cannot reach
+                # public artist metadata or image services.
+                "MUSIC_VAULT_ARTIST_IMAGE_PROVIDER": "synthetic",
             }
         )
         if args.offscreen:
@@ -572,6 +641,21 @@ def main() -> int:
 
         write_aggregate_manifest(output, child_manifests, sizes, scenes)
         manifest = validate_output(output, runtime, len(sizes) * len(scenes))
+        enabled_captures = [
+            capture
+            for capture in manifest.get("captures", [])
+            if capture.get("scene") == "artists_fetch_enabled"
+        ]
+        if enabled_captures and not any(
+            int((capture.get("browser_metrics") or {}).get(
+                "synthetic_provider_call_count", 0
+            ))
+            > 0
+            for capture in enabled_captures
+        ):
+            raise RuntimeError(
+                "Synthetic artist provider was never exercised by enabled review scenes."
+            )
         wrong_data = project_root / "dist" / "MusicVault" / "data"
         if wrong_data.exists():
             raise RuntimeError("dist/MusicVault/data was created during UI review.")
@@ -590,6 +674,8 @@ def main() -> int:
                     "schema_version": 2,
                     "config_volume_percent": 23,
                     "api_key_present": False,
+                    "artist_provider": "synthetic_no_network",
+                    "scale_factor": args.scale or 1.0,
                     "dataset": dataset,
                 },
                 indent=2,

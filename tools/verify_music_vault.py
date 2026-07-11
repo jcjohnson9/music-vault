@@ -16,12 +16,18 @@ REQUIRED_FILES = (
     "music_vault/core/app_status.py",
     "music_vault/core/watchtower_status.py",
     "music_vault/core/paths.py",
+    "music_vault/core/library_browser.py",
+    "music_vault/metadata/artist_images.py",
+    "music_vault/ui/browser_loader.py",
+    "music_vault/ui/media_grid.py",
+    "music_vault/ui/thumbnail_cache.py",
     "music_vault/ui/theme.py",
     "music_vault/ui/icons.py",
     "music_vault/ui/components.py",
     "music_vault/ui/review.py",
     "assets/icons/music_vault.ico",
     "assets/icons/ui/README.md",
+    "assets/icons/ui/artist-unknown.svg",
 )
 
 
@@ -47,10 +53,14 @@ def main() -> int:
         sys.path.insert(0, project_root_text)
 
     from music_vault.core import paths
+    from music_vault.core.library_browser import load_album_summaries, load_artist_summaries
     from music_vault.core.app_status import write_app_status
     from music_vault.core.watchtower_status import write_watchtower_status
     from music_vault.ui.components import EmptyState, IconButton, SearchField
     from music_vault.ui.icons import REQUIRED_ICONS, icon_path
+    from music_vault.ui.media_grid import MediaGridModel, MediaGridView
+    from music_vault.ui.thumbnail_cache import ThumbnailCache
+    from music_vault.metadata.artist_images import ArtistImageCache, ArtistImageService
     from music_vault.ui.review import schedule_ui_review
     from music_vault.ui.theme import application_stylesheet
     import music_vault.app as app
@@ -72,6 +82,21 @@ def main() -> int:
         print("Music Vault UI components or review hook are unavailable.")
         return 1
 
+    if not all(
+        callable(value)
+        for value in (
+            load_album_summaries,
+            load_artist_summaries,
+            MediaGridModel,
+            MediaGridView,
+            ThumbnailCache,
+            ArtistImageCache,
+            ArtistImageService,
+        )
+    ):
+        print("Music Vault media-browser components are unavailable.")
+        return 1
+
     expected_data_dir = PROJECT_ROOT / "data"
     resolved_paths = {
         "project root": paths.project_root(),
@@ -79,6 +104,7 @@ def main() -> int:
         "database": paths.database_path(),
         "config": paths.config_path(),
         "status": paths.app_status_path(),
+        "artist images": paths.artist_images_dir(),
     }
 
     if resolved_paths["project root"] != PROJECT_ROOT:
@@ -89,7 +115,7 @@ def main() -> int:
         print(f"Unexpected data directory: {resolved_paths['data directory']}")
         return 1
 
-    for name in ("database", "config", "status"):
+    for name in ("database", "config", "status", "artist images"):
         if resolved_paths[name].parent != expected_data_dir:
             print(f"{name.title()} path is outside the data directory: {resolved_paths[name]}")
             return 1
