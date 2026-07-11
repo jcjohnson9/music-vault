@@ -31,12 +31,17 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
-| `music_vault/metadata/service.py` | Transactional metadata authority for precedence, materialization, locks, manual/confirmed changes, history, undo, and Batch 7 snapshots. |
+| `music_vault/metadata/remediation_schema.py` | Additive schema-v4 remediation job, item, cache, constraint, and index definitions. |
+| `music_vault/metadata/service.py` | Transactional metadata authority for precedence, materialization, locks, manual/confirmed/high-confidence changes, history, undo, and rollback snapshots. |
+| `music_vault/metadata/matching.py` | Provider-query normalization, recording/release scoring, risk detection, ambiguity policy, and typed field-level decisions. |
+| `music_vault/metadata/remediation.py` | Resumable analyze/apply/verify/rollback coordinator and private aggregate/item reporting. |
+| `music_vault/metadata/tag_writer.py` | Verified MP3 full-file backup, temporary-copy tag writeback, audio-payload checks, atomic commit, and restore. |
 | `music_vault/metadata/musicbrainz_enricher.py` | Typed, explicit MusicBrainz candidate search with bounded public networking. |
 | `music_vault/metadata/artwork.py` | Validated content-addressed local and Cover Art Archive artwork storage. |
 | `music_vault/metadata/cover_art.py` | Compatibility helper for existing Cover Art Archive behavior. |
 | `MusicVault.spec` | PyInstaller configuration for the packaged Windows application. |
 | `tools/dev/profile_media_browsers.py` | Synthetic-only 300/1,000/5,000-track query, model, render, thumbnail, and revisit profiler. |
+| `tools/dev/remediate_library_metadata.py` | Aggregate-only status, analyze, resume, explicitly confirmed apply/writeback, verify, report, and rollback interface. |
 
 Music Vault has no Watchtower runtime dependency or integration. Active code
 uses `app_status.py`; `watchtower_status.py` only preserves import compatibility.
@@ -53,7 +58,7 @@ source playlist
   -> local media files
   -> targeted Mutagen/source observations
   -> metadata precedence and effective field materialization
-  -> schema-v3 SQLite library, provenance, and history
+  -> schema-v4 SQLite library, provenance, history, and remediation state
   -> PySide6 browsing and QMediaPlayer playback
 ```
 
@@ -80,8 +85,9 @@ code must not contain credentials or private library content.
 The local `data/` directory contains user-specific state such as the SQLite
 database, configuration, API-key file, synchronization state, media, artwork,
 artist-image files and provenance under `data/artist_images/`, status export,
-reports, and migration backups under `data/backups/`. Runtime data is private
-and excluded from source control and public packages.
+remediation reports/candidate snapshots/cache state, and database/media backups
+under `data/backups/`. Runtime data is private and excluded from source control
+and public packages.
 
 ### Build output
 
@@ -98,7 +104,7 @@ separate these integrations from local library ownership and persistence.
 
 ## Metadata authority boundary
 
-Schema version 3 separates metadata into three concepts. Provider/file values
+Schema version 3 introduced three metadata-authority concepts. Provider/file values
 are retained in `track_metadata_observations`; one effective state per editable
 field lives in `track_metadata_fields`; and compatible effective columns remain
 materialized in `tracks` for established queries and playback. Effective
@@ -124,9 +130,23 @@ portrait cache.
 Schema migration is additive and uses SQLite's backup API before changing a
 non-empty older database. It seeds conservative state and observations without
 provider access, media-tag reads, fabricated canonical dates, or history.
-Batch 6 mutations remain database-only: playing media is not reloaded and
-audio-file tag writeback is deferred to the audited Batch 7 workflow. See
-[`METADATA_MODEL.md`](METADATA_MODEL.md) for the complete authority contract.
+Schema version 4 adds only persisted remediation job/item/cache structures.
+
+The remediation coordinator keeps analysis separate from apply. Analysis
+snapshots state, uses cached/rate-limited provider candidates, and writes only
+private job/cache/report records. Apply rechecks the aggregate library revision,
+per-item metadata/locks, candidate age, file state, and disk estimate. It routes
+eligible database changes through `MetadataService`; manual and confirmed locks
+remain authoritative. Distinct recording identity is evaluated separately from
+album/release/artwork certainty, so ambiguous release fields stay review-only.
+
+Supported MP3 writeback creates and verifies a complete original backup, edits
+a temporary copy, validates tag readback and unchanged audio-payload hash/codec/
+duration, then atomically replaces the source. Rollback restores the verified
+file and exact pre-apply field/provenance/ID snapshot unless later changes create
+a conflict. Unsupported formats never claim file success. See
+[`METADATA_MODEL.md`](METADATA_MODEL.md) and
+[`METADATA_REMEDIATION.md`](METADATA_REMEDIATION.md) for the complete contracts.
 
 ## Playback state boundary
 
@@ -215,8 +235,8 @@ The current architecture is functional and does not require a wholesale
 rewrite. Known areas for incremental improvement are:
 
 - `music_vault/app.py` has broad responsibilities and is large;
-- existing-library remediation and audited audio-file tag writeback remain
-  deferred to Batch 7;
+- broader audio-format writeback beyond the currently audited MP3 path remains
+  future work;
 - synchronization assumes a single configured source workflow;
 - there is no portable manifest for selective mobile transfer; and
 - there is no station, program-timeline, or mixed audio-segment model for the

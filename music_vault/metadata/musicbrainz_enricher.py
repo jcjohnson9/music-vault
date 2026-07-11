@@ -32,6 +32,8 @@ class MetadataCandidate:
     recording_id: str | None
     release_id: str | None
     score: int
+    duration_seconds: float | None = None
+    album_artist: str | None = None
     country: str | None = None
     release_status: str | None = None
     artwork_available: bool | None = None
@@ -98,6 +100,16 @@ def _release_date(value: object) -> str | None:
         return normalize_release_date(value)
     except ValueError:
         return None
+
+
+def _duration_seconds(value: object) -> float | None:
+    try:
+        milliseconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if milliseconds <= 0:
+        return None
+    return round(milliseconds / 1000.0, 3)
 
 
 class MusicBrainzProvider:
@@ -208,10 +220,14 @@ class MusicBrainzProvider:
         for recording in payload.get("recordings", []) or []:
             if not isinstance(recording, Mapping):
                 continue
-            score = max(0, min(100, int(recording.get("score", 0) or 0)))
+            try:
+                score = max(0, min(100, int(recording.get("score", 0) or 0)))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MetadataProviderError("musicbrainz_response_invalid") from exc
             recording_id = _clean(recording.get("id"))
             recording_title = _clean(recording.get("title")) or clean_title
             artist_credit = _artist_credit(recording, clean_artist)
+            duration_seconds = _duration_seconds(recording.get("length"))
             releases = recording.get("releases", []) or []
             if not releases:
                 releases = [None]
@@ -230,6 +246,8 @@ class MusicBrainzProvider:
                         recording_id=recording_id,
                         release_id=_clean(release_map.get("id")),
                         score=score,
+                        duration_seconds=duration_seconds,
+                        album_artist=_artist_credit(release_map, artist_credit),
                         country=_clean(release_map.get("country")),
                         release_status=_clean(release_map.get("status")),
                         artwork_available=artwork_available,

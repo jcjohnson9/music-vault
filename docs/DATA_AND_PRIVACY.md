@@ -50,17 +50,22 @@ it must be protected like the rest of the personal database.
 
 The user can explicitly search MusicBrainz from the Trusted Metadata editor.
 That action sends the current or user-entered title and artist to the public
-MusicBrainz service. No search runs automatically across the library, no query
-is added to App Status, and no YouTube API key or browser cookie is sent.
-MusicBrainz candidates remain temporary until the user selects a candidate,
-chooses fields, and confirms application.
+MusicBrainz service. The separate remediation workflow can explicitly analyze
+the library by sending each track's current effective title, artist, and
+duration to MusicBrainz. Neither workflow runs automatically at startup; no
+query is added to App Status, and no YouTube API key or browser cookie is sent.
+Candidates in the Batch 6 one-track editor remain temporary until the user
+selects a candidate, chooses fields, and confirms application. Batch 7 library
+remediation instead persists private candidate evidence and expiring cache rows
+so long-running jobs can resume safely, as described below.
 
-Cover Art Archive image retrieval happens only when selected candidate artwork
-is explicitly applied. MusicBrainz and cover requests run with bounded time and
+Cover Art Archive image retrieval happens only after explicit candidate review
+or when selected candidate artwork is explicitly applied. MusicBrainz and cover requests run with bounded time and
 response sizes, HTTPS and provider-host restrictions, public-address checks,
 sanitized errors, and disabled environment proxy inheritance. They require no
-provider credential. Candidate searches are not persisted as a separate search
-log.
+provider credential. The Batch 6 editor does not persist a separate search log;
+Batch 7 retains only its private hashed cache identity and necessary candidate
+evidence for resumability.
 
 Validated local artwork is copied rather than permanently linked to its
 original path. Content-addressed files are private runtime data under
@@ -69,10 +74,44 @@ runtime cover directory. Old artwork is not deleted automatically by clear,
 reset, or undo. Track covers are independent from artist photos under
 `data/artist_images/`.
 
-Batch 6 corrections change only Music Vault's database and managed artwork
-references. Music Vault does not rewrite embedded tags or audio content in this
-batch. Audited, resumable, rollback-capable file-tag remediation is a Batch 7
-boundary.
+Batch 6 manual corrections change only Music Vault's database and managed
+artwork references. Batch 7 remediation keeps analysis non-destructive, then
+allows a separately confirmed apply to update strict high-confidence database
+fields and, with an additional explicit choice, verified tags in supported
+MP3 files.
+
+## Existing-library remediation data
+
+Schema version 4 stores resumable jobs, private item snapshots, classifications,
+candidate evidence, hashes, backup references, and an expiring provider cache
+inside the local runtime database. Atomic private reports are written below
+`data/metadata_reports/<job-id>/`; database backups remain under
+`data/backups/`, and per-job original media backups remain under
+`data/backups/metadata_jobs/<job-id>/`.
+
+These records can contain titles, artists, albums, provider identifiers, local
+paths, prior values, and candidate decisions. They are excluded from Git and
+public packages and must not be pasted into issues or reports. Public and
+headless verification output is aggregate-only. App Status contains no item-
+level remediation data.
+
+Successful/no-match provider cache entries expire, and temporary provider
+failures use a shorter retry interval. The cache retains only normalized query
+identity, necessary sanitized candidate fields, response state, and timestamps;
+it does not store HTTP bodies, credentials, YouTube data, or browser cookies.
+
+Applying a remediation job requires explicit confirmation. Needs-review,
+ambiguous, no-match, skipped, failed, locked, and stale items remain unchanged.
+Every supported media write uses a verified full-file backup and temporary
+copy, then checks tag readback and that audio payload, codec, and duration did
+not change. Music Vault does not transcode, normalize, rename, move, or delete
+audio. Unsupported formats report no file write rather than pretending success.
+
+Rollback uses the retained backup and pre-apply metadata/provenance snapshot.
+If the user or another application changed a file or field after apply,
+rollback records a conflict instead of overwriting the newer state. Backups and
+reports are not removed automatically. See
+[Metadata Remediation](METADATA_REMEDIATION.md).
 
 ## Optional artist photos
 

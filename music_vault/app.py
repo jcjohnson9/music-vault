@@ -124,6 +124,7 @@ from music_vault.ui.media_grid import (
     MediaKind,
 )
 from music_vault.ui.metadata_editor import MetadataEditorDialog
+from music_vault.ui.metadata_remediation import MetadataRemediationDialog
 from music_vault.ui.review import schedule_ui_review
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
 from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
@@ -219,6 +220,7 @@ class MusicVaultWindow(QMainWindow):
         self.browser_summary_cache = BrowserSummaryCache()
         self._detail_browser_context = None
         self._metadata_editor: MetadataEditorDialog | None = None
+        self._metadata_remediation_dialog: MetadataRemediationDialog | None = None
         self.browser_summary_loader = BrowserSummaryLoader(self)
         self.browser_summary_loader.loaded.connect(self._browser_summaries_loaded)
         self.browser_summary_loader.failed.connect(self._browser_summaries_failed)
@@ -627,6 +629,9 @@ class MusicVaultWindow(QMainWindow):
             "Edit Metadata", "metadata", self.open_metadata_editor
         )
         self.edit_metadata_action.setEnabled(False)
+        self.library_overflow.add_action(
+            "Review Library Metadata", "metadata", self.open_metadata_remediation
+        )
         self.library_overflow.add_action(
             "Remove Missing", "warning", self.remove_missing_tracks,
             destructive=True,
@@ -2572,17 +2577,67 @@ class MusicVaultWindow(QMainWindow):
                 "Select exactly one track to edit its metadata.",
             )
             return
+        self.open_metadata_editor_for_track(track_ids[0], musicbrainz_tab=musicbrainz_tab)
+
+    def open_metadata_editor_for_track(
+        self, track_id: int, *, musicbrainz_tab: bool = False
+    ) -> None:
         if self._metadata_editor is not None and self._metadata_editor.isVisible():
             self._metadata_editor.raise_()
             self._metadata_editor.activateWindow()
             return
-        dialog = MetadataEditorDialog(self.metadata_service, track_ids[0], self)
+        if self.db.get_track(int(track_id)) is None:
+            return
+        dialog = MetadataEditorDialog(self.metadata_service, int(track_id), self)
         dialog.metadata_changed.connect(self.metadata_change_applied)
         dialog.finished.connect(lambda _result: setattr(self, "_metadata_editor", None))
         self._metadata_editor = dialog
         if musicbrainz_tab:
             dialog.tabs.setCurrentWidget(dialog.musicbrainz_tab)
         dialog.open()
+
+    def open_metadata_remediation(self) -> None:
+        dialog = self._metadata_remediation_dialog
+        if dialog is not None and dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = MetadataRemediationDialog(self.db, self)
+        dialog.tracks_changed.connect(self.remediation_tracks_changed)
+        dialog.edit_track_requested.connect(self.open_metadata_editor_for_track)
+        dialog.finished.connect(
+            lambda _result: setattr(self, "_metadata_remediation_dialog", None)
+        )
+        self._metadata_remediation_dialog = dialog
+        dialog.open()
+
+    def remediation_tracks_changed(self, track_ids: object) -> None:
+        try:
+            changed_ids = tuple(sorted({int(value) for value in track_ids}))
+        except (TypeError, ValueError):
+            return
+        if not changed_ids:
+            return
+
+        self.invalidate_browser_data(BrowserInvalidationReason.FUTURE_METADATA)
+        for track_id in changed_ids:
+            self.refresh_visible_track_metadata(track_id)
+
+        if self.current_track_id in changed_ids:
+            track = self.db.get_track(self.current_track_id)
+            if track is not None:
+                self.now_title.setText(track["title"] or Path(track["path"]).stem)
+                self.now_artist.setText(track["artist"] or "Unknown Artist")
+                self.set_cover_art(track["cover_path"])
+
+        if self.current_view_kind in {"albums", "artists"}:
+            if self.current_view_kind == "albums":
+                self.show_album_browser()
+            else:
+                self.show_artist_browser()
+        elif self.current_view_kind in {"album_tracks", "artist_tracks"}:
+            self.refresh_current_view()
+        self.write_app_status()
 
     def play_selected(self) -> None:
         track_id = self.selected_track_id()

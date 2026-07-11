@@ -26,6 +26,12 @@
 - Treat manual and user-confirmed metadata locks as authoritative; preserve
   provenance/history, and never rewrite audio-file tags without explicit batch
   authorization.
+- Existing-library remediation must analyze before apply, auto-apply only
+  strict high-confidence unambiguous matches after explicit confirmation, and
+  keep unresolved items unchanged. Every media write requires a verified full-
+  file backup, temporary-copy writeback, unchanged-audio-payload proof, and
+  conflict-aware rollback; reports, caches, artwork, and backups remain private
+  runtime data.
 - Browser-performance changes must run
   `tools/dev/profile_media_browsers.ps1`; it uses synthetic temporary data only,
   and generated benchmark JSON or screenshots must not be committed.

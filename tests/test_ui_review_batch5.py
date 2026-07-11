@@ -63,6 +63,7 @@ def test_synthetic_seed_has_large_safe_browser_dataset(tmp_path):
     )
 
     assert result["track_count"] == 300
+    assert result["synthetic_mp3_count"] == 1
     assert len(albums) == 100
     assert len(artists) == 200
     assert config["artist_image_fetch_enabled"] is False
@@ -74,7 +75,7 @@ def test_synthetic_seed_has_large_safe_browser_dataset(tmp_path):
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
     try:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
     finally:
         connection.close()
 

@@ -68,6 +68,7 @@ EXPECTED_REQUIRED_ICONS = {
 EXPECTED_OVERFLOW_ACTIONS = [
     "Remove From Playlist",
     "Edit Metadata",
+    "Review Library Metadata",
     "Remove Missing",
     "Refresh Art",
 ]
@@ -315,6 +316,7 @@ def test_overflow_button_keeps_exact_actions_and_callbacks(
     for text, icon_name, destructive in (
         ("Remove From Playlist", "remove", True),
         ("Edit Metadata", "metadata", False),
+        ("Review Library Metadata", "metadata", False),
         ("Remove Missing", "warning", True),
         ("Refresh Art", "refresh", False),
     ):

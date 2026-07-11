@@ -107,13 +107,17 @@ provider search, audio-file tag mutation, or AcoustID requirement.
 foundation.
 
 **Scope:** Back up first, produce a private remediation report, review proposed
-changes, apply approved corrections incrementally, and verify that later imports
-do not undo them.
+changes, apply only strict high-confidence corrections incrementally, write
+supported MP3 tags through verified full-file backups without changing audio,
+and provide resumable analysis, manual review, verification, and rollback.
 
 **Non-goals:** No blind bulk replacement, no publication of personal reports,
 and no unaudited modification of downloaded audio.
 
-**Status:** Next.
+**Status:** Complete. Automated, packaged-sandbox, controlled-live dry-run and
+strict high-confidence apply, backup, verification, publication-safety, and
+delivery gates passed. Uncertain and unresolved tracks remain unchanged for
+later review.
 
 ## Batch 8 — Clean Blank Distribution and Public V1 Release
 
@@ -127,7 +131,7 @@ and publish approved source/release artifacts.
 **Non-goals:** No personal database, key, media, artwork cache, reports, status
 file, or playlist data in the distribution.
 
-**Status:** Planned; V1 Stable is gated here.
+**Status:** Next; V1 Stable is gated here.
 
 ## Batch 9 — Full-Screen Party Mode
 

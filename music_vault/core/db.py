@@ -13,9 +13,10 @@ from music_vault.metadata.schema import (
     normalize_release_date,
     seed_existing_metadata,
 )
+from music_vault.metadata.remediation_schema import create_remediation_schema
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -48,6 +49,7 @@ class MusicVaultDB:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.migrate()
 
         if legacy_failure_file is not None:
@@ -297,6 +299,7 @@ class MusicVaultDB:
                 self._create_base_tables()
                 self._create_support_tables_and_indexes()
                 create_metadata_schema(self.conn)
+                create_remediation_schema(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
             return
 
@@ -311,7 +314,15 @@ class MusicVaultDB:
                 self._backfill_youtube_source_fields()
                 create_metadata_schema(self.conn)
                 seed_existing_metadata(self.conn)
+                create_remediation_schema(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+            return
+
+        # Batch 7 schema additions remain idempotent within schema version 4 so
+        # prerelease v4 databases can acquire recovery-only columns safely.
+        if version == CURRENT_SCHEMA_VERSION:
+            with self.conn:
+                create_remediation_schema(self.conn)
 
     def upsert_track(
         self,

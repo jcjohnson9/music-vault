@@ -95,6 +95,14 @@ def artist_image_index_path() -> Path:
     return artist_images_dir() / "index.json"
 
 
+def metadata_reports_dir() -> Path:
+    return data_dir() / "metadata_reports"
+
+
+def metadata_job_backups_dir() -> Path:
+    return data_dir() / "backups" / "metadata_jobs"
+
+
 def default_downloads_dir() -> Path:
     return data_dir() / "youtube_downloads"
 

@@ -7,6 +7,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Added additive SQLite schema version 4 with resumable remediation jobs,
+  private per-item snapshots, aggregate lifecycle counts, and an expiring
+  provider-result cache, with verified pre-migration backup behavior.
+- Added explicit existing-library analysis with pause, resume, retry, cancel,
+  aggregate-safe reporting, strict high-confidence classification, field-level
+  release decisions, and conservative query normalization that preserves
+  meaningful version identity.
+- Added a remediation dashboard and aggregate-only maintenance tool. Analysis
+  is non-destructive; database apply, supported-file writeback, and rollback
+  each require explicit actions, and ambiguous or unresolved items remain
+  unchanged.
+- Added audited MP3 tag writeback using verified full-file backups, temporary
+  copies, tag readback, atomic replacement, and unchanged audio-payload, codec,
+  and duration checks. Unsupported formats report database-only behavior
+  truthfully.
+- Added conflict-aware job rollback that restores exact original media and
+  pre-apply metadata/provenance while retaining grouped apply and rollback
+  history. Private reports, provider cache data, artwork, and backups remain
+  ignored runtime data.
 - Added additive SQLite schema version 3 with canonical `release_date`,
   materialized metadata timestamps, normalized effective field state, retained
   source observations, grouped metadata history, and verified pre-migration

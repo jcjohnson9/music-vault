@@ -12,14 +12,16 @@ from typing import Any, Callable, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QImageReader
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtGui import QImage, QImageReader, QImageWriter
 
 from music_vault.core.paths import cover_art_archive_dir, manual_covers_dir
 
 
 MAX_ARTWORK_BYTES = 8 * 1024 * 1024
 MAX_ARTWORK_PIXELS = 25_000_000
+MAX_EMBEDDED_ARTWORK_DIMENSION = 1200
+TARGET_EMBEDDED_ARTWORK_BYTES = 1_500_000
 MAX_REDIRECTS = 3
 CONNECT_TIMEOUT_SECONDS = 5
 READ_TIMEOUT_SECONDS = 15
@@ -48,6 +50,140 @@ class PreparedArtwork:
     width: int
     height: int
     sha256: str
+
+
+def _decode_prepared_artwork(artwork: PreparedArtwork) -> QImage:
+    byte_array = QByteArray(artwork.data)
+    buffer = QBuffer()
+    buffer.setData(byte_array)
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        raise ArtworkError("artwork_decode_failed")
+    reader = QImageReader(buffer)
+    reader.setDecideFormatFromContent(True)
+    image = reader.read()
+    buffer.close()
+    if image.isNull():
+        raise ArtworkError("artwork_decode_failed")
+    return image
+
+
+def _has_visible_transparency(image: QImage) -> bool:
+    """Return whether any decoded pixel is not fully opaque."""
+
+    if not image.hasAlphaChannel():
+        return False
+    rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    bits = rgba.constBits()
+    width = rgba.width()
+    stride = rgba.bytesPerLine()
+    for row in range(rgba.height()):
+        start = row * stride + 3
+        alpha = bytes(bits[start : start + width * 4 : 4])
+        if alpha.count(255) != width:
+            return True
+    return False
+
+
+def _encode_image(image: QImage, mime_type: str, *, quality: int = 88) -> bytes:
+    encoded = QByteArray()
+    buffer = QBuffer(encoded)
+    if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        raise ArtworkError("artwork_encode_failed")
+    format_name = b"PNG" if mime_type == "image/png" else b"JPEG"
+    writer = QImageWriter(buffer, format_name)
+    if mime_type == "image/png":
+        # Qt's PNG plugin uses its generic 0-100 compression scale rather
+        # than zlib's 0-9 scale. The maximum is deterministic and compact.
+        writer.setCompression(100)
+    else:
+        writer.setQuality(max(1, min(100, int(quality))))
+        writer.setOptimizedWrite(True)
+    if not writer.write(image):
+        buffer.close()
+        raise ArtworkError("artwork_encode_failed")
+    buffer.close()
+    return bytes(encoded)
+
+
+def _scale_down(image: QImage, max_dimension: int) -> QImage:
+    if max(image.width(), image.height()) <= max_dimension:
+        return image
+    return image.scaled(
+        max_dimension,
+        max_dimension,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def normalize_artwork_for_embedding(
+    artwork: PreparedArtwork,
+    *,
+    max_dimension: int = MAX_EMBEDDED_ARTWORK_DIMENSION,
+    target_bytes: int = TARGET_EMBEDDED_ARTWORK_BYTES,
+) -> PreparedArtwork:
+    """Create deterministic, bounded artwork suitable for media-file tags.
+
+    Transparent images remain lossless PNG. Opaque images use an efficient
+    JPEG representation. Images are never enlarged, and exceptionally dense
+    images are reduced further when encoding quality alone cannot meet the
+    requested byte target.
+    """
+
+    if isinstance(max_dimension, bool) or int(max_dimension) <= 0:
+        raise ValueError("max_dimension must be a positive integer.")
+    if isinstance(target_bytes, bool) or int(target_bytes) <= 0:
+        raise ValueError("target_bytes must be a positive integer.")
+    max_dimension = int(max_dimension)
+    target_bytes = int(target_bytes)
+
+    # Do not trust a caller-constructed dataclass. Revalidate the bytes and
+    # content type before decoding or preserving the original representation.
+    validated = prepare_artwork_bytes(artwork.data, artwork.mime_type)
+    image = _scale_down(_decode_prepared_artwork(validated), max_dimension)
+    transparent = _has_visible_transparency(image)
+    output_mime = "image/png" if transparent else "image/jpeg"
+
+    if (
+        validated.mime_type == output_mime
+        and validated.width == image.width()
+        and validated.height == image.height()
+        and len(validated.data) <= target_bytes
+    ):
+        return validated
+
+    if output_mime == "image/png":
+        working = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        payload = _encode_image(working, output_mime)
+    else:
+        working = image.convertToFormat(QImage.Format.Format_RGB888)
+        payload = b""
+        for quality in (88, 82, 76, 70, 64, 58, 52, 46, 40):
+            payload = _encode_image(working, output_mime, quality=quality)
+            if len(payload) <= target_bytes:
+                break
+
+    # PNG cannot trade quality for bytes, and unusually dense JPEGs may still
+    # miss a very small caller-supplied target. Reduce dimensions gradually,
+    # always preserving aspect ratio and never enlarging.
+    attempts = 0
+    while len(payload) > target_bytes and max(working.width(), working.height()) > 96:
+        attempts += 1
+        if attempts > 8:
+            break
+        ratio = max(0.5, min(0.9, (target_bytes / len(payload)) ** 0.5 * 0.95))
+        next_edge = max(96, int(max(working.width(), working.height()) * ratio))
+        if next_edge >= max(working.width(), working.height()):
+            next_edge = max(96, max(working.width(), working.height()) - 1)
+        working = _scale_down(working, next_edge)
+        if output_mime == "image/png":
+            payload = _encode_image(working, output_mime)
+        else:
+            payload = _encode_image(working, output_mime, quality=40)
+
+    # Re-run the public validation boundary so dimensions, MIME/magic, decode,
+    # and the returned content hash describe the exact embedded payload.
+    return prepare_artwork_bytes(payload, output_mime)
 
 
 def _mime_from_payload(payload: bytes) -> str | None:
