@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QItemSelectionModel, QObject, QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtSvg import QSvgRenderer
@@ -67,7 +67,7 @@ EXPECTED_REQUIRED_ICONS = {
 
 EXPECTED_OVERFLOW_ACTIONS = [
     "Remove From Playlist",
-    "Enrich Selected",
+    "Edit Metadata",
     "Remove Missing",
     "Refresh Art",
 ]
@@ -163,6 +163,8 @@ def test_theme_qss_has_transparent_labels_scrollbars_and_control_states():
     assert "QCheckBox::indicator:checked" in stylesheet
     assert "QComboBox QAbstractItemView" in stylesheet
     assert "QToolTip" in stylesheet
+    assert "QMessageBox" in stylesheet
+    assert f"background: {theme.COLORS['card_surface']}" in stylesheet
     assert "QSlider::groove:horizontal:focus" in stylesheet
     assert "QSlider::handle:horizontal:focus" in stylesheet
     assert 'QProgressBar#SyncProgress[syncState="complete"]' in stylesheet
@@ -288,8 +290,20 @@ def test_elided_label_preserves_full_text_accessibility_and_tooltip(qapp):
     assert label.fullText() == LONG_TITLE
     assert label.accessibleName() == LONG_TITLE
     assert label.text() != LONG_TITLE
-    assert label.toolTip() == LONG_TITLE
+    assert label.toolTip() == f"<qt>{LONG_TITLE}</qt>"
     label.close()
+
+
+def test_elided_label_treats_metadata_markup_as_literal_text(qapp):
+    label = ElidedLabel('<img src="file:///private/path"> Synthetic')
+    label.setFixedWidth(20)
+    label.show()
+    qapp.processEvents()
+
+    assert label.textFormat() == Qt.TextFormat.PlainText
+    assert label.fullText().startswith("<img")
+    assert "<img" not in label.toolTip()
+    assert "&lt;img" in label.toolTip()
 
 
 def test_overflow_button_keeps_exact_actions_and_callbacks(
@@ -300,7 +314,7 @@ def test_overflow_button_keeps_exact_actions_and_callbacks(
     overflow = OverflowActionButton()
     for text, icon_name, destructive in (
         ("Remove From Playlist", "remove", True),
-        ("Enrich Selected", "metadata", False),
+        ("Edit Metadata", "metadata", False),
         ("Remove Missing", "warning", True),
         ("Refresh Art", "refresh", False),
     ):
@@ -541,6 +555,65 @@ def _pixmap_color_count(pixmap: QPixmap, color_value: str) -> int:
         for y in range(image.height())
         if image.pixelColor(x, y).rgba() == target.rgba()
     )
+
+
+def test_edit_metadata_action_requires_exactly_one_selected_track(isolated_ui_window, qapp):
+    window = isolated_ui_window.window
+    window.library_table.clearSelection()
+    window.update_metadata_action_state()
+    assert not window.edit_metadata_action.isEnabled()
+
+    window.library_table.selectRow(0)
+    qapp.processEvents()
+    assert window.edit_metadata_action.isEnabled()
+
+    selection = window.library_table.selectionModel()
+    selection.select(
+        window.library_table.model().index(1, 0),
+        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    qapp.processEvents()
+    assert len(window.selected_track_ids()) == 2
+    assert not window.edit_metadata_action.isEnabled()
+
+
+def test_metadata_refresh_preserves_player_queue_context_and_playlists(isolated_ui_window):
+    window = isolated_ui_window.window
+    track_id = isolated_ui_window.track_ids[0]
+    window.current_track_id = track_id
+    window.manual_queue = [isolated_ui_window.track_ids[1]]
+    window.base_playback_context = {
+        "kind": "library",
+        "playlist_id": None,
+        "playlist_name": "Library",
+        "track_ids": list(isolated_ui_window.track_ids[:3]),
+        "current_track_id": track_id,
+    }
+    queue_before = list(window.manual_queue)
+    context_before = dict(window.base_playback_context)
+    membership_before = window.db.conn.execute(
+        "SELECT COUNT(*) FROM playlist_tracks"
+    ).fetchone()[0]
+    source_before = window.player.source()
+    position_before = window.player.position()
+    state_before = window.player.playbackState()
+
+    result = window.metadata_service.apply_manual_patch(
+        track_id,
+        {"title": "Trusted Synthetic Title", "artist": "Trusted Synthetic Artist"},
+    )
+    window.metadata_change_applied(result)
+
+    assert window.now_title.fullText() == "Trusted Synthetic Title"
+    assert window.now_artist.fullText() == "Trusted Synthetic Artist"
+    assert window.player.source() == source_before
+    assert window.player.position() == position_before
+    assert window.player.playbackState() == state_before
+    assert window.manual_queue == queue_before
+    assert window.base_playback_context == context_before
+    assert window.db.conn.execute(
+        "SELECT COUNT(*) FROM playlist_tracks"
+    ).fetchone()[0] == membership_before
 
 
 @pytest.mark.parametrize("width,height", [(1100, 720), (1440, 900), (1920, 1080)])

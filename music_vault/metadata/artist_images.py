@@ -213,7 +213,13 @@ def _safe_error_code(value: object, fallback: str = "provider_error") -> str:
 
 def _is_global_address(value: str) -> bool:
     try:
-        return ipaddress.ip_address(value).is_global
+        address = ipaddress.ip_address(value)
+        return bool(
+            address.is_global
+            and not address.is_multicast
+            and not address.is_unspecified
+            and not address.is_reserved
+        )
     except ValueError:
         return False
 

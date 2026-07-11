@@ -26,10 +26,15 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/browser_loader.py` | Token-guarded background summary jobs using short-lived read-only database connections. |
 | `music_vault/ui/media_grid.py` | Reusable album/artist models, filter proxy, delegate-painted responsive grid, state presentation, and visible-range discovery. |
 | `music_vault/ui/thumbnail_cache.py` | Bounded memory LRU, coalesced background QImage decoding, high-DPI thumbnail keys, and stale-generation protection. |
+| `music_vault/ui/metadata_editor.py` | Trusted Metadata dialog for field actions, source inspection, candidate review, history, and undo. |
+| `music_vault/ui/metadata_tasks.py` | Cancellable, stale-result-safe background provider work for the metadata editor. |
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
-| `music_vault/metadata/musicbrainz_enricher.py` | Optional MusicBrainz metadata lookup. |
-| `music_vault/metadata/cover_art.py` | Optional Cover Art Archive artwork retrieval. |
+| `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
+| `music_vault/metadata/service.py` | Transactional metadata authority for precedence, materialization, locks, manual/confirmed changes, history, undo, and Batch 7 snapshots. |
+| `music_vault/metadata/musicbrainz_enricher.py` | Typed, explicit MusicBrainz candidate search with bounded public networking. |
+| `music_vault/metadata/artwork.py` | Validated content-addressed local and Cover Art Archive artwork storage. |
+| `music_vault/metadata/cover_art.py` | Compatibility helper for existing Cover Art Archive behavior. |
 | `MusicVault.spec` | PyInstaller configuration for the packaged Windows application. |
 | `tools/dev/profile_media_browsers.py` | Synthetic-only 300/1,000/5,000-track query, model, render, thumbnail, and revisit profiler. |
 
@@ -46,8 +51,9 @@ source playlist
   -> valid database/local-file reconciliation
   -> authorized yt-dlp and FFmpeg processing
   -> local media files
-  -> targeted, source-aware Mutagen metadata and artwork import
-  -> SQLite library
+  -> targeted Mutagen/source observations
+  -> metadata precedence and effective field materialization
+  -> schema-v3 SQLite library, provenance, and history
   -> PySide6 browsing and QMediaPlayer playback
 ```
 
@@ -90,6 +96,38 @@ and FFmpeg handle authorized media processing. MusicBrainz and Cover Art
 Archive can provide metadata and artwork. The application should continue to
 separate these integrations from local library ownership and persistence.
 
+## Metadata authority boundary
+
+Schema version 3 separates metadata into three concepts. Provider/file values
+are retained in `track_metadata_observations`; one effective state per editable
+field lives in `track_metadata_fields`; and compatible effective columns remain
+materialized in `tracks` for established queries and playback. Effective
+changes are recorded by group in `track_metadata_history`. `release_date` is
+canonical music information with `YYYY`, `YYYY-MM`, or `YYYY-MM-DD` precision,
+while `year` is derived from it and `source_upload_date` remains source context.
+
+`MetadataService` is the single transactional authority for automatic
+observations, manual set/clear, unlock, reset, confirmed candidates, history,
+undo, and materialized-column consistency. Manual and user-confirmed locks
+outrank embedded and YouTube fallbacks; lower-priority or empty automatic
+observations cannot erase them. No-op and observation-only work does not create
+history or advance the effective metadata timestamp.
+
+The Trusted Metadata UI reads typed snapshots, exposes provenance/lock state,
+and applies a multi-field change under one change-group ID. MusicBrainz search
+is explicit and background-only; candidates are never auto-applied. Selected
+Cover Art Archive artwork is fetched only after confirmation and stored with
+validated manual/candidate artwork under content-addressed runtime cover
+directories. This track-artwork system is independent from the optional artist
+portrait cache.
+
+Schema migration is additive and uses SQLite's backup API before changing a
+non-empty older database. It seeds conservative state and observations without
+provider access, media-tag reads, fabricated canonical dates, or history.
+Batch 6 mutations remain database-only: playing media is not reloaded and
+audio-file tag writeback is deferred to the audited Batch 7 workflow. See
+[`METADATA_MODEL.md`](METADATA_MODEL.md) for the complete authority contract.
+
 ## Playback state boundary
 
 `current_track_id` is the authoritative now-playing identity and remains
@@ -119,7 +157,7 @@ work in a bounded worker pool; QPixmap creation and model updates stay on the
 GUI thread. Only visible and near-visible keys request thumbnails, and duplicate
 requests coalesce.
 
-The committed profiler uses temporary schema-v2 synthetic databases and no
+The committed profiler uses temporary current-schema synthetic databases and no
 network or personal files. A representative post-change run measured:
 
 | Synthetic scale | Albums query | Artists query | Album/artist summaries |
@@ -165,7 +203,7 @@ the delegate-painted media browser. Resizing reflows the item view without
 constructing card widgets or repeating database grouping.
 
 `tools/dev/capture_ui_review.py` creates a temporary marker-valid project root,
-synthetic schema-v2 data, generated artwork, and non-media sentinel files. The
+synthetic current-schema data, generated artwork, and non-media sentinel files. The
 packaged/source capture hook activates only when its explicit review environment
 variable and validated plan are present. Visible paths are neutralized before
 capture, the runtime is deleted afterward, and screenshot output remains an
@@ -177,8 +215,8 @@ The current architecture is functional and does not require a wholesale
 rewrite. Known areas for incremental improvement are:
 
 - `music_vault/app.py` has broad responsibilities and is large;
-- canonical metadata, source metadata, provenance, confidence, and manual
-  overrides are not fully modeled;
+- existing-library remediation and audited audio-file tag writeback remain
+  deferred to Batch 7;
 - synchronization assumes a single configured source workflow;
 - there is no portable manifest for selective mobile transfer; and
 - there is no station, program-timeline, or mixed audio-segment model for the

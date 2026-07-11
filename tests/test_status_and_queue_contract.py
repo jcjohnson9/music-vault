@@ -7,6 +7,7 @@ from music_vault.core import app_status
 from music_vault.core.db import MusicVaultDB
 from music_vault.core.playback_errors import playback_error_message
 from music_vault.core.watchtower_status import write_watchtower_status
+from music_vault.app import MusicVaultWindow
 
 
 def test_app_status_schema_and_compatibility_alias(tmp_path, monkeypatch):
@@ -44,3 +45,26 @@ def test_queue_fifo_and_base_context_invariants_remain_in_source():
     assert "queued_track_id = self.manual_queue.pop(0)" in source
     assert "capture_base_context=False" in source
     assert 'self.base_playback_context["current_track_id"] = track_id' in source
+
+
+def test_acceptance_mode_skips_api_key_file_access(monkeypatch):
+    monkeypatch.setenv("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "1")
+
+    class NoFileAccess:
+        def api_key_path(self):
+            raise AssertionError("Acceptance mode must not inspect the API-key file.")
+
+    assert MusicVaultWindow.read_saved_api_key(NoFileAccess()) == ""
+
+
+def test_acceptance_status_mode_skips_api_key_file_access(monkeypatch):
+    monkeypatch.setenv("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "1")
+    monkeypatch.setattr(
+        app_status,
+        "youtube_api_key_path",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Acceptance status must not inspect the API-key file.")
+        ),
+    )
+
+    assert app_status._api_ready() is False

@@ -90,14 +90,16 @@ replacement.
 
 **Objective:** Make metadata correctable, attributable, and durable.
 
-**Scope:** Add versioned metadata provenance, confidence, canonical-versus-source
-values, non-destructive candidate review, manual field and artwork correction,
-and protection for user overrides.
+**Scope:** Add schema-v3 source observations, effective field provenance and
+confidence, canonical release dates, manual/confirmed locks, precedence-aware
+imports, grouped metadata history and undo, manual field/artwork correction,
+and explicit MusicBrainz/Cover Art Archive candidate review. Corrections remain
+inside the Music Vault library; audio-file tag writeback is deferred.
 
-**Non-goals:** No automatic rewrite of the existing personal library and no
-AcoustID requirement unless separately approved.
+**Non-goals:** No automatic rewrite of the existing personal library, bulk
+provider search, audio-file tag mutation, or AcoustID requirement.
 
-**Status:** Next.
+**Status:** Complete.
 
 ## Batch 7 — Existing Library Metadata Remediation
 
@@ -109,9 +111,9 @@ changes, apply approved corrections incrementally, and verify that later imports
 do not undo them.
 
 **Non-goals:** No blind bulk replacement, no publication of personal reports,
-and no modification of downloaded audio without explicit approval.
+and no unaudited modification of downloaded audio.
 
-**Status:** Planned.
+**Status:** Next.
 
 ## Batch 8 — Clean Blank Distribution and Public V1 Release
 

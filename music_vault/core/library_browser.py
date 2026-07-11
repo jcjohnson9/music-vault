@@ -272,7 +272,7 @@ def browser_revision(conn: sqlite3.Connection) -> BrowserRevision:
         SELECT
             COUNT(*) AS track_count,
             COALESCE(MAX(id), 0) AS max_track_id,
-            COALESCE(MAX(updated_at), '') AS max_updated_at,
+            COALESCE(MAX(metadata_updated_at), '') AS max_updated_at,
             COUNT(CASE
                 WHEN cover_path IS NOT NULL AND TRIM(cover_path) <> '' THEN 1
             END) AS artwork_count

@@ -24,6 +24,30 @@ log, structured failure history, or App Status. Common Google API keys, query
 tokens, bearer/authorization values, and private-key blocks are redacted. The
 supported public/unlisted workflow does not silently access browser cookies.
 
+## Metadata provider requests and artwork
+
+Manual field editing, clear/unlock/reset, history, and undo are local database
+operations. Music Vault contacts MusicBrainz only after the user explicitly
+clicks **Search MusicBrainz**; that request contains the entered title and
+artist. It uses no provider API key, YouTube API key, browser cookie, or hidden
+whole-library scan. No candidate is applied without explicit field selection
+and confirmation.
+
+MusicBrainz searches run outside the GUI thread with rate limiting, explicit
+timeouts, response-size and JSON validation, an HTTPS-only MusicBrainz host
+policy, public-address validation, disabled environment proxy inheritance, and
+sanitized error codes. Cover Art Archive retrieval occurs only after selected
+candidate artwork is confirmed. Cover URLs and redirects are restricted to
+approved HTTPS hosts, public addresses, and standard ports; image bytes, MIME
+type, encoded format, dimensions, pixels, and decodability are bounded and
+validated before storage.
+
+Chosen local artwork is also decoded and bounded before Music Vault copies it
+to content-addressed runtime storage. Do not commit or publicly attach managed
+covers, metadata observations/history, provider references, or pre-migration
+database backups. Clear, reset, and undo intentionally do not delete artwork
+files. Batch 6 does not rewrite audio-file tags or media content.
+
 ## Optional artist-image requests
 
 Artist-photo lookup is disabled by default and requires explicit user opt-in.

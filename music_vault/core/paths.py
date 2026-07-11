@@ -75,6 +75,14 @@ def covers_dir() -> Path:
     return data_dir() / "covers"
 
 
+def manual_covers_dir() -> Path:
+    return covers_dir() / "manual"
+
+
+def cover_art_archive_dir() -> Path:
+    return covers_dir() / "providers" / "cover_art_archive"
+
+
 def artist_images_dir() -> Path:
     return data_dir() / "artist_images"
 

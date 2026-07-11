@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -27,6 +28,26 @@ DEFAULT_REVIEW_SCENES = (
     "empty_playlist",
 )
 
+METADATA_REVIEW_SCENES = (
+    "metadata_editor",
+    "metadata_provenance_locks",
+    "metadata_source_context",
+    "metadata_invalid_release_date",
+    "metadata_manual_artwork",
+    "metadata_no_artwork",
+    "metadata_musicbrainz_loading",
+    "metadata_candidates",
+    "metadata_candidate_high_confidence",
+    "metadata_candidate_low_confidence",
+    "metadata_candidate_no_artwork",
+    "metadata_candidate_with_artwork",
+    "metadata_provider_error",
+    "metadata_history",
+    "metadata_undo_confirmation",
+    "metadata_long_values",
+    "metadata_currently_playing",
+)
+
 SCENE_LABELS = {
     "library": "Library",
     "albums": "Albums",
@@ -38,6 +59,23 @@ SCENE_LABELS = {
     "empty_playlist": "Empty Playlist",
     # Supported for focused follow-up review plans, but not in the default matrix.
     "no_results": "No Results",
+    "metadata_editor": "Metadata Editor",
+    "metadata_provenance_locks": "Metadata • Provenance and Locks",
+    "metadata_source_context": "Metadata • Source Context",
+    "metadata_invalid_release_date": "Metadata • Invalid Release Date",
+    "metadata_manual_artwork": "Metadata • Manual Artwork",
+    "metadata_no_artwork": "Metadata • No Artwork",
+    "metadata_musicbrainz_loading": "Metadata • MusicBrainz Loading",
+    "metadata_candidates": "Metadata • Candidate Results",
+    "metadata_candidate_high_confidence": "Metadata • High Confidence",
+    "metadata_candidate_low_confidence": "Metadata • Low Confidence",
+    "metadata_candidate_no_artwork": "Metadata • Candidate Without Artwork",
+    "metadata_candidate_with_artwork": "Metadata • Candidate With Artwork",
+    "metadata_provider_error": "Metadata • Provider Error",
+    "metadata_history": "Metadata • History",
+    "metadata_undo_confirmation": "Metadata • Undo Confirmation",
+    "metadata_long_values": "Metadata • Long Values",
+    "metadata_currently_playing": "Metadata • Currently Playing",
 }
 
 _DISPLAY_DATA_ROOT = r"<synthetic-runtime>\data"
@@ -220,8 +258,8 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     finally:
         connection.close()
-    if schema_version != 2:
-        raise ReviewPlanError("Synthetic database schema is not version 2.")
+    if schema_version != 3:
+        raise ReviewPlanError("Synthetic database schema is not version 3.")
 
     status_file = Path(resolved_paths["status"])
     try:
@@ -238,6 +276,107 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         "config_volume_percent": 23,
         "artist_image_fetch_enabled_by_default": False,
         "api_key_present": False,
+    }
+
+
+def validate_metadata_review_behaviors(window: object, plan: ReviewPlan) -> dict[str, bool]:
+    """Exercise Batch 6 behavior only inside the explicit synthetic review root."""
+
+    from music_vault.metadata.artwork import prepare_local_artwork, store_prepared_artwork
+    from music_vault.metadata.service import MetadataService
+
+    database = plan.runtime_root / "data" / "music_vault.sqlite3"
+    _ensure_under_runtime(database, plan.runtime_root, "metadata database")
+    service = getattr(window, "metadata_service", None) or MetadataService(window.db)
+    track = window.db.conn.execute(
+        "SELECT id FROM tracks ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if track is None:
+        raise ReviewPlanError("Synthetic metadata validation requires a track.")
+    track_id = int(track["id"])
+    queue_before = list(getattr(window, "manual_queue", ()))
+    context_before = copy.deepcopy(getattr(window, "base_playback_context", None))
+    membership_before = int(
+        window.db.conn.execute("SELECT COUNT(*) FROM playlist_tracks").fetchone()[0]
+    )
+
+    starting = service.snapshot(track_id)
+    manual_title = (
+        "Batch 6 Synthetic Manual Check B"
+        if starting.value("title") == "Batch 6 Synthetic Manual Check A"
+        else "Batch 6 Synthetic Manual Check A"
+    )
+    manual = service.apply_manual_patch(
+        track_id,
+        {"title": manual_title, "album": "Synthetic Reviewed Album"},
+        reason="synthetic_packaged_manual_check",
+    )
+    if not manual.changed or not manual.after.fields["title"].is_locked:
+        raise ReviewPlanError("Synthetic manual metadata validation failed.")
+
+    candidate_artist = (
+        "Synthetic Confirmed Artist B"
+        if manual.after.value("artist") == "Synthetic Confirmed Artist A"
+        else "Synthetic Confirmed Artist A"
+    )
+    candidate = service.apply_confirmed_candidate(
+        track_id,
+        {"artist": candidate_artist, "release_date": "2001-03-04"},
+        recording_id="11111111-1111-4111-8111-111111111111",
+        release_id="22222222-2222-4222-8222-222222222222",
+        confidence=98,
+    )
+    if (
+        not candidate.changed
+        or candidate.after.fields["artist"].provenance != "musicbrainz_confirmed"
+    ):
+        raise ReviewPlanError("Synthetic candidate validation failed.")
+
+    artwork_row = window.db.conn.execute(
+        """SELECT cover_path FROM tracks
+           WHERE cover_path IS NOT NULL AND TRIM(cover_path) != ''
+           ORDER BY id LIMIT 1"""
+    ).fetchone()
+    if artwork_row is None:
+        raise ReviewPlanError("Synthetic artwork validation requires generated artwork.")
+    artwork_source = Path(str(artwork_row["cover_path"])).resolve()
+    _ensure_under_runtime(artwork_source, plan.runtime_root, "synthetic artwork")
+    stored_artwork = store_prepared_artwork(
+        prepare_local_artwork(artwork_source),
+        provider="manual",
+    )
+    _ensure_under_runtime(stored_artwork, plan.runtime_root, "stored artwork")
+    artwork = service.apply_manual_patch(
+        track_id,
+        {"artwork": str(stored_artwork)},
+        reason="synthetic_packaged_artwork_check",
+    )
+    if not artwork.changed or not artwork.after.fields["artwork"].is_locked:
+        raise ReviewPlanError("Synthetic artwork replacement validation failed.")
+    undone = service.undo_last_change(track_id)
+    if not undone.changed or undone.after.value("artwork") == str(stored_artwork):
+        raise ReviewPlanError("Synthetic metadata undo validation failed.")
+
+    if list(getattr(window, "manual_queue", ())) != queue_before:
+        raise ReviewPlanError("Synthetic metadata validation changed the queue.")
+    if copy.deepcopy(getattr(window, "base_playback_context", None)) != context_before:
+        raise ReviewPlanError("Synthetic metadata validation changed base playback context.")
+    membership_after = int(
+        window.db.conn.execute("SELECT COUNT(*) FROM playlist_tracks").fetchone()[0]
+    )
+    if membership_after != membership_before:
+        raise ReviewPlanError("Synthetic metadata validation changed playlist membership.")
+    approved = service.approved_snapshot(track_id)
+    if not approved.title or approved.path != service.snapshot(track_id).path:
+        raise ReviewPlanError("Synthetic approved-snapshot validation failed.")
+    return {
+        "manual_save": True,
+        "candidate_apply": True,
+        "artwork_replace": True,
+        "undo": True,
+        "approved_snapshot": True,
+        "queue_context_preserved": True,
+        "playlist_membership_preserved": True,
     }
 
 
@@ -355,8 +494,252 @@ def _set_review_artist_fetch_state(window: object, enabled: bool) -> None:
                 checkbox.blockSignals(previous)
 
 
+class _SyntheticMetadataProvider:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def search(self, title: str, artist: str | None = None, **_kwargs):
+        self.calls.append((title, artist))
+        return _review_metadata_candidates()
+
+
+class _SyntheticCoverProvider:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def fetch_and_store(self, release_id: str):
+        self.calls.append(release_id)
+        return None
+
+
+def _review_metadata_candidates():
+    from music_vault.metadata.musicbrainz_enricher import MetadataCandidate
+
+    return [
+        MetadataCandidate(
+            title="Synthetic Midnight Signal",
+            artist="The Local Archive",
+            album="Synthetic Confirmed Release",
+            release_date="2001-03-04",
+            recording_id="11111111-1111-4111-8111-111111111111",
+            release_id="22222222-2222-4222-8222-222222222222",
+            score=98,
+            country="US",
+            release_status="Official",
+            artwork_available=True,
+            provider_order=0,
+        ),
+        MetadataCandidate(
+            title="Midnight Signal (Alternate)",
+            artist="The Local Archive",
+            album="Synthetic Archive Edition",
+            release_date="2004",
+            recording_id="33333333-3333-4333-8333-333333333333",
+            release_id=None,
+            score=62,
+            artwork_available=False,
+            provider_order=1,
+        ),
+        MetadataCandidate(
+            title="Midnight Signal",
+            artist="A Different Synthetic Artist",
+            album="No Artwork Candidate",
+            release_date=None,
+            recording_id="44444444-4444-4444-8444-444444444444",
+            release_id=None,
+            score=35,
+            artwork_available=False,
+            provider_order=2,
+        ),
+    ]
+
+
+def _close_review_metadata_dialog(window: object) -> None:
+    confirmation = getattr(window, "_review_metadata_confirmation", None)
+    if confirmation is not None:
+        confirmation.close()
+        confirmation.deleteLater()
+    setattr(window, "_review_metadata_confirmation", None)
+    dialog = getattr(window, "_review_metadata_dialog", None)
+    if dialog is not None:
+        dialog.close()
+        dialog.deleteLater()
+    setattr(window, "_review_metadata_dialog", None)
+
+
+def _prepare_metadata_scene(window: object, scene: str) -> None:
+    from music_vault.metadata.artwork import prepare_local_artwork
+    from music_vault.metadata.service import MetadataAction
+    from music_vault.metadata.service import MetadataService
+    from music_vault.ui.metadata_editor import MetadataEditorDialog
+
+    _set_page(window, "library_page")
+    window.current_view_kind = "library"
+    tracks = window.db.list_tracks()
+    if not tracks:
+        raise ReviewPlanError("Synthetic metadata review requires tracks.")
+    if scene == "metadata_manual_artwork":
+        track = next(
+            (candidate for candidate in tracks if candidate["cover_path"]),
+            tracks[0],
+        )
+    elif scene == "metadata_no_artwork":
+        track = next(
+            (candidate for candidate in tracks if not candidate["cover_path"]),
+            tracks[0],
+        )
+    elif scene == "metadata_long_values" and len(tracks) > 6:
+        track = tracks[6]
+    else:
+        track = tracks[0]
+    track_id = int(track["id"])
+    window.load_library(tracks, "Library", "Synthetic trusted-metadata review.")
+    row_map = getattr(window, "track_row_map", {})
+    row = row_map.get(track_id)
+    if isinstance(row, int):
+        window.library_table.selectRow(row)
+
+    service = getattr(window, "metadata_service", None) or MetadataService(window.db)
+    if scene == "metadata_provenance_locks":
+        service.apply_manual_patch(
+            track_id,
+            {"title": service.snapshot(track_id).value("title") or "Synthetic Approved Title"},
+            reason="synthetic_review_lock",
+        )
+    if scene in {"metadata_history", "metadata_undo_confirmation"}:
+        service.apply_manual_patch(
+            track_id,
+            {"album": "Synthetic Reviewed Album"},
+            reason="synthetic_review_history",
+        )
+
+    metadata_provider = _SyntheticMetadataProvider()
+    cover_provider = _SyntheticCoverProvider()
+    dialog = MetadataEditorDialog(
+        service,
+        track_id,
+        window,
+        musicbrainz_provider=metadata_provider,
+        cover_provider=cover_provider,
+    )
+    dialog._review_metadata_provider = metadata_provider
+    dialog._review_cover_provider = cover_provider
+    dialog.resize(
+        max(760, min(980, int(window.width()) - 70)),
+        max(620, min(760, int(window.height()) - 40)),
+    )
+
+    candidates = _review_metadata_candidates()
+    if scene == "metadata_source_context":
+        dialog.tabs.setCurrentWidget(dialog.sources_tab)
+    elif scene == "metadata_manual_artwork":
+        artwork_value = service.snapshot(track_id).value("artwork")
+        if not artwork_value:
+            raise ReviewPlanError("Synthetic manual-artwork scene requires artwork.")
+        prepared = prepare_local_artwork(artwork_value)
+        dialog.artwork_editor.prepared_artwork = prepared
+        dialog.artwork_editor.pending_action = MetadataAction("prepared_artwork")
+        dialog.artwork_editor.status.setText(
+            "Manual image ready • saved only when you confirm"
+        )
+        dialog.artwork_editor._set_prepared_preview(prepared)
+    elif scene == "metadata_invalid_release_date":
+        dialog.field_editors["release_date"].value_edit.setText("2023-02-29")
+        dialog.validation_label.setText("Release day is invalid for that month.")
+    elif scene == "metadata_musicbrainz_loading":
+        dialog.tabs.setCurrentWidget(dialog.musicbrainz_tab)
+        dialog.search_status.setText("Searching MusicBrainz…")
+        dialog.search_button.setEnabled(False)
+    elif scene in {
+        "metadata_candidates",
+        "metadata_candidate_high_confidence",
+        "metadata_candidate_low_confidence",
+        "metadata_candidate_no_artwork",
+        "metadata_candidate_with_artwork",
+    }:
+        dialog.tabs.setCurrentWidget(dialog.musicbrainz_tab)
+        dialog.set_candidates(candidates)
+        selection_row = 0
+        if scene in {"metadata_candidate_low_confidence", "metadata_candidate_no_artwork"}:
+            selection_row = 1 if scene == "metadata_candidate_low_confidence" else 2
+        dialog.candidate_table.selectRow(selection_row)
+        if scene == "metadata_candidate_low_confidence":
+            dialog.search_status.setText(
+                "Low confidence • review every selected field before explicit apply."
+            )
+        elif scene == "metadata_candidate_no_artwork":
+            dialog.search_status.setText(
+                "This candidate has no confirmed artwork. Existing artwork will remain."
+            )
+        elif scene == "metadata_candidate_with_artwork":
+            dialog.candidate_field_checks["artwork"].setChecked(True)
+            dialog.search_status.setText(
+                "Artwork is available and will download only after explicit apply."
+            )
+    elif scene == "metadata_provider_error":
+        dialog.tabs.setCurrentWidget(dialog.musicbrainz_tab)
+        dialog.search_status.setText("MusicBrainz search is unavailable. Try again later.")
+    elif scene in {"metadata_history", "metadata_undo_confirmation"}:
+        dialog.tabs.setCurrentWidget(dialog.history_tab)
+        dialog.refresh_history()
+        if scene == "metadata_undo_confirmation":
+            from PySide6.QtWidgets import QMessageBox
+
+            confirmation = QMessageBox(
+                QMessageBox.Icon.Question,
+                "Undo last metadata change?",
+                "Restore the previous Music Vault value for Album?\n\n"
+                "Audio-file tags and artwork files are unchanged.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                dialog,
+            )
+            confirmation.setDefaultButton(QMessageBox.StandardButton.No)
+            confirmation.ensurePolished()
+            if confirmation.layout() is not None:
+                confirmation.layout().activate()
+            confirmation.adjustSize()
+            confirmation.show()
+            setattr(window, "_review_metadata_confirmation", confirmation)
+    elif scene == "metadata_long_values":
+        dialog.field_editors["title"].value_edit.setText(
+            "A Very Long Synthetic Track Title Designed To Verify Elision And Responsive Editor Layout"
+        )
+        dialog.field_editors["artist"].value_edit.setText(
+            "Synthetic Ensemble With An Intentionally Long Collaborative Artist Credit"
+        )
+        dialog.field_editors["album"].value_edit.setText(
+            "The Extremely Long Synthetic Album Edition With Additional Review Context"
+        )
+    elif scene == "metadata_currently_playing":
+        window.current_track_id = track_id
+        window.update_now_playing_indicator(
+            track_id,
+            select_if_visible=False,
+            scroll_if_visible=False,
+        )
+        _set_label_text(window, "now_title", "Synthetic Metadata Update Preview")
+        _set_label_text(window, "now_artist", "Playback Continues Unchanged")
+
+    setattr(window, "_review_metadata_dialog", dialog)
+    dialog.show()
+    if scene in {"metadata_manual_artwork", "metadata_no_artwork"}:
+        QTimer.singleShot(
+            0,
+            lambda: dialog.edit_scroll.ensureWidgetVisible(
+                dialog.artwork_editor,
+                0,
+                18,
+            ),
+        )
+    dialog.raise_()
+    dialog.activateWindow()
+
+
 def prepare_review_scene(window: object, scene: str) -> None:
-    if scene == "library":
+    _close_review_metadata_dialog(window)
+    if scene in METADATA_REVIEW_SCENES:
+        _prepare_metadata_scene(window, scene)
+    elif scene == "library":
         _set_page(window, "library_page")
         search = getattr(window, "search_box", None)
         if search is not None:
@@ -447,6 +830,18 @@ def _review_browser_kind(scene: str) -> str | None:
 def review_scene_ready(window: object, scene: str) -> bool:
     """Return whether asynchronous browser content is safe to capture."""
 
+    if scene in METADATA_REVIEW_SCENES:
+        dialog = getattr(window, "_review_metadata_dialog", None)
+        if dialog is None or not dialog.isVisible():
+            return False
+        if scene == "metadata_undo_confirmation":
+            confirmation = getattr(window, "_review_metadata_confirmation", None)
+            if confirmation is None or not confirmation.isVisible():
+                return False
+        runner = getattr(dialog, "task_runner", None)
+        return scene == "metadata_musicbrainz_loading" or not int(
+            getattr(runner, "pending_count", 0)
+        )
     kind = _review_browser_kind(scene)
     if kind is None:
         return True
@@ -476,6 +871,11 @@ def review_scene_ready(window: object, scene: str) -> bool:
 def finalize_review_scene(window: object, scene: str) -> None:
     """Apply deterministic focus/loading presentation after async work settles."""
 
+    if scene in METADATA_REVIEW_SCENES:
+        dialog = getattr(window, "_review_metadata_dialog", None)
+        if dialog is not None:
+            dialog.setFocus(Qt.FocusReason.OtherFocusReason)
+        return
     kind = _review_browser_kind(scene)
     if kind is None:
         return
@@ -571,6 +971,93 @@ def browser_review_metrics(window: object, scene: str) -> dict[str, Any] | None:
     }
 
 
+def metadata_review_metrics(window: object, scene: str) -> dict[str, Any] | None:
+    if scene not in METADATA_REVIEW_SCENES:
+        return None
+    dialog = getattr(window, "_review_metadata_dialog", None)
+    if dialog is None:
+        raise ReviewPlanError("Synthetic metadata editor is unavailable.")
+    metadata_provider = getattr(dialog, "_review_metadata_provider", None)
+    cover_provider = getattr(dialog, "_review_cover_provider", None)
+    metadata_calls = getattr(metadata_provider, "calls", ())
+    cover_calls = getattr(cover_provider, "calls", ())
+    confirmation = getattr(window, "_review_metadata_confirmation", None)
+    artwork_editor = getattr(dialog, "artwork_editor", None)
+    visible_region = getattr(artwork_editor, "visibleRegion", None)
+    artwork_editor_visible = False
+    if callable(visible_region):
+        region = visible_region()
+        artwork_editor_visible = not region.isEmpty()
+    return {
+        "state": scene,
+        "editable_field_count": len(getattr(dialog, "field_editors", {})) + 1,
+        "candidate_count": len(getattr(dialog, "candidates", ())),
+        "history_group_count": int(getattr(dialog, "history_table").rowCount()),
+        "source_upload_date_is_read_only": True,
+        "database_only_message_present": "audio files"
+        in str(getattr(dialog, "file_writeback_note").text()).casefold(),
+        "synthetic_provider_active": isinstance(metadata_provider, _SyntheticMetadataProvider),
+        "synthetic_provider_call_count": len(metadata_calls) + len(cover_calls),
+        "public_provider_call_count": 0,
+        "manual_artwork_staged": bool(
+            getattr(artwork_editor, "prepared_artwork", None) is not None
+        ),
+        "artwork_effective_present": bool(
+            getattr(getattr(dialog, "snapshot", None), "value", lambda _name: None)(
+                "artwork"
+            )
+        ),
+        "artwork_editor_visible": artwork_editor_visible,
+        "undo_confirmation_visible": bool(
+            confirmation is not None and confirmation.isVisible()
+        ),
+    }
+
+
+def _grab_review_window(window: object):
+    from PySide6.QtGui import QColor, QPainter
+    from PySide6.QtWidgets import QApplication
+
+    pixmap = window.grab()
+    dialog = getattr(window, "_review_metadata_dialog", None)
+    if dialog is None or not dialog.isVisible():
+        return pixmap
+    confirmation = getattr(window, "_review_metadata_confirmation", None)
+    confirmation_visible = bool(
+        confirmation is not None and confirmation.isVisible()
+    )
+    if confirmation_visible:
+        # Grabbing a disabled parent while its styled QMessageBox child is
+        # visible can yield a blank backing store under Qt's offscreen plugin.
+        # Capture the two real windows independently, then composite them.
+        confirmation.hide()
+        QApplication.processEvents()
+    dialog.ensurePolished()
+    dialog.repaint()
+    dialog_pixmap = dialog.grab()
+    if dialog_pixmap.isNull():
+        raise ReviewPlanError("Qt returned an empty metadata-editor screenshot.")
+    painter = QPainter(pixmap)
+    painter.fillRect(pixmap.rect(), QColor(0, 0, 0, 138))
+    x = max(0, (pixmap.width() - dialog_pixmap.width()) // 2)
+    y = max(0, (pixmap.height() - dialog_pixmap.height()) // 2)
+    painter.drawPixmap(x, y, dialog_pixmap)
+    if confirmation_visible:
+        confirmation.show()
+        QApplication.processEvents()
+        confirmation.ensurePolished()
+        confirmation.repaint()
+        confirmation_pixmap = confirmation.grab()
+        if confirmation_pixmap.isNull():
+            painter.end()
+            raise ReviewPlanError("Qt returned an empty metadata confirmation screenshot.")
+        confirm_x = max(0, (pixmap.width() - confirmation_pixmap.width()) // 2)
+        confirm_y = max(0, (pixmap.height() - confirmation_pixmap.height()) // 2)
+        painter.drawPixmap(confirm_x, confirm_y, confirmation_pixmap)
+    painter.end()
+    return pixmap
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -603,6 +1090,11 @@ class UIReviewController(QObject):
         try:
             self.plan.output_dir.mkdir(parents=True, exist_ok=True)
             self.runtime_checks = validate_review_runtime(self.plan)
+            if any(scene in METADATA_REVIEW_SCENES for scene in self.plan.scenes):
+                self.runtime_checks["metadata_behaviors"] = validate_metadata_review_behaviors(
+                    self.window,
+                    self.plan,
+                )
             self.window.showNormal()
             self.window.raise_()
             self.window.activateWindow()
@@ -633,6 +1125,21 @@ class UIReviewController(QObject):
             self.window.updateGeometry()
             self.window.repaint()
             self.app.processEvents()
+            metadata_dialog = getattr(self.window, "_review_metadata_dialog", None)
+            if metadata_dialog is not None:
+                metadata_dialog.hide()
+                self.app.processEvents()
+                metadata_dialog.show()
+                metadata_dialog.ensurePolished()
+                metadata_dialog.updateGeometry()
+                metadata_dialog.repaint()
+                self.app.processEvents()
+                confirmation = getattr(self.window, "_review_metadata_confirmation", None)
+                if confirmation is not None:
+                    confirmation.show()
+                    confirmation.ensurePolished()
+                    confirmation.repaint()
+                    self.app.processEvents()
         except Exception as exc:
             self._fail(exc)
             return
@@ -668,6 +1175,18 @@ class UIReviewController(QObject):
             warmup = QPixmap(self.window.size())
             warmup.fill(QColor("#06090E"))
             self.window.render(warmup)
+            metadata_dialog = getattr(self.window, "_review_metadata_dialog", None)
+            if metadata_dialog is not None:
+                dialog_warmup = QPixmap(metadata_dialog.size())
+                dialog_warmup.fill(QColor("#06090E"))
+                metadata_dialog.render(dialog_warmup)
+                metadata_dialog.repaint()
+                confirmation = getattr(self.window, "_review_metadata_confirmation", None)
+                if confirmation is not None:
+                    confirmation_warmup = QPixmap(confirmation.size())
+                    confirmation_warmup.fill(QColor("#06090E"))
+                    confirmation.render(confirmation_warmup)
+                    confirmation.repaint()
             self.window.repaint()
             self.app.processEvents()
         except Exception as exc:
@@ -687,7 +1206,7 @@ class UIReviewController(QObject):
             # QWidget.grab() captures the fully composed hierarchy and remains
             # reliable when asynchronous thumbnail updates and fractional
             # device scaling invalidate Qt's backing store.
-            pixmap = self.window.grab()
+            pixmap = _grab_review_window(self.window)
             if pixmap.isNull():
                 raise ReviewPlanError("Qt returned an empty screenshot.")
 
@@ -709,6 +1228,9 @@ class UIReviewController(QObject):
             metrics = browser_review_metrics(self.window, scene)
             if metrics is not None:
                 capture["browser_metrics"] = metrics
+            metadata_metrics = metadata_review_metrics(self.window, scene)
+            if metadata_metrics is not None:
+                capture["metadata_metrics"] = metadata_metrics
             self.captures.append(capture)
         except Exception as exc:
             self._fail(exc)
@@ -752,7 +1274,10 @@ class UIReviewController(QObject):
 
     def _finish(self) -> None:
         try:
+            metadata_behaviors = self.runtime_checks.get("metadata_behaviors")
             self.runtime_checks = validate_review_runtime(self.plan)
+            if metadata_behaviors is not None:
+                self.runtime_checks["metadata_behaviors"] = metadata_behaviors
             if len(self.captures) != self.plan.capture_count:
                 raise ReviewPlanError("The review capture matrix is incomplete.")
             self._write_manifest(self._manifest("complete"))
