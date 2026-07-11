@@ -3,10 +3,19 @@
 import sys
 import random
 import json
+import math
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QThread, Signal, QSize, QTimer
-from PySide6.QtGui import QBrush, QColor, QPixmap, QDesktopServices, QIcon
+from PySide6.QtCore import Qt, QUrl, QThread, Signal, QSize, QTimer, QRectF
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QPixmap,
+    QDesktopServices,
+    QIcon,
+    QPainter,
+    QPainterPath,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QMediaDevices
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +46,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QGridLayout,
     QMenu,
+    QSizePolicy,
+    QButtonGroup,
 )
 
 from music_vault.core.db import MusicVaultDB
@@ -71,6 +82,16 @@ from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
 from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
 from music_vault.metadata.musicbrainz_enricher import search_recording
 from music_vault.metadata.cover_art import download_front_cover
+from music_vault.ui.components import (
+    ElidedLabel,
+    EmptyState,
+    IconButton,
+    OverflowActionButton,
+    SearchField,
+)
+from music_vault.ui.icons import render_icon_pixmap, ui_icon
+from music_vault.ui.review import schedule_ui_review
+from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
 
 
 NOW_PLAYING_ROLE = int(Qt.UserRole) + 1
@@ -122,6 +143,7 @@ class MusicVaultWindow(QMainWindow):
         if app_icon_path.exists():
             self.setWindowIcon(QIcon(str(app_icon_path)))
         self.resize(1380, 860)
+        self.setMinimumSize(1100, 720)
 
         self.config = self.load_config()
         self.volume_percent = normalize_volume_percent(
@@ -149,6 +171,14 @@ class MusicVaultWindow(QMainWindow):
         self.track_row_map: dict[int, int] = {}
         self._playing_row: int | None = None
         self._styled_now_playing_track_id: int | None = None
+        self._dark_title_bar_applied = False
+        self._dark_title_bar_attempted = False
+        self._browser_cards: list[QWidget] = []
+        self._browser_column_count = 0
+        self._browser_reflow_timer = QTimer(self)
+        self._browser_reflow_timer.setSingleShot(True)
+        self._browser_reflow_timer.setInterval(80)
+        self._browser_reflow_timer.timeout.connect(self.reflow_browser_cards)
 
         self.app_sync_status: dict | None = None
 
@@ -176,6 +206,7 @@ class MusicVaultWindow(QMainWindow):
         self.player.errorOccurred.connect(self.on_media_error)
 
         self.build_ui()
+        self.update_playback_mode_buttons()
         self.load_library()
         self.load_playlists()
         self.refresh_settings_status()
@@ -241,8 +272,22 @@ class MusicVaultWindow(QMainWindow):
         self.volume_percent = volume
         self.config["volume_percent"] = volume
         self.audio_output.setVolume(volume / 100.0)
+        self.update_volume_icon()
         self._pending_volume_percent = volume
         self.volume_save_timer.start()
+
+    def update_volume_icon(self) -> None:
+        if not hasattr(self, "volume_icon"):
+            return
+        if self.volume_percent <= 0:
+            icon_name = "volume-muted"
+        elif self.volume_percent < 45:
+            icon_name = "volume-low"
+        else:
+            icon_name = "volume"
+        self.volume_icon.setPixmap(
+            render_icon_pixmap(icon_name, 18, COLORS["text_secondary"])
+        )
 
     def flush_pending_volume_save(self) -> bool:
         if self._pending_volume_percent is None:
@@ -307,9 +352,10 @@ class MusicVaultWindow(QMainWindow):
 
     def build_ui(self) -> None:
         root = QWidget()
+        root.setObjectName("AppRoot")
         root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(16, 16, 16, 16)
-        root_layout.setSpacing(16)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(12)
 
         self.sidebar = self.build_sidebar()
         self.pages = QStackedWidget()
@@ -321,38 +367,42 @@ class MusicVaultWindow(QMainWindow):
         self.pages.addWidget(self.library_page)
         self.pages.addWidget(self.sync_page)
         self.pages.addWidget(self.settings_page)
+        self.pages.currentChanged.connect(self.update_sidebar_navigation_state)
 
         main_shell = QFrame()
         main_shell.setObjectName("MainShell")
         main_layout = QVBoxLayout(main_shell)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(14)
+        main_layout.setSpacing(12)
 
         main_layout.addWidget(self.pages, 1)
-        main_layout.addWidget(self.build_player_bar())
+        self.player_bar = self.build_player_bar()
+        main_layout.addWidget(self.player_bar)
 
         root_layout.addWidget(self.sidebar)
         root_layout.addWidget(main_shell, 1)
 
         self.setCentralWidget(root)
         self.apply_styles()
+        self.update_sidebar_navigation_state()
 
 
 
     def build_sidebar(self) -> QWidget:
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(260)
+        sidebar.setFixedWidth(232)
 
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(18, 22, 18, 22)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 18, 16, 16)
+        layout.setSpacing(8)
 
         brand_row = QHBoxLayout()
-        logo = QLabel("♪")
+        logo = QLabel()
         logo.setObjectName("LogoBadge")
         logo.setFixedSize(42, 42)
         logo.setAlignment(Qt.AlignCenter)
+        logo.setPixmap(render_icon_pixmap("music-note", 24, COLORS["accent_ink"]))
 
         brand_col = QVBoxLayout()
         brand = QLabel("Music Vault")
@@ -365,9 +415,15 @@ class MusicVaultWindow(QMainWindow):
         brand_row.addWidget(logo)
         brand_row.addLayout(brand_col, 1)
 
-        self.library_btn = self.sidebar_button("Library", 0)
-        self.sync_btn_nav = self.sidebar_button("Sync Center", 1)
-        self.settings_btn = self.sidebar_button("Settings", 2)
+        self.library_btn = self.sidebar_button("Library", 0, "library")
+        self.sync_btn_nav = self.sidebar_button("Sync Center", 1, "sync")
+        self.settings_btn = self.sidebar_button("Settings", 2, "settings")
+        self.sidebar_button_group = QButtonGroup(self)
+        self.sidebar_button_group.setExclusive(True)
+        for index, button in enumerate(
+            (self.library_btn, self.sync_btn_nav, self.settings_btn)
+        ):
+            self.sidebar_button_group.addButton(button, index)
 
         divider = QFrame()
         divider.setObjectName("Divider")
@@ -378,6 +434,9 @@ class MusicVaultWindow(QMainWindow):
 
         self.playlists = QListWidget()
         self.playlists.setObjectName("PlaylistList")
+        self.playlists.setTextElideMode(Qt.ElideRight)
+        self.playlists.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.playlists.setAccessibleName("Library views and playlists")
         self.playlists.itemClicked.connect(self.on_playlist_clicked)
 
         layout.addLayout(brand_row)
@@ -393,12 +452,61 @@ class MusicVaultWindow(QMainWindow):
 
         return sidebar
 
-    def sidebar_button(self, text: str, page_index: int) -> QPushButton:
+    def sidebar_button(self, text: str, page_index: int, icon_name: str) -> QPushButton:
         btn = QPushButton(text)
         btn.setObjectName("SidebarButton")
         btn.setCursor(Qt.PointingHandCursor)
+        btn.setCheckable(True)
+        btn.setIcon(ui_icon(icon_name, 20))
+        btn.setIconSize(QSize(20, 20))
+        btn.setToolTip(text)
+        btn.setAccessibleName(text)
         btn.clicked.connect(lambda: self.pages.setCurrentIndex(page_index))
         return btn
+
+    def update_sidebar_navigation_state(self, _index: int | None = None) -> None:
+        if not hasattr(self, "pages"):
+            return
+        current = self.pages.currentIndex()
+        for index, button in enumerate(
+            (self.library_btn, self.sync_btn_nav, self.settings_btn)
+        ):
+            button.setChecked(index == current)
+            repolish(button)
+
+    def make_action_button(
+        self,
+        text: str,
+        icon_name: str,
+        callback,
+        *,
+        object_name: str = "SoftButton",
+        tooltip: str | None = None,
+    ) -> QPushButton:
+        button = QPushButton(text)
+        button.setObjectName(object_name)
+        if object_name == "PrimaryButton":
+            normal_icon_color = active_icon_color = COLORS["accent_ink"]
+        elif object_name == "DangerButton":
+            normal_icon_color = COLORS["danger"]
+            active_icon_color = COLORS["danger_hover"]
+        else:
+            normal_icon_color = COLORS["text_secondary"]
+            active_icon_color = COLORS["text_primary"]
+        button.setIcon(
+            ui_icon(
+                icon_name,
+                18,
+                color=normal_icon_color,
+                active_color=active_icon_color,
+            )
+        )
+        button.setIconSize(QSize(18, 18))
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip(tooltip or text)
+        button.setAccessibleName(text)
+        button.clicked.connect(callback)
+        return button
 
 
 
@@ -415,63 +523,72 @@ class MusicVaultWindow(QMainWindow):
         hero_layout.setContentsMargins(24, 22, 24, 22)
         hero_layout.setSpacing(16)
 
-        top_row = QHBoxLayout()
+        title_row = QHBoxLayout()
         title_col = QVBoxLayout()
+        title_col.setSpacing(4)
         self.page_title = QLabel("Library")
         self.page_title.setObjectName("PageTitle")
         self.page_subtitle = QLabel("Your local music collection, synced and ready.")
         self.page_subtitle.setObjectName("MutedLabel")
         title_col.addWidget(self.page_title)
         title_col.addWidget(self.page_subtitle)
+        title_row.addLayout(title_col, 1)
 
-        import_btn = QPushButton("Import Folder")
-        import_btn.setObjectName("PrimaryButton")
-        import_btn.clicked.connect(self.import_music_folder)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self.import_btn = self.make_action_button(
+            "Import Folder",
+            "import",
+            self.import_music_folder,
+            object_name="PrimaryButton",
+            tooltip="Import a folder of local music",
+        )
+        self.create_playlist_btn = self.make_action_button(
+            "New Playlist", "add", self.create_playlist
+        )
+        self.add_playlist_btn = self.make_action_button(
+            "Add to Playlist", "playlists", self.add_selected_to_playlist
+        )
+        self.queue_next_btn = self.make_action_button(
+            "Queue Next", "queue-next", self.queue_selected_next
+        )
+        self.library_overflow = OverflowActionButton(self)
+        self.library_overflow.setToolTip("More library actions")
+        self.library_overflow.setAccessibleName("More library actions")
+        self.library_overflow.add_action(
+            "Remove From Playlist",
+            "remove",
+            self.remove_selected_from_current_playlist,
+            destructive=True,
+        )
+        self.library_overflow.add_action(
+            "Enrich Selected", "metadata", self.enrich_selected
+        )
+        self.library_overflow.add_action(
+            "Remove Missing", "warning", self.remove_missing_tracks,
+            destructive=True,
+        )
+        self.library_overflow.add_action(
+            "Refresh Art", "refresh", self.refresh_artwork
+        )
 
-        create_playlist_btn = QPushButton("New Playlist")
-        create_playlist_btn.setObjectName("SoftButton")
-        create_playlist_btn.clicked.connect(self.create_playlist)
+        action_row.addWidget(self.import_btn)
+        action_row.addWidget(self.create_playlist_btn)
+        action_row.addWidget(self.add_playlist_btn)
+        action_row.addWidget(self.queue_next_btn)
+        action_row.addWidget(self.library_overflow)
+        action_row.addStretch(1)
 
-        add_playlist_btn = QPushButton("Add to Playlist")
-        add_playlist_btn.setObjectName("SoftButton")
-        add_playlist_btn.clicked.connect(self.add_selected_to_playlist)
-
-        queue_next_btn = QPushButton("Queue Next")
-        queue_next_btn.setObjectName("SoftButton")
-        queue_next_btn.clicked.connect(self.queue_selected_next)
-
-        remove_playlist_btn = QPushButton("Remove From Playlist")
-        remove_playlist_btn.setObjectName("SoftButton")
-        remove_playlist_btn.clicked.connect(self.remove_selected_from_current_playlist)
-
-        enrich_btn = QPushButton("Enrich Selected")
-        enrich_btn.setObjectName("SoftButton")
-        enrich_btn.clicked.connect(self.enrich_selected)
-
-        clean_btn = QPushButton("Remove Missing")
-        clean_btn.setObjectName("SoftButton")
-        clean_btn.clicked.connect(self.remove_missing_tracks)
-
-        refresh_art_btn = QPushButton("Refresh Art")
-        refresh_art_btn.setObjectName("SoftButton")
-        refresh_art_btn.clicked.connect(self.refresh_artwork)
-
-        top_row.addLayout(title_col, 1)
-        top_row.addWidget(import_btn)
-        top_row.addWidget(create_playlist_btn)
-        top_row.addWidget(add_playlist_btn)
-        top_row.addWidget(queue_next_btn)
-        top_row.addWidget(remove_playlist_btn)
-        top_row.addWidget(enrich_btn)
-        top_row.addWidget(clean_btn)
-        top_row.addWidget(refresh_art_btn)
-
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search songs, artists, albums...")
+        self.search_box = SearchField(
+            placeholder="Search songs, artists, albums...",
+            parent=page,
+        )
         self.search_box.textChanged.connect(self.filter_library)
         self.search_box.setObjectName("SearchBox")
+        self.search_box.setAccessibleName("Search the current music view")
 
-        hero_layout.addLayout(top_row)
+        hero_layout.addLayout(title_row)
+        hero_layout.addLayout(action_row)
         hero_layout.addWidget(self.search_box)
 
         stats_row = QHBoxLayout()
@@ -506,17 +623,40 @@ class MusicVaultWindow(QMainWindow):
         self.library_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.library_table.customContextMenuRequested.connect(self.open_song_context_menu)
         self.library_table.verticalHeader().setVisible(False)
-        self.library_table.setAlternatingRowColors(True)
+        self.library_table.setAlternatingRowColors(False)
         self.library_table.setShowGrid(False)
-        self.library_table.horizontalHeader().setStretchLastSection(True)
+        self.library_table.setWordWrap(False)
+        self.library_table.setTextElideMode(Qt.ElideRight)
+        self.library_table.setFocusPolicy(Qt.StrongFocus)
+        self.library_table.setAccessibleName("Music library tracks")
+        self.library_table.horizontalHeader().setStretchLastSection(False)
         self.library_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.library_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.library_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.library_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.library_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.library_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.library_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.library_table.horizontalHeader().resizeSection(3, 68)
         self.library_table.setColumnHidden(4, True)
 
+        self.library_empty_state = EmptyState(
+            "library",
+            "Your library is ready for music",
+            "Import a folder to begin building your local collection.",
+            parent=table_card,
+        )
+        self.search_empty_state = EmptyState(
+            "search",
+            "No matching tracks",
+            "Try a shorter title, artist, or album search.",
+            parent=table_card,
+        )
+        self.library_body_stack = QStackedWidget()
+        self.library_body_stack.setObjectName("LibraryBodyStack")
+        self.library_body_stack.addWidget(self.library_table)
+        self.library_body_stack.addWidget(self.library_empty_state)
+        self.library_body_stack.addWidget(self.search_empty_state)
+
         table_layout.addLayout(table_header)
-        table_layout.addWidget(self.library_table, 1)
+        table_layout.addWidget(self.library_body_stack, 1)
 
         browser_page = QFrame()
         browser_page.setObjectName("Card")
@@ -542,6 +682,7 @@ class MusicVaultWindow(QMainWindow):
         self.browser_grid.setContentsMargins(4, 4, 4, 4)
         self.browser_grid.setHorizontalSpacing(16)
         self.browser_grid.setVerticalSpacing(16)
+        self.browser_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
         self.browser_scroll.setWidget(self.browser_container)
 
@@ -597,6 +738,7 @@ class MusicVaultWindow(QMainWindow):
             self.sync_progress.setRange(0, 100)
             self.sync_progress.setValue(0)
             self.sync_progress.setFormat("Ready")
+        self.set_sync_visual_state("idle")
 
     def set_sync_status(self, status: str) -> None:
         if hasattr(self, "sync_status_card"):
@@ -604,6 +746,21 @@ class MusicVaultWindow(QMainWindow):
 
         if hasattr(self, "sync_progress") and self.sync_progress.maximum() != 0:
             self.sync_progress.setFormat(status)
+
+    def set_sync_visual_state(self, state: str) -> None:
+        normalized = state if state in {
+            "idle", "syncing", "complete", "complete_with_issues", "failed"
+        } else "idle"
+        for widget_name in (
+            "sync_status_card",
+            "sync_failed_card",
+            "sync_progress",
+            "youtube_log",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setProperty("syncState", normalized)
+                repolish(widget)
 
     def clear_sync_log(self) -> None:
         if hasattr(self, "youtube_log"):
@@ -619,7 +776,12 @@ class MusicVaultWindow(QMainWindow):
 
     def build_sync_page(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout(page)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+
+        sync_content = QWidget()
+        sync_content.setObjectName("SyncContent")
+        layout = QVBoxLayout(sync_content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
@@ -663,6 +825,7 @@ class MusicVaultWindow(QMainWindow):
         self.youtube_url = QLineEdit()
         self.youtube_url.setPlaceholderText("Paste your YouTube playlist URL")
         self.youtube_url.setObjectName("SearchBox")
+        self.youtube_url.setAccessibleName("Authorized YouTube playlist URL")
 
         output_row = QHBoxLayout()
         self.youtube_output = QLineEdit(
@@ -672,14 +835,14 @@ class MusicVaultWindow(QMainWindow):
             )
         )
         self.youtube_output.setObjectName("SearchBox")
+        self.youtube_output.setAccessibleName("YouTube download folder")
 
-        choose_output = QPushButton("Choose Folder")
-        choose_output.setObjectName("SoftButton")
-        choose_output.clicked.connect(self.choose_youtube_output)
-
-        open_output = QPushButton("Open Downloads")
-        open_output.setObjectName("SoftButton")
-        open_output.clicked.connect(self.open_youtube_output)
+        choose_output = self.make_action_button(
+            "Choose Folder", "folder", self.choose_youtube_output
+        )
+        open_output = self.make_action_button(
+            "Open Downloads", "downloaded", self.open_youtube_output
+        )
 
         output_row.addWidget(self.youtube_output, 1)
         output_row.addWidget(choose_output)
@@ -692,11 +855,21 @@ class MusicVaultWindow(QMainWindow):
 
         self.youtube_sync_btn = QPushButton("Start Sync")
         self.youtube_sync_btn.setObjectName("PrimaryButton")
+        self.youtube_sync_btn.setIcon(
+            ui_icon(
+                "sync",
+                18,
+                color=COLORS["accent_ink"],
+                active_color=COLORS["accent_ink"],
+            )
+        )
+        self.youtube_sync_btn.setToolTip("Start an authorized playlist sync")
+        self.youtube_sync_btn.setAccessibleName("Start authorized playlist sync")
         self.youtube_sync_btn.clicked.connect(self.sync_youtube_playlist)
 
-        clear_log_btn = QPushButton("Clear Log")
-        clear_log_btn.setObjectName("SoftButton")
-        clear_log_btn.clicked.connect(self.clear_sync_log)
+        clear_log_btn = self.make_action_button(
+            "Clear Log", "remove", self.clear_sync_log
+        )
 
         action_row.addWidget(self.youtube_sync_btn)
         action_row.addWidget(clear_log_btn)
@@ -721,7 +894,11 @@ class MusicVaultWindow(QMainWindow):
         self.youtube_log = QTextEdit()
         self.youtube_log.setReadOnly(True)
         self.youtube_log.setObjectName("SyncLog")
-        self.youtube_log.setPlaceholderText("Sync progress will appear here...")
+        self.youtube_log.setPlaceholderText(
+            "No sync activity yet. Authorized sync progress will appear here."
+        )
+        self.youtube_log.setAccessibleName("YouTube synchronization activity log")
+        self.youtube_log.setMinimumHeight(120)
 
         sync_layout.addWidget(form_title)
         sync_layout.addWidget(self.sync_quality_label)
@@ -738,6 +915,13 @@ class MusicVaultWindow(QMainWindow):
         layout.addWidget(header)
         layout.addLayout(metric_row)
         layout.addWidget(sync_card, 1)
+
+        self.sync_scroll = QScrollArea()
+        self.sync_scroll.setObjectName("SyncScroll")
+        self.sync_scroll.setWidgetResizable(True)
+        self.sync_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sync_scroll.setWidget(sync_content)
+        page_layout.addWidget(self.sync_scroll)
 
         return page
 
@@ -776,6 +960,7 @@ class MusicVaultWindow(QMainWindow):
         self.settings_api_key.setObjectName("SearchBox")
         self.settings_api_key.setPlaceholderText("Paste or update your YouTube API key")
         self.settings_api_key.setEchoMode(QLineEdit.Password)
+        self.settings_api_key.setAccessibleName("YouTube API key")
         self.settings_api_key.setText(self.read_saved_api_key())
 
         folder_label = QLabel("Default Download Folder")
@@ -784,17 +969,17 @@ class MusicVaultWindow(QMainWindow):
         folder_row = QHBoxLayout()
         self.settings_download_folder = QLineEdit()
         self.settings_download_folder.setObjectName("SearchBox")
+        self.settings_download_folder.setAccessibleName("Default download folder")
         self.settings_download_folder.setText(
             self.config.get("download_folder", str(default_downloads_dir()))
         )
 
-        choose_folder_btn = QPushButton("Choose")
-        choose_folder_btn.setObjectName("SoftButton")
-        choose_folder_btn.clicked.connect(self.choose_default_download_folder)
-
-        open_downloads_btn = QPushButton("Open Downloads")
-        open_downloads_btn.setObjectName("SoftButton")
-        open_downloads_btn.clicked.connect(self.open_default_download_folder)
+        choose_folder_btn = self.make_action_button(
+            "Choose", "folder", self.choose_default_download_folder
+        )
+        open_downloads_btn = self.make_action_button(
+            "Open Downloads", "downloaded", self.open_default_download_folder
+        )
 
         folder_row.addWidget(self.settings_download_folder, 1)
         folder_row.addWidget(choose_folder_btn)
@@ -805,6 +990,7 @@ class MusicVaultWindow(QMainWindow):
 
         self.settings_quality = QComboBox()
         self.settings_quality.setObjectName("QualityCombo")
+        self.settings_quality.setAccessibleName("Download audio quality")
         self.settings_quality.addItems(["192", "256", "320"])
 
         quality = str(self.config.get("audio_quality", "320"))
@@ -816,6 +1002,16 @@ class MusicVaultWindow(QMainWindow):
 
         save_btn = QPushButton("Save Settings")
         save_btn.setObjectName("PrimaryButton")
+        save_btn.setIcon(
+            ui_icon(
+                "settings",
+                18,
+                color=COLORS["accent_ink"],
+                active_color=COLORS["accent_ink"],
+            )
+        )
+        save_btn.setToolTip("Save Music Vault settings")
+        save_btn.setAccessibleName("Save Music Vault settings")
         save_btn.clicked.connect(self.save_settings_from_ui)
 
         maintenance_title = QLabel("Maintenance")
@@ -823,21 +1019,20 @@ class MusicVaultWindow(QMainWindow):
 
         maintenance_row = QHBoxLayout()
 
-        open_data_btn = QPushButton("Open Data Folder")
-        open_data_btn.setObjectName("SoftButton")
-        open_data_btn.clicked.connect(self.open_data_folder)
-
-        clear_failed_btn = QPushButton("Clear Failure History")
-        clear_failed_btn.setObjectName("SoftButton")
-        clear_failed_btn.clicked.connect(self.clear_failed_downloads)
-
-        refresh_btn = QPushButton("Refresh Status")
-        refresh_btn.setObjectName("SoftButton")
-        refresh_btn.clicked.connect(self.refresh_settings_status)
-
-        clean_btn = QPushButton("Remove Missing Tracks")
-        clean_btn.setObjectName("SoftButton")
-        clean_btn.clicked.connect(self.remove_missing_tracks)
+        open_data_btn = self.make_action_button(
+            "Open Data Folder", "folder", self.open_data_folder
+        )
+        clear_failed_btn = self.make_action_button(
+            "Clear Failure History", "remove", self.clear_failed_downloads,
+            object_name="DangerButton",
+        )
+        refresh_btn = self.make_action_button(
+            "Refresh Status", "refresh", self.refresh_settings_status
+        )
+        clean_btn = self.make_action_button(
+            "Remove Missing Tracks", "warning", self.remove_missing_tracks,
+            object_name="DangerButton",
+        )
 
         maintenance_row.addWidget(open_data_btn)
         maintenance_row.addWidget(clear_failed_btn)
@@ -850,18 +1045,23 @@ class MusicVaultWindow(QMainWindow):
 
         self.api_key_status = QLabel()
         self.api_key_status.setObjectName("StatusLine")
+        self.api_key_status.setWordWrap(True)
 
         self.ffmpeg_status = QLabel()
         self.ffmpeg_status.setObjectName("StatusLine")
+        self.ffmpeg_status.setWordWrap(True)
 
         self.db_status = QLabel()
         self.db_status.setObjectName("StatusLine")
+        self.db_status.setWordWrap(True)
 
         self.config_status = QLabel()
         self.config_status.setObjectName("StatusLine")
+        self.config_status.setWordWrap(True)
 
         self.app_status_line = QLabel()
         self.app_status_line.setObjectName("StatusLine")
+        self.app_status_line.setWordWrap(True)
 
         settings_layout.addWidget(youtube_title)
         settings_layout.addWidget(api_label)
@@ -883,37 +1083,110 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(self.app_status_line)
         settings_layout.addStretch(1)
 
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setObjectName("SettingsScroll")
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setWidget(settings_card)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         layout.addWidget(header)
-        layout.addWidget(settings_card, 1)
+        layout.addWidget(self.settings_scroll, 1)
 
         return page
 
     def build_player_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("PlayerBar")
-        bar.setFixedHeight(128)
+        bar.setFixedHeight(144)
 
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(16)
+        layout = QGridLayout(bar)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setColumnMinimumWidth(0, 190)
+        layout.setColumnMinimumWidth(1, 320)
+        layout.setColumnMinimumWidth(2, 190)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 0)
+        layout.setColumnStretch(2, 1)
+
+        left_region = QFrame()
+        left_region.setObjectName("PlayerRegion")
+        left_region.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        left_layout = QHBoxLayout(left_region)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
 
         self.cover_art = QLabel()
         self.cover_art.setObjectName("CoverArt")
-        self.cover_art.setFixedSize(82, 82)
+        self.cover_art.setFixedSize(76, 76)
         self.cover_art.setAlignment(Qt.AlignCenter)
-        self.cover_art.setText("♪")
+        self.cover_art.setPixmap(
+            render_icon_pixmap("music-note", 30, COLORS["text_primary"])
+        )
 
         track_info = QVBoxLayout()
         track_info.setSpacing(4)
+        track_info.setContentsMargins(0, 0, 0, 0)
 
-        self.now_title = QLabel("No track selected")
+        self.now_title = ElidedLabel("No track selected")
         self.now_title.setObjectName("NowTitle")
 
-        self.now_artist = QLabel("Double-click a song to play")
+        self.now_artist = ElidedLabel("Double-click a song to play")
         self.now_artist.setObjectName("MutedLabel")
+
+        track_info.addStretch(1)
+        track_info.addWidget(self.now_title)
+        track_info.addWidget(self.now_artist)
+        track_info.addStretch(1)
+        left_layout.addWidget(self.cover_art)
+        left_layout.addLayout(track_info, 1)
+
+        self.player_center = QFrame()
+        self.player_center.setObjectName("PlayerCenter")
+        self.player_center.setMinimumWidth(320)
+        self.player_center.setMaximumWidth(420)
+        center_layout = QVBoxLayout(self.player_center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
+        controls.addStretch(1)
+
+        self.prev_btn = IconButton(
+            "previous", "Previous track", size=22, variant="circle", parent=bar
+        )
+        self.prev_btn.setObjectName("CircleButton")
+        self.prev_btn.clicked.connect(self.play_previous)
+
+        self.play_btn = IconButton(
+            "play", "Play or pause", size=24, variant="play", parent=bar
+        )
+        self.play_btn.setObjectName("PlayButton")
+        self.play_btn.setIcon(
+            ui_icon(
+                "play",
+                24,
+                color=COLORS["app_background"],
+                active_color=COLORS["app_background"],
+            )
+        )
+        self.play_btn.clicked.connect(self.toggle_play)
+
+        self.next_btn = IconButton(
+            "next", "Next track", size=22, variant="circle", parent=bar
+        )
+        self.next_btn.setObjectName("CircleButton")
+        self.next_btn.clicked.connect(self.play_next)
+
+        controls.addWidget(self.prev_btn)
+        controls.addWidget(self.play_btn)
+        controls.addWidget(self.next_btn)
+        controls.addStretch(1)
 
         self.progress_slider = QSlider(Qt.Horizontal)
         self.progress_slider.setObjectName("ProgressSlider")
+        self.progress_slider.setAccessibleName("Playback position")
         self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
         self.progress_slider.sliderReleased.connect(self.on_slider_released)
 
@@ -926,56 +1199,49 @@ class MusicVaultWindow(QMainWindow):
         time_row.addStretch(1)
         time_row.addWidget(self.duration_label)
 
-        track_info.addWidget(self.now_title)
-        track_info.addWidget(self.now_artist)
-        track_info.addWidget(self.progress_slider)
-        track_info.addLayout(time_row)
+        center_layout.addLayout(controls)
+        center_layout.addWidget(self.progress_slider)
+        center_layout.addLayout(time_row)
 
-        controls_col = QVBoxLayout()
-        controls_col.setSpacing(8)
-
-        controls = QHBoxLayout()
-        controls.setSpacing(10)
-
-        prev_btn = QPushButton("‹")
-        prev_btn.setObjectName("CircleButton")
-        prev_btn.setToolTip("Previous")
-        prev_btn.clicked.connect(self.play_previous)
-
-        self.play_btn = QPushButton("▶")
-        self.play_btn.setObjectName("PlayButton")
-        self.play_btn.setToolTip("Play / Pause")
-        self.play_btn.clicked.connect(self.toggle_play)
-
-        next_btn = QPushButton("›")
-        next_btn.setObjectName("CircleButton")
-        next_btn.setToolTip("Next")
-        next_btn.clicked.connect(self.play_next)
-
-        controls.addWidget(prev_btn)
-        controls.addWidget(self.play_btn)
-        controls.addWidget(next_btn)
+        right_region = QFrame()
+        right_region.setObjectName("PlayerRegion")
+        right_region.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        right_layout = QVBoxLayout(right_region)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
 
         mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
+        mode_row.setSpacing(6)
+        mode_row.addStretch(1)
 
-        self.autoplay_btn = QPushButton("Auto On")
+        self.autoplay_btn = QPushButton("Auto")
         self.autoplay_btn.setObjectName("ModeButtonActive")
+        self.autoplay_btn.setIcon(ui_icon("autoplay", 16))
+        self.autoplay_btn.setFixedWidth(58)
         self.autoplay_btn.setToolTip("Toggle autoplay next track")
+        self.autoplay_btn.setAccessibleName("Toggle autoplay")
         self.autoplay_btn.clicked.connect(self.toggle_autoplay)
 
-        self.shuffle_btn = QPushButton("Shuffle")
+        self.shuffle_btn = QPushButton()
         self.shuffle_btn.setObjectName("ModeButton")
+        self.shuffle_btn.setIcon(ui_icon("shuffle", 17))
+        self.shuffle_btn.setFixedWidth(34)
         self.shuffle_btn.setToolTip("Toggle shuffle")
+        self.shuffle_btn.setAccessibleName("Toggle shuffle")
         self.shuffle_btn.clicked.connect(self.toggle_shuffle)
 
-        self.repeat_btn = QPushButton("Repeat Off")
+        self.repeat_btn = QPushButton()
         self.repeat_btn.setObjectName("ModeButton")
+        self.repeat_btn.setIcon(ui_icon("repeat", 17))
+        self.repeat_btn.setFixedWidth(34)
         self.repeat_btn.setToolTip("Cycle repeat mode")
+        self.repeat_btn.setAccessibleName("Cycle repeat mode")
         self.repeat_btn.clicked.connect(self.cycle_repeat)
 
-        self.queue_label = QLabel("Queue: 0")
+        self.queue_label = QLabel("Q: 0")
         self.queue_label.setObjectName("TinyLabel")
+        self.queue_label.setFixedWidth(40)
+        self.queue_label.setAlignment(Qt.AlignCenter)
         self.queue_label.setToolTip("Songs queued to play next")
 
         mode_row.addWidget(self.autoplay_btn)
@@ -983,25 +1249,33 @@ class MusicVaultWindow(QMainWindow):
         mode_row.addWidget(self.repeat_btn)
         mode_row.addWidget(self.queue_label)
 
-        controls_col.addLayout(controls)
-        controls_col.addLayout(mode_row)
-
-        volume_col = QVBoxLayout()
-        volume_label = QLabel("Volume")
-        volume_label.setObjectName("TinyLabel")
+        volume_row = QHBoxLayout()
+        volume_row.setSpacing(8)
+        volume_row.addStretch(1)
+        self.volume_icon = QLabel()
+        self.volume_icon.setObjectName("VolumeIcon")
+        self.volume_icon.setFixedSize(20, 20)
+        self.volume_icon.setAlignment(Qt.AlignCenter)
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setObjectName("VolumeSlider")
-        self.volume_slider.setFixedWidth(140)
+        self.volume_slider.setAccessibleName("Playback volume")
+        self.volume_slider.setMinimumWidth(96)
+        self.volume_slider.setMaximumWidth(150)
         self.volume_slider.setRange(0, 100)
         self.initialize_volume_controls()
         self.volume_slider.valueChanged.connect(self.on_volume_changed)
-        volume_col.addWidget(volume_label)
-        volume_col.addWidget(self.volume_slider)
+        self.update_volume_icon()
+        volume_row.addWidget(self.volume_icon)
+        volume_row.addWidget(self.volume_slider, 1)
 
-        layout.addWidget(self.cover_art)
-        layout.addLayout(track_info, 1)
-        layout.addLayout(controls_col)
-        layout.addLayout(volume_col)
+        right_layout.addStretch(1)
+        right_layout.addLayout(mode_row)
+        right_layout.addLayout(volume_row)
+        right_layout.addStretch(1)
+
+        layout.addWidget(left_region, 0, 0)
+        layout.addWidget(self.player_center, 0, 1)
+        layout.addWidget(right_region, 0, 2)
 
         return bar
 
@@ -1026,430 +1300,7 @@ class MusicVaultWindow(QMainWindow):
 
 
     def apply_styles(self) -> None:
-        self.setStyleSheet("""
-            QWidget {
-                background: #050607;
-                color: #F5F7FA;
-                font-family: Segoe UI;
-                font-size: 13px;
-            }
-
-            QFrame#Sidebar {
-                background: #070A0D;
-                border: 1px solid #161B22;
-                border-radius: 24px;
-            }
-
-            QLabel#LogoBadge {
-                background: #1DB954;
-                color: #050607;
-                border-radius: 21px;
-                font-size: 24px;
-                font-weight: 900;
-            }
-
-            QLabel#Brand {
-                font-size: 21px;
-                font-weight: 900;
-                color: #FFFFFF;
-            }
-
-            QLabel#PageTitle {
-                font-size: 34px;
-                font-weight: 900;
-                color: #FFFFFF;
-            }
-
-            QLabel#CardTitle {
-                font-size: 17px;
-                font-weight: 850;
-                color: #FFFFFF;
-            }
-
-            QLabel#MutedLabel {
-                color: #A7B0BD;
-                font-size: 12px;
-            }
-
-            QLabel#SectionLabel {
-                color: #667085;
-                font-size: 11px;
-                font-weight: 900;
-                letter-spacing: 2px;
-            }
-
-            QLabel#TinyLabel {
-                color: #7E8794;
-                font-size: 11px;
-            }
-
-            QLabel#NowTitle {
-                color: #FFFFFF;
-                font-size: 16px;
-                font-weight: 900;
-            }
-
-            QLabel#StatusLine {
-                background: #0D1117;
-                border: 1px solid #202938;
-                border-radius: 16px;
-                padding: 14px;
-                color: #DDE8F8;
-            }
-
-            QFrame#MainShell {
-                background: transparent;
-            }
-
-            QFrame#HeroHeader {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #141A22,
-                    stop:0.45 #10151C,
-                    stop:1 #0B0F14);
-                border: 1px solid #1E2936;
-                border-radius: 26px;
-            }
-
-            QFrame#TopHeader,
-            QFrame#Card,
-            QFrame#StatCard {
-                background: #0A0E13;
-                border: 1px solid #18202B;
-                border-radius: 24px;
-            }
-
-            QFrame#StatCard {
-                min-height: 70px;
-            }
-
-            QLabel#StatValue {
-                color: #FFFFFF;
-                font-size: 24px;
-                font-weight: 900;
-            }
-
-            QFrame#PlayerBar {
-                background: #090D12;
-                border: 1px solid #1E2936;
-                border-radius: 28px;
-            }
-
-            QLabel#CoverArt {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #1DB954,
-                    stop:0.55 #2563EB,
-                    stop:1 #7C3AED);
-                border: none;
-                border-radius: 18px;
-                color: #FFFFFF;
-                font-size: 32px;
-                font-weight: 900;
-            }
-
-            QPushButton {
-                background: #111827;
-                border: 1px solid #253244;
-                color: #EEF5FF;
-                padding: 10px 15px;
-                border-radius: 16px;
-                font-weight: 750;
-            }
-
-            QPushButton:hover {
-                background: #182235;
-                border: 1px solid #1DB954;
-            }
-
-            QPushButton:disabled {
-                background: #0B0F14;
-                color: #556070;
-                border: 1px solid #161B22;
-            }
-
-            QPushButton#PrimaryButton {
-                background: #1DB954;
-                border: 1px solid #1ED760;
-                color: #061008;
-                font-weight: 900;
-            }
-
-            QPushButton#PrimaryButton:hover {
-                background: #1ED760;
-            }
-
-            QPushButton#SoftButton {
-                background: #10161F;
-                border: 1px solid #253244;
-            }
-
-            QPushButton#SidebarButton {
-                text-align: left;
-                background: transparent;
-                border: 1px solid transparent;
-                color: #BCC7D6;
-                padding: 13px 14px;
-                border-radius: 14px;
-                font-weight: 850;
-            }
-
-            QPushButton#SidebarButton:hover {
-                background: #10161F;
-                border: 1px solid #253244;
-                color: #FFFFFF;
-            }
-
-            QPushButton#CircleButton {
-                min-width: 44px;
-                min-height: 44px;
-                max-width: 44px;
-                max-height: 44px;
-                border-radius: 22px;
-                font-size: 26px;
-                padding: 0;
-                background: #10161F;
-            }
-
-            QPushButton#PlayButton {
-                min-width: 58px;
-                min-height: 58px;
-                max-width: 58px;
-                max-height: 58px;
-                border-radius: 29px;
-                background: #FFFFFF;
-                color: #050607;
-                border: none;
-                font-size: 20px;
-                font-weight: 900;
-                padding: 0;
-            }
-
-            QPushButton#PlayButton:hover {
-                background: #1ED760;
-                color: #061008;
-            }
-
-            QLineEdit#SearchBox,
-            QLineEdit {
-                background: #080C11;
-                border: 1px solid #263244;
-                border-radius: 18px;
-                padding: 13px 16px;
-                color: #EFF4FF;
-                selection-background-color: #1DB954;
-            }
-
-            QLineEdit#SearchBox:focus,
-            QLineEdit:focus {
-                border: 1px solid #1DB954;
-            }
-
-            QTextEdit#SyncLog {
-                background: #070A0D;
-                border: 1px solid #202A38;
-                border-radius: 18px;
-                padding: 12px;
-                color: #D0D8E5;
-                font-family: Consolas;
-                font-size: 12px;
-            }
-
-            QListWidget#PlaylistList {
-                background: #06090D;
-                border: 1px solid #18202B;
-                border-radius: 16px;
-                padding: 8px;
-                outline: none;
-            }
-
-            QListWidget#PlaylistList::item {
-                padding: 11px;
-                border-radius: 11px;
-                color: #B8C2D2;
-            }
-
-            QListWidget#PlaylistList::item:selected {
-                background: #12351F;
-                color: #FFFFFF;
-            }
-
-            QTableWidget#LibraryTable {
-                background: #070A0D;
-                alternate-background-color: #090E14;
-                border: 1px solid #192230;
-                border-radius: 18px;
-                gridline-color: transparent;
-                selection-background-color: #1DB954;
-                selection-color: #061008;
-                outline: none;
-            }
-
-            QTableWidget#LibraryTable::item {
-                padding: 11px;
-                border: none;
-            }
-
-            QTableWidget#LibraryTable::item:selected {
-                background: #1DB954;
-                color: #061008;
-            }
-
-            QHeaderView::section {
-                background: #0E141C;
-                color: #AAB4C2;
-                border: none;
-                padding: 12px;
-                font-weight: 900;
-            }
-
-            QFrame#Divider {
-                background: #1E293B;
-            }
-
-            QCheckBox#PermissionCheck {
-                color: #CDD8E8;
-                spacing: 10px;
-            }
-
-
-            QPushButton#ModeButton {
-                background: #0D131B;
-                border: 1px solid #263244;
-                color: #AEB8C7;
-                padding: 7px 11px;
-                border-radius: 13px;
-                font-size: 11px;
-                font-weight: 850;
-            }
-
-            QPushButton#ModeButton:hover {
-                color: #FFFFFF;
-                border: 1px solid #1DB954;
-            }
-
-            QPushButton#ModeButtonActive {
-                background: #12351F;
-                border: 1px solid #1DB954;
-                color: #1ED760;
-                padding: 7px 11px;
-                border-radius: 13px;
-                font-size: 11px;
-                font-weight: 900;
-            }
-
-            QPushButton#ModeButtonActive:hover {
-                background: #164A2A;
-            }
-
-
-            QScrollArea#BrowserScroll {
-                background: transparent;
-                border: none;
-            }
-
-            QFrame#BrowserCard {
-                background: #0D131B;
-                border: 1px solid #202B3A;
-                border-radius: 20px;
-            }
-
-            QFrame#BrowserCard:hover {
-                background: #111A26;
-                border: 1px solid #1DB954;
-            }
-
-            QLabel#BrowserCover {
-                background: #070A0D;
-                border-radius: 16px;
-                color: #1DB954;
-                font-size: 42px;
-                font-weight: 900;
-            }
-
-            QLabel#BrowserCardTitle {
-                color: #FFFFFF;
-                font-size: 13px;
-                font-weight: 900;
-            }
-
-
-            QComboBox#QualityCombo {
-                background: #080C11;
-                border: 1px solid #263244;
-                border-radius: 16px;
-                padding: 10px 14px;
-                color: #EFF4FF;
-                font-weight: 800;
-            }
-
-            QComboBox#QualityCombo:hover {
-                border: 1px solid #1DB954;
-            }
-
-            QComboBox#QualityCombo::drop-down {
-                border: none;
-                width: 28px;
-            }
-
-            QComboBox#QualityCombo QAbstractItemView {
-                background: #0D131B;
-                color: #EFF4FF;
-                selection-background-color: #1DB954;
-                selection-color: #061008;
-                border: 1px solid #263244;
-            }
-
-
-            QFrame#SyncMetricCard {
-                background: #0A0E13;
-                border: 1px solid #18202B;
-                border-radius: 20px;
-                min-height: 66px;
-            }
-
-            QLabel#SyncMetricValue {
-                color: #FFFFFF;
-                font-size: 20px;
-                font-weight: 900;
-            }
-
-            QProgressBar#SyncProgress {
-                background: #070A0D;
-                border: 1px solid #202A38;
-                border-radius: 12px;
-                height: 24px;
-                color: #FFFFFF;
-                text-align: center;
-                font-weight: 800;
-            }
-
-            QProgressBar#SyncProgress::chunk {
-                background: #1DB954;
-                border-radius: 10px;
-            }
-
-            QSlider::groove:horizontal {
-                border: none;
-                height: 6px;
-                background: #263244;
-                border-radius: 3px;
-            }
-
-            QSlider::sub-page:horizontal {
-                background: #1DB954;
-                border-radius: 3px;
-            }
-
-            QSlider::handle:horizontal {
-                background: #FFFFFF;
-                border: 2px solid #1DB954;
-                width: 14px;
-                height: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
-            }
-        """)
-
-
+        self.setStyleSheet(application_stylesheet())
 
 
     def rebuild_track_row_map(self) -> dict[int, int]:
@@ -1512,7 +1363,7 @@ class MusicVaultWindow(QMainWindow):
         font.setBold(playing)
         title_item.setFont(font)
         title_item.setForeground(
-            QBrush(QColor("#1DB954")) if playing else QBrush()
+            QBrush(QColor(COLORS["now_playing"])) if playing else QBrush()
         )
 
     def apply_now_playing_row_state(
@@ -1602,7 +1453,7 @@ class MusicVaultWindow(QMainWindow):
                 item.setData(Qt.UserRole, track["id"])
 
                 if col_idx == 0:
-                    item.setToolTip(str(track["path"]))
+                    item.setToolTip(str(values[0]))
 
                     cover_path = track["cover_path"] if "cover_path" in track.keys() else None
 
@@ -1623,6 +1474,20 @@ class MusicVaultWindow(QMainWindow):
         if subtitle and hasattr(self, "page_subtitle"):
             self.page_subtitle.setText(subtitle)
 
+        if not tracks and hasattr(self, "library_empty_state"):
+            if self.current_view_kind == "custom":
+                self.library_empty_state.title_label.setText("This playlist is empty")
+                self.library_empty_state.description_label.setText(
+                    "Add a track from Library to begin this playlist."
+                )
+            else:
+                self.library_empty_state.title_label.setText(
+                    "Your library is ready for music"
+                )
+                self.library_empty_state.description_label.setText(
+                    "Import a folder to begin building your local collection."
+                )
+
         self.filter_library(self.search_box.text() if hasattr(self, "search_box") else "")
         self.restore_table_selection(selected_track_id)
         self.apply_now_playing_row_state()
@@ -1633,6 +1498,17 @@ class MusicVaultWindow(QMainWindow):
 
         def add_sidebar_item(label: str, kind: str, playlist_id: int | None = None) -> None:
             item = QListWidgetItem(label)
+            icon_name = {
+                "library": "library",
+                "recent": "recently-added",
+                "downloaded": "downloaded",
+                "albums": "albums",
+                "artists": "artists",
+                "new": "add",
+                "custom": "playlists",
+            }.get(kind, "playlists")
+            item.setIcon(ui_icon(icon_name, 18))
+            item.setToolTip(label)
             item.setData(Qt.UserRole, {
                 "kind": kind,
                 "id": playlist_id,
@@ -1651,19 +1527,92 @@ class MusicVaultWindow(QMainWindow):
             add_sidebar_item(playlist["name"], "custom", playlist["id"])
 
 
-    def clear_browser_grid(self) -> None:
+    def clear_browser_grid(self, *, delete_widgets: bool = True) -> None:
         while self.browser_grid.count():
             item = self.browser_grid.takeAt(0)
             widget = item.widget()
 
-            if widget is not None:
+            if delete_widgets and widget is not None:
                 widget.deleteLater()
+        if delete_widgets:
+            self._browser_cards = []
+        self._browser_column_count = 0
 
-    def make_browser_card(self, title: str, subtitle: str, cover_path: str | None, callback) -> QFrame:
+    def browser_column_count(self) -> int:
+        width = self.browser_scroll.viewport().width() if hasattr(self, "browser_scroll") else 0
+        return max(1, int(max(width, 200) // 200))
+
+    def reflow_browser_cards(self) -> None:
+        if not self._browser_cards:
+            return
+        columns = self.browser_column_count()
+        if columns == self._browser_column_count and self.browser_grid.count():
+            return
+        self.clear_browser_grid(delete_widgets=False)
+        for index, card in enumerate(self._browser_cards):
+            self.browser_grid.addWidget(card, index // columns, index % columns)
+        self._browser_column_count = columns
+
+    def rounded_cover_pixmap(
+        self,
+        source: QPixmap,
+        size: int,
+        radius: float = 14.0,
+        *,
+        dpr: float | None = None,
+    ) -> QPixmap:
+        pixel_ratio = float(self.devicePixelRatioF() if dpr is None else dpr)
+        if not math.isfinite(pixel_ratio) or pixel_ratio <= 0:
+            pixel_ratio = 1.0
+        pixel_ratio = min(pixel_ratio, 4.0)
+        physical_size = max(1, int(math.ceil(size * pixel_ratio)))
+        scaled = source.scaled(
+            QSize(physical_size, physical_size),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation,
+        )
+        x_offset = max(0, (scaled.width() - physical_size) // 2)
+        y_offset = max(0, (scaled.height() - physical_size) // 2)
+        target = QPixmap(physical_size, physical_size)
+        target.fill(Qt.transparent)
+        painter = QPainter(target)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        path = QPainterPath()
+        physical_radius = radius * pixel_ratio
+        path.addRoundedRect(
+            QRectF(0, 0, physical_size, physical_size),
+            physical_radius,
+            physical_radius,
+        )
+        painter.setClipPath(path)
+        painter.drawPixmap(
+            0,
+            0,
+            scaled,
+            x_offset,
+            y_offset,
+            physical_size,
+            physical_size,
+        )
+        painter.end()
+        target.setDevicePixelRatio(pixel_ratio)
+        return target
+
+    def make_browser_card(
+        self,
+        title: str,
+        subtitle: str,
+        cover_path: str | None,
+        callback,
+        *,
+        placeholder_icon: str = "albums",
+    ) -> QFrame:
         card = QFrame()
         card.setObjectName("BrowserCard")
-        card.setFixedSize(174, 224)
+        card.setFixedSize(184, 232)
         card.setCursor(Qt.PointingHandCursor)
+        card.setFocusPolicy(Qt.StrongFocus)
+        card.setAccessibleName(f"Open {title}")
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -1671,32 +1620,28 @@ class MusicVaultWindow(QMainWindow):
 
         cover = QLabel()
         cover.setObjectName("BrowserCover")
-        cover.setFixedSize(146, 146)
+        cover.setFixedSize(156, 156)
         cover.setAlignment(Qt.AlignCenter)
 
         if cover_path and Path(cover_path).exists():
             pixmap = QPixmap(cover_path)
 
             if not pixmap.isNull():
-                cover.setPixmap(
-                    pixmap.scaled(
-                        QSize(146, 146),
-                        Qt.KeepAspectRatioByExpanding,
-                        Qt.SmoothTransformation
-                    )
-                )
+                cover.setPixmap(self.rounded_cover_pixmap(pixmap, 156))
             else:
-                cover.setText("♪")
+                cover.setPixmap(
+                    render_icon_pixmap(placeholder_icon, 42, COLORS["text_muted"])
+                )
         else:
-            cover.setText("♪")
+            cover.setPixmap(
+                render_icon_pixmap(placeholder_icon, 42, COLORS["text_muted"])
+            )
 
-        title_label = QLabel(title)
+        title_label = ElidedLabel(title)
         title_label.setObjectName("BrowserCardTitle")
-        title_label.setWordWrap(True)
 
-        subtitle_label = QLabel(subtitle)
+        subtitle_label = ElidedLabel(subtitle)
         subtitle_label.setObjectName("MutedLabel")
-        subtitle_label.setWordWrap(True)
 
         layout.addWidget(cover)
         layout.addWidget(title_label)
@@ -1704,9 +1649,18 @@ class MusicVaultWindow(QMainWindow):
         layout.addStretch(1)
 
         def handle_click(event):
-            callback()
+            if event.button() == Qt.LeftButton:
+                callback()
+
+        def handle_key(event):
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+                callback()
+                event.accept()
+                return
+            QFrame.keyPressEvent(card, event)
 
         card.mousePressEvent = handle_click
+        card.keyPressEvent = handle_key
 
         return card
 
@@ -1777,7 +1731,15 @@ class MusicVaultWindow(QMainWindow):
         albums = self.album_groups()
         self.track_count_card.value_label.setText(str(len(albums)))
 
-        columns = 5
+        if not albums:
+            self._browser_cards = [EmptyState(
+                "albums",
+                "No albums yet",
+                "Imported tracks with album metadata will appear here.",
+                parent=self.browser_container,
+            )]
+            self.reflow_browser_cards()
+            return
 
         for index, album in enumerate(albums):
             card = self.make_browser_card(
@@ -1786,7 +1748,8 @@ class MusicVaultWindow(QMainWindow):
                 album["cover_path"],
                 lambda album_name=album["album"]: self.open_album(album_name)
             )
-            self.browser_grid.addWidget(card, index // columns, index % columns)
+            self._browser_cards.append(card)
+        self.reflow_browser_cards()
 
     def show_artist_browser(self) -> None:
         self.library_content_stack.setCurrentIndex(1)
@@ -1799,16 +1762,26 @@ class MusicVaultWindow(QMainWindow):
         artists = self.artist_groups()
         self.track_count_card.value_label.setText(str(len(artists)))
 
-        columns = 5
+        if not artists:
+            self._browser_cards = [EmptyState(
+                "artists",
+                "No artists yet",
+                "Imported artist metadata will appear here.",
+                parent=self.browser_container,
+            )]
+            self.reflow_browser_cards()
+            return
 
         for index, artist in enumerate(artists):
             card = self.make_browser_card(
                 artist["artist"],
                 f'{artist["count"]} tracks',
                 artist["cover_path"],
-                lambda artist_name=artist["artist"]: self.open_artist(artist_name)
+                lambda artist_name=artist["artist"]: self.open_artist(artist_name),
+                placeholder_icon="artists",
             )
-            self.browser_grid.addWidget(card, index // columns, index % columns)
+            self._browser_cards.append(card)
+        self.reflow_browser_cards()
 
     def open_album(self, album_name: str) -> None:
         rows = self.db.conn.execute("""
@@ -2095,6 +2068,7 @@ class MusicVaultWindow(QMainWindow):
 
         self.sync_progress.setRange(0, 0)
         self.sync_progress.setFormat("Syncing...")
+        self.set_sync_visual_state("syncing")
 
         self.log_youtube("Starting Music Vault sync.")
         self.log_youtube(f"Download folder: {self.config['download_folder']}")
@@ -2164,6 +2138,7 @@ class MusicVaultWindow(QMainWindow):
         values = sync_ui_values(result)
         self.sync_progress.setFormat(values["status"])
         self.sync_status_card.value_label.setText(values["status"])
+        self.set_sync_visual_state(result.status)
 
         if hasattr(self, "refresh_current_view"):
             self.refresh_current_view()
@@ -2302,17 +2277,14 @@ class MusicVaultWindow(QMainWindow):
             pixmap = QPixmap(cover_path)
 
             if not pixmap.isNull():
-                scaled = pixmap.scaled(
-                    QSize(78, 78),
-                    Qt.KeepAspectRatioByExpanding,
-                    Qt.SmoothTransformation
+                self.cover_art.setPixmap(
+                    self.rounded_cover_pixmap(pixmap, 72, radius=10.0)
                 )
-                self.cover_art.setPixmap(scaled)
-                self.cover_art.setText("")
                 return
 
-        self.cover_art.setPixmap(QPixmap())
-        self.cover_art.setText("♪")
+        self.cover_art.setPixmap(
+            render_icon_pixmap("music-note", 30, COLORS["text_primary"])
+        )
 
     def toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -2443,7 +2415,7 @@ class MusicVaultWindow(QMainWindow):
 
     def update_queue_label(self) -> None:
         if hasattr(self, "queue_label"):
-            self.queue_label.setText(f"Queue: {len(self.manual_queue)}")
+            self.queue_label.setText(f"Q: {len(self.manual_queue)}")
 
     def queue_selected_next(self) -> None:
         track_id = self.selected_track_id()
@@ -2478,8 +2450,11 @@ class MusicVaultWindow(QMainWindow):
         menu = QMenu(self)
 
         play_action = menu.addAction("Play")
+        play_action.setIcon(ui_icon("play", 18))
         play_next_action = menu.addAction("Play Next")
+        play_next_action.setIcon(ui_icon("queue-next", 18))
         add_playlist_action = menu.addAction("Add to Playlist")
+        add_playlist_action.setIcon(ui_icon("playlists", 18))
 
         action = menu.exec(self.library_table.viewport().mapToGlobal(position))
 
@@ -2590,43 +2565,76 @@ class MusicVaultWindow(QMainWindow):
 
     def update_playback_mode_buttons(self) -> None:
         if self.autoplay_enabled:
-            self.autoplay_btn.setText("Auto On")
+            self.autoplay_btn.setText("Auto")
             self.autoplay_btn.setObjectName("ModeButtonActive")
+            self.autoplay_btn.setIcon(
+                ui_icon("autoplay", 16, color=COLORS["accent"])
+            )
+            self.autoplay_btn.setToolTip("Autoplay is on")
         else:
-            self.autoplay_btn.setText("Auto Off")
+            self.autoplay_btn.setText("Auto")
             self.autoplay_btn.setObjectName("ModeButton")
+            self.autoplay_btn.setIcon(ui_icon("autoplay", 16))
+            self.autoplay_btn.setToolTip("Autoplay is off")
 
         if self.shuffle_enabled:
-            self.shuffle_btn.setText("Shuffle On")
             self.shuffle_btn.setObjectName("ModeButtonActive")
+            self.shuffle_btn.setIcon(
+                ui_icon("shuffle", 17, color=COLORS["accent"])
+            )
+            self.shuffle_btn.setToolTip("Shuffle is on")
         else:
-            self.shuffle_btn.setText("Shuffle")
             self.shuffle_btn.setObjectName("ModeButton")
+            self.shuffle_btn.setIcon(ui_icon("shuffle", 17))
+            self.shuffle_btn.setToolTip("Shuffle is off")
 
         if self.repeat_mode == "off":
-            self.repeat_btn.setText("Repeat Off")
             self.repeat_btn.setObjectName("ModeButton")
+            self.repeat_btn.setIcon(ui_icon("repeat", 17))
+            self.repeat_btn.setToolTip("Repeat is off")
         elif self.repeat_mode == "all":
-            self.repeat_btn.setText("Repeat All")
             self.repeat_btn.setObjectName("ModeButtonActive")
+            self.repeat_btn.setIcon(
+                ui_icon("repeat", 17, color=COLORS["accent"])
+            )
+            self.repeat_btn.setToolTip("Repeat all is on")
         else:
-            self.repeat_btn.setText("Repeat One")
             self.repeat_btn.setObjectName("ModeButtonActive")
+            self.repeat_btn.setIcon(
+                ui_icon("repeat-one", 17, color=COLORS["accent"])
+            )
+            self.repeat_btn.setToolTip("Repeat one is on")
 
         self.update_queue_label()
 
         for btn in [self.autoplay_btn, self.shuffle_btn, self.repeat_btn]:
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-            btn.update()
+            repolish(btn)
 
         self.write_app_status()
 
     def on_playback_state_changed(self, state) -> None:
         if state == QMediaPlayer.PlayingState:
-            self.play_btn.setText("❚❚")
+            self.play_btn.setIcon(
+                ui_icon(
+                    "pause",
+                    24,
+                    color=COLORS["app_background"],
+                    active_color=COLORS["app_background"],
+                )
+            )
+            self.play_btn.setToolTip("Pause")
+            self.play_btn.setAccessibleName("Pause")
         else:
-            self.play_btn.setText("▶")
+            self.play_btn.setIcon(
+                ui_icon(
+                    "play",
+                    24,
+                    color=COLORS["app_background"],
+                    active_color=COLORS["app_background"],
+                )
+            )
+            self.play_btn.setToolTip("Play")
+            self.play_btn.setAccessibleName("Play")
 
         self.write_app_status()
 
@@ -2734,6 +2742,7 @@ class MusicVaultWindow(QMainWindow):
 
     def filter_library(self, text: str) -> None:
         needle = text.lower().strip()
+        visible_count = 0
 
         for row in range(self.library_table.rowCount()):
             row_text = " ".join(
@@ -2741,7 +2750,18 @@ class MusicVaultWindow(QMainWindow):
                 for col in range(self.library_table.columnCount())
                 if self.library_table.item(row, col)
             )
-            self.library_table.setRowHidden(row, needle not in row_text)
+            hidden = needle not in row_text
+            self.library_table.setRowHidden(row, hidden)
+            if not hidden:
+                visible_count += 1
+
+        if hasattr(self, "library_body_stack"):
+            if self.library_table.rowCount() == 0:
+                self.library_body_stack.setCurrentIndex(1)
+            elif visible_count == 0:
+                self.library_body_stack.setCurrentIndex(2)
+            else:
+                self.library_body_stack.setCurrentIndex(0)
 
 
     def remove_missing_tracks(self) -> None:
@@ -2935,6 +2955,17 @@ class MusicVaultWindow(QMainWindow):
         if hasattr(self, "settings_api_key") and not self.settings_api_key.text().strip():
             self.settings_api_key.setText(self.read_saved_api_key())
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._browser_cards:
+            self._browser_reflow_timer.start()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._dark_title_bar_attempted:
+            self._dark_title_bar_attempted = True
+            self._dark_title_bar_applied = apply_dark_title_bar(self)
+
     def closeEvent(self, event) -> None:
         self.flush_pending_volume_save()
         super().closeEvent(event)
@@ -2954,6 +2985,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     window = MusicVaultWindow()
     window.show()
+    schedule_ui_review(window, app)
     sys.exit(app.exec())
 
 

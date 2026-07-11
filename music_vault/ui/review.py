@@ -1,0 +1,589 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import QObject, QTimer
+
+
+REVIEW_ENV = "MUSIC_VAULT_UI_REVIEW"
+REVIEW_SCHEMA_VERSION = 1
+
+DEFAULT_REVIEW_SCENES = (
+    "library",
+    "albums",
+    "artists",
+    "sync_center",
+    "settings",
+    "empty_playlist",
+)
+
+SCENE_LABELS = {
+    "library": "Library",
+    "albums": "Albums",
+    "artists": "Artists",
+    "sync_center": "Sync Center",
+    "settings": "Settings",
+    "empty_playlist": "Empty Playlist",
+    # Supported for focused follow-up review plans, but not in the default matrix.
+    "no_results": "No Results",
+}
+
+_DISPLAY_DATA_ROOT = r"<synthetic-runtime>\data"
+_WINDOWS_PATH_RE = re.compile(r"(?i)(?:[a-z]:\\|\\\\)[^\r\n]+")
+
+
+class ReviewPlanError(ValueError):
+    """Raised when an explicitly requested synthetic UI review plan is unsafe."""
+
+
+@dataclass(frozen=True)
+class ReviewSize:
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class ReviewPlan:
+    request_path: Path
+    runtime_root: Path
+    output_dir: Path
+    sizes: tuple[ReviewSize, ...]
+    scenes: tuple[str, ...]
+    settle_ms: int
+
+    @property
+    def capture_count(self) -> int:
+        return len(self.sizes) * len(self.scenes)
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _absolute_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ReviewPlanError(f"{label} must be a non-empty absolute path.")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ReviewPlanError(f"{label} must be an absolute path.")
+    return path.resolve()
+
+
+def _parse_sizes(value: Any) -> tuple[ReviewSize, ...]:
+    if not isinstance(value, list) or not value:
+        raise ReviewPlanError("sizes must be a non-empty list.")
+
+    sizes: list[ReviewSize] = []
+    seen: set[tuple[int, int]] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ReviewPlanError("Each size must contain width and height integers.")
+        width = entry.get("width")
+        height = entry.get("height")
+        if isinstance(width, bool) or isinstance(height, bool):
+            raise ReviewPlanError("Review dimensions must be integers.")
+        if not isinstance(width, int) or not isinstance(height, int):
+            raise ReviewPlanError("Review dimensions must be integers.")
+        if not 800 <= width <= 4096 or not 600 <= height <= 2160:
+            raise ReviewPlanError("Review dimensions are outside the supported range.")
+        key = (width, height)
+        if key in seen:
+            raise ReviewPlanError("Duplicate review dimensions are not allowed.")
+        seen.add(key)
+        sizes.append(ReviewSize(width, height))
+    return tuple(sizes)
+
+
+def _parse_scenes(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ReviewPlanError("scenes must be a non-empty list.")
+    if any(not isinstance(scene, str) or scene not in SCENE_LABELS for scene in value):
+        raise ReviewPlanError("The review plan contains an unsupported scene.")
+    if len(set(value)) != len(value):
+        raise ReviewPlanError("Duplicate review scenes are not allowed.")
+    return tuple(value)
+
+
+def load_review_plan(path: str | Path) -> ReviewPlan:
+    request_path = Path(path).expanduser()
+    if not request_path.is_absolute():
+        raise ReviewPlanError("The review plan path must be absolute.")
+    request_path = request_path.resolve()
+    try:
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("The review plan could not be read as JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise ReviewPlanError("The review plan must be a JSON object.")
+    if payload.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        raise ReviewPlanError("Unsupported UI review plan schema version.")
+
+    runtime_root = _absolute_path(payload.get("runtime_root"), "runtime_root")
+    output_dir = _absolute_path(payload.get("output_dir"), "output_dir")
+    sizes = _parse_sizes(payload.get("sizes"))
+    scenes = _parse_scenes(payload.get("scenes"))
+
+    settle_ms = payload.get("settle_ms", 250)
+    if isinstance(settle_ms, bool) or not isinstance(settle_ms, int):
+        raise ReviewPlanError("settle_ms must be an integer.")
+    if not 50 <= settle_ms <= 5000:
+        raise ReviewPlanError("settle_ms is outside the supported range.")
+
+    expected_count = payload.get("expected_capture_count")
+    capture_count = len(sizes) * len(scenes)
+    if expected_count is not None and expected_count != capture_count:
+        raise ReviewPlanError("expected_capture_count does not match the review matrix.")
+
+    if not _is_relative_to(request_path, runtime_root):
+        raise ReviewPlanError("The review plan must be stored under the synthetic runtime.")
+    if _is_relative_to(output_dir, runtime_root):
+        raise ReviewPlanError("Review output must be outside the disposable runtime.")
+    if not (runtime_root / "run.py").is_file() or not (runtime_root / "music_vault").is_dir():
+        raise ReviewPlanError("The synthetic runtime does not contain project-root markers.")
+
+    return ReviewPlan(
+        request_path=request_path,
+        runtime_root=runtime_root,
+        output_dir=output_dir,
+        sizes=sizes,
+        scenes=scenes,
+        settle_ms=settle_ms,
+    )
+
+
+def _ensure_under_runtime(path: Path, runtime_root: Path, label: str) -> None:
+    if not _is_relative_to(path.resolve(), runtime_root):
+        raise ReviewPlanError(f"{label} resolved outside the synthetic runtime.")
+
+
+def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
+    """Validate the active resolver and synthetic data without reading any key."""
+    from music_vault.core.paths import (
+        app_status_path,
+        config_path,
+        data_dir,
+        database_path,
+        project_root,
+        youtube_api_key_path,
+    )
+
+    resolved_root = project_root().resolve()
+    if resolved_root != plan.runtime_root:
+        raise ReviewPlanError("The application did not resolve the synthetic runtime root.")
+
+    resolved_paths = {
+        "data": data_dir(),
+        "database": database_path(),
+        "config": config_path(),
+        "status": app_status_path(),
+        "api_key": youtube_api_key_path(),
+    }
+    for label, path in resolved_paths.items():
+        _ensure_under_runtime(Path(path), plan.runtime_root, label)
+
+    config_file = Path(resolved_paths["config"])
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Synthetic configuration is unavailable or malformed.") from exc
+    if not isinstance(config, dict) or config.get("volume_percent") != 23:
+        raise ReviewPlanError("Synthetic configuration did not preserve volume 23.")
+    download_folder = _absolute_path(config.get("download_folder"), "download_folder")
+    _ensure_under_runtime(download_folder, plan.runtime_root, "download_folder")
+
+    api_key_file = Path(resolved_paths["api_key"])
+    if api_key_file.exists():
+        raise ReviewPlanError("An API-key file exists in the synthetic runtime.")
+
+    database_file = Path(resolved_paths["database"])
+    connection = sqlite3.connect(f"file:{database_file.as_posix()}?mode=ro", uri=True)
+    try:
+        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        connection.close()
+    if schema_version != 2:
+        raise ReviewPlanError("Synthetic database schema is not version 2.")
+
+    status_file = Path(resolved_paths["status"])
+    try:
+        status_payload = json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Synthetic App Status was not generated correctly.") from exc
+    if not isinstance(status_payload, dict):
+        raise ReviewPlanError("Synthetic App Status is malformed.")
+
+    return {
+        "resolver_isolated": True,
+        "schema_version": schema_version,
+        "status_generated": True,
+        "config_volume_percent": 23,
+        "api_key_present": False,
+    }
+
+
+def _set_label_text(owner: object, attribute: str, text: str) -> None:
+    widget = getattr(owner, attribute, None)
+    if widget is not None and hasattr(widget, "setText"):
+        widget.setText(text)
+
+
+def sanitize_review_paths(window: object) -> None:
+    """Replace synthetic absolute paths with neutral review-only display text."""
+    _set_label_text(window, "youtube_output", rf"{_DISPLAY_DATA_ROOT}\youtube_downloads")
+    _set_label_text(window, "settings_download_folder", rf"{_DISPLAY_DATA_ROOT}\youtube_downloads")
+    _set_label_text(window, "db_status", rf"Database: {_DISPLAY_DATA_ROOT}\music_vault.sqlite3")
+    _set_label_text(
+        window,
+        "config_status",
+        "\n".join(
+            (
+                rf"Config: {_DISPLAY_DATA_ROOT}\music_vault_config.json",
+                rf"Download Folder: {_DISPLAY_DATA_ROOT}\youtube_downloads",
+                "Audio Quality: 320 kbps",
+                "Unresolved Sync Failures: 1",
+            )
+        ),
+    )
+    _set_label_text(window, "app_status_line", rf"App Status: {_DISPLAY_DATA_ROOT}\music_vault_status.json")
+    _set_label_text(window, "ffmpeg_status", "FFmpeg: Synthetic review environment")
+    _set_label_text(window, "api_key_status", "YouTube API Key: Missing (synthetic review)")
+
+    api_field = getattr(window, "settings_api_key", None)
+    if api_field is not None and hasattr(api_field, "clear"):
+        api_field.clear()
+
+
+def _set_metric(window: object, attribute: str, value: str) -> None:
+    card = getattr(window, attribute, None)
+    value_label = getattr(card, "value_label", None)
+    if value_label is not None and hasattr(value_label, "setText"):
+        value_label.setText(value)
+
+
+def _prepare_sync_issue_scene(window: object) -> None:
+    visual_helper = getattr(window, "set_sync_visual_state", None)
+    if callable(visual_helper):
+        visual_helper("complete_with_issues")
+
+    _set_metric(window, "sync_status_card", "Complete with issues")
+    _set_metric(window, "sync_downloaded_card", "8")
+    _set_metric(window, "sync_skipped_card", "3")
+    _set_metric(window, "sync_failed_card", "1")
+
+    progress = getattr(window, "sync_progress", None)
+    if progress is not None:
+        progress.setRange(0, 100)
+        progress.setValue(100)
+        progress.setFormat("Complete with issues")
+
+    log = getattr(window, "youtube_log", None)
+    if log is not None and hasattr(log, "setPlainText"):
+        log.setPlainText(
+            "Synthetic review completed with one recoverable issue.\n"
+            "8 new items prepared | 3 already present | 1 needs attention.\n"
+            "No network request was made."
+        )
+
+    url_field = getattr(window, "youtube_url", None)
+    if url_field is not None and hasattr(url_field, "setText"):
+        url_field.setText("Synthetic authorized playlist review")
+    permission = getattr(window, "youtube_confirm", None)
+    if permission is not None and hasattr(permission, "setChecked"):
+        permission.setChecked(True)
+    button = getattr(window, "youtube_sync_btn", None)
+    if button is not None:
+        button.setEnabled(True)
+        button.setText("Start Sync")
+
+
+def _set_page(window: object, page_attribute: str) -> None:
+    pages = getattr(window, "pages", None)
+    page = getattr(window, page_attribute, None)
+    if pages is None or page is None:
+        raise ReviewPlanError(f"The {page_attribute} review page is unavailable.")
+    pages.setCurrentWidget(page)
+
+
+def prepare_review_scene(window: object, scene: str) -> None:
+    if scene == "library":
+        _set_page(window, "library_page")
+        search = getattr(window, "search_box", None)
+        if search is not None:
+            search.clear()
+        window.current_view_kind = "library"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Library"
+        tracks = window.db.list_tracks()
+        window.load_library(
+            tracks,
+            "Library",
+            "A polished local collection built from synthetic review data.",
+        )
+        if tracks:
+            window.update_now_playing_indicator(
+                int(tracks[0]["id"]),
+                select_if_visible=False,
+                scroll_if_visible=False,
+            )
+            _set_label_text(window, "now_title", "Synthetic Midnight Signal")
+            _set_label_text(window, "now_artist", "The Local Archive")
+        if len(tracks) > 1:
+            window.library_table.selectRow(1)
+        if len(tracks) > 2:
+            window.manual_queue = [int(tracks[2]["id"])]
+            window.update_queue_label()
+    elif scene == "albums":
+        _set_page(window, "library_page")
+        window.current_view_kind = "albums"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Albums"
+        window.show_album_browser()
+    elif scene == "artists":
+        _set_page(window, "library_page")
+        window.current_view_kind = "artists"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Artists"
+        window.show_artist_browser()
+    elif scene == "sync_center":
+        _set_page(window, "sync_page")
+        _prepare_sync_issue_scene(window)
+    elif scene == "settings":
+        _set_page(window, "settings_page")
+    elif scene == "empty_playlist":
+        _set_page(window, "library_page")
+        search = getattr(window, "search_box", None)
+        if search is not None:
+            search.clear()
+        window.current_view_kind = "custom"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Empty Playlist"
+        window.load_library(
+            [],
+            "Empty Playlist",
+            "Add a track to begin this synthetic playlist.",
+        )
+    elif scene == "no_results":
+        _set_page(window, "library_page")
+        window.current_view_kind = "library"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Library"
+        window.load_library(window.db.list_tracks(), "Library", "Synthetic search review.")
+        search = getattr(window, "search_box", None)
+        if search is not None:
+            search.setText("no-synthetic-track-matches-this-query")
+        else:
+            window.filter_library("no-synthetic-track-matches-this-query")
+    else:
+        raise ReviewPlanError("The requested review scene is unsupported.")
+
+    sanitize_review_paths(window)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_error_text(exc: BaseException, plan: ReviewPlan) -> str:
+    text = str(exc).replace(str(plan.runtime_root), "<synthetic-runtime>")
+    text = text.replace(str(plan.output_dir), "<review-output>")
+    text = _WINDOWS_PATH_RE.sub("<path>", text)
+    return f"{type(exc).__name__}: {text[:500]}"
+
+
+class UIReviewController(QObject):
+    def __init__(self, window: object, app: object, plan: ReviewPlan) -> None:
+        super().__init__(window)
+        self.window = window
+        self.app = app
+        self.plan = plan
+        self.jobs = [
+            (size, scene)
+            for size in plan.sizes
+            for scene in plan.scenes
+        ]
+        self.job_index = 0
+        self.captures: list[dict[str, Any]] = []
+        self.runtime_checks: dict[str, Any] = {}
+        self.started_at = _utc_now()
+
+    def start(self) -> None:
+        try:
+            self.plan.output_dir.mkdir(parents=True, exist_ok=True)
+            self.runtime_checks = validate_review_runtime(self.plan)
+            self.window.showNormal()
+            self.window.raise_()
+            self.window.activateWindow()
+        except Exception as exc:
+            self._fail(exc)
+            return
+        QTimer.singleShot(50, self._prepare_next)
+
+    def _prepare_next(self) -> None:
+        if self.job_index >= len(self.jobs):
+            self._finish()
+            return
+
+        size, scene = self.jobs[self.job_index]
+        try:
+            # Re-expose the native window between jobs. On Windows, rapidly
+            # switching stacked pages while resizing can otherwise leave stale
+            # regions in Qt's backing store even after a synchronous repaint.
+            # This path is reachable only through the explicit review hook.
+            if self.job_index:
+                self.window.hide()
+                self.app.processEvents()
+            self.window.resize(size.width, size.height)
+            prepare_review_scene(self.window, scene)
+            self.window.showNormal()
+            self.window.raise_()
+            self.window.activateWindow()
+            self.window.ensurePolished()
+            self.window.updateGeometry()
+            self.window.repaint()
+            self.app.processEvents()
+        except Exception as exc:
+            self._fail(exc)
+            return
+        QTimer.singleShot(self.plan.settle_ms, self._prime_current_render)
+
+    def _prime_current_render(self) -> None:
+        """Render once before saving so every child surface is polished."""
+        try:
+            from PySide6.QtGui import QColor, QPixmap
+
+            warmup = QPixmap(self.window.size())
+            warmup.fill(QColor("#06090E"))
+            self.window.render(warmup)
+            self.window.repaint()
+            self.app.processEvents()
+        except Exception as exc:
+            self._fail(exc)
+            return
+        QTimer.singleShot(200, self._capture_current)
+
+    def _capture_current(self) -> None:
+        size, scene = self.jobs[self.job_index]
+        try:
+            sanitize_review_paths(self.window)
+            from PySide6.QtGui import QColor, QPixmap
+            from PySide6.QtWidgets import QToolTip
+
+            QToolTip.hideText()
+            self.window.repaint()
+            self.app.processEvents()
+            # Each capture is normally isolated in its own process by the
+            # developer harness. Rendering the complete widget tree avoids
+            # copying compositor artifacts and also works in offscreen tests.
+            pixmap = QPixmap(self.window.size())
+            pixmap.fill(QColor("#06090E"))
+            self.window.render(pixmap)
+            if pixmap.isNull():
+                raise ReviewPlanError("Qt returned an empty screenshot.")
+
+            filename = f"{size.width}x{size.height}_{scene}.png"
+            destination = self.plan.output_dir / filename
+            if not pixmap.save(str(destination), "PNG"):
+                raise ReviewPlanError("Qt could not save a review screenshot.")
+
+            self.captures.append(
+                {
+                    "file": filename,
+                    "page": SCENE_LABELS[scene],
+                    "scene": scene,
+                    "requested_width": size.width,
+                    "requested_height": size.height,
+                    "captured_width": pixmap.width(),
+                    "captured_height": pixmap.height(),
+                    "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                }
+            )
+        except Exception as exc:
+            self._fail(exc)
+            return
+
+        self.job_index += 1
+        QTimer.singleShot(100, self._prepare_next)
+
+    def _manifest(self, status: str, error: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": REVIEW_SCHEMA_VERSION,
+            "application": "Music Vault",
+            "review_kind": "synthetic_ui",
+            "status": status,
+            "started_at": self.started_at,
+            "finished_at": _utc_now(),
+            "runtime": "isolated_temporary",
+            "dark_title_bar_applied": bool(
+                getattr(self.window, "_dark_title_bar_applied", False)
+            ),
+            "runtime_checks": self.runtime_checks,
+            "requested_capture_count": self.plan.capture_count,
+            "capture_count": len(self.captures),
+            "sizes": [
+                {"width": size.width, "height": size.height}
+                for size in self.plan.sizes
+            ],
+            "pages": [SCENE_LABELS[scene] for scene in self.plan.scenes],
+            "captures": self.captures,
+        }
+        if error:
+            payload["error"] = error
+        return payload
+
+    def _write_manifest(self, payload: dict[str, Any]) -> None:
+        self.plan.output_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.plan.output_dir / "manifest.json"
+        temporary = destination.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(destination)
+
+    def _finish(self) -> None:
+        try:
+            self.runtime_checks = validate_review_runtime(self.plan)
+            if len(self.captures) != self.plan.capture_count:
+                raise ReviewPlanError("The review capture matrix is incomplete.")
+            self._write_manifest(self._manifest("complete"))
+        except Exception as exc:
+            self._fail(exc)
+            return
+        self._close(0)
+
+    def _fail(self, exc: BaseException) -> None:
+        try:
+            self._write_manifest(
+                self._manifest("failed", _safe_error_text(exc, self.plan))
+            )
+        finally:
+            self._close(2)
+
+    def _close(self, exit_code: int) -> None:
+        try:
+            self.window.close()
+        finally:
+            self.app.exit(exit_code)
+
+
+def schedule_ui_review(window: object, app: object) -> bool:
+    """Schedule an isolated capture only when the explicit review env var is set."""
+    request = os.environ.get(REVIEW_ENV, "").strip()
+    if not request:
+        return False
+
+    plan = load_review_plan(request)
+    controller = UIReviewController(window, app, plan)
+    setattr(window, "_ui_review_controller", controller)
+    QTimer.singleShot(0, controller.start)
+    return True

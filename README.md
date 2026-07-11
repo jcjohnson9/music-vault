@@ -12,8 +12,8 @@ with metadata, artwork, playlists, and playback.
 
 **v1.0.0 Release Candidate — not yet V1 Stable**
 
-The core Windows application is established, but release-candidate correctness
-and presentation work remains. Current blockers are tracked in the
+The core Windows application and premium desktop UI are established, while
+remaining release-candidate gates are tracked in the
 [project roadmap](docs/ROADMAP.md). Music Vault is designed for personal,
 local-first use; its source code is available under the [MIT License](LICENSE).
 
@@ -38,6 +38,8 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Windows default audio-output following
 - Local settings for the API key, download folder, and audio quality
 - PyInstaller-based Windows EXE workflow with a custom icon
+- Centralized premium dark UI system with original scalable icons, responsive
+  desktop layouts, accessible focus states, and native-title-bar integration
 - Source verification, build, launch, and publication-safety tooling
 - Versioned, neutral App Status JSON for optional local consumers
 
@@ -139,6 +141,7 @@ virtual environment:
 .\tools\dev\check_status.ps1
 .\tools\dev\rebuild_and_run.ps1
 .\tools\dev\v1_sanity_check.ps1
+.\tools\dev\capture_ui_review.ps1
 ```
 
 Run the synthetic regression suite with:
@@ -146,6 +149,11 @@ Run the synthetic regression suite with:
 ```powershell
 .\.venv\Scripts\python.exe -B -m pytest -q
 ```
+
+The UI review helper creates an isolated synthetic runtime and sanitized
+screenshots outside the repository by default. It never uses the personal
+database, API key, media, artwork cache, or network services. Screenshot output
+is for local review only and is not committed automatically.
 
 Build the one-folder Windows application with:
 
@@ -173,7 +181,6 @@ See [Architecture](docs/ARCHITECTURE.md) for the current code and data flow, and
 ## Remaining release-candidate gates
 
 - Manual metadata correction is not yet complete.
-- The interface still requires its planned premium UI pass.
 - A clean, blank V1 distribution has not yet been published.
 
 Correction work and release ordering are tracked in
@@ -181,8 +188,10 @@ Correction work and release ordering are tracked in
 
 ## Screenshots
 
-Sanitized demo screenshots will be added after the premium UI and blank-demo
-work. Personal-library screenshots are intentionally not included.
+The developer review harness can generate sanitized synthetic screenshots for
+Library, Albums, Artists, Sync Center, Settings, and empty states at common
+desktop sizes. Personal-library and temporary review screenshots are
+intentionally not included in source control.
 
 ## License
 

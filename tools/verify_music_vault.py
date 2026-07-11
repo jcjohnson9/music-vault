@@ -16,7 +16,12 @@ REQUIRED_FILES = (
     "music_vault/core/app_status.py",
     "music_vault/core/watchtower_status.py",
     "music_vault/core/paths.py",
+    "music_vault/ui/theme.py",
+    "music_vault/ui/icons.py",
+    "music_vault/ui/components.py",
+    "music_vault/ui/review.py",
     "assets/icons/music_vault.ico",
+    "assets/icons/ui/README.md",
 )
 
 
@@ -44,10 +49,27 @@ def main() -> int:
     from music_vault.core import paths
     from music_vault.core.app_status import write_app_status
     from music_vault.core.watchtower_status import write_watchtower_status
+    from music_vault.ui.components import EmptyState, IconButton, SearchField
+    from music_vault.ui.icons import REQUIRED_ICONS, icon_path
+    from music_vault.ui.review import schedule_ui_review
+    from music_vault.ui.theme import application_stylesheet
     import music_vault.app as app
 
     if not callable(write_app_status) or write_watchtower_status is not write_app_status:
         print("App status exporter or compatibility alias is invalid.")
+        return 1
+
+    if not application_stylesheet().strip():
+        print("Music Vault UI stylesheet is empty.")
+        return 1
+
+    missing_icons = [name for name in REQUIRED_ICONS if not icon_path(name).is_file()]
+    if missing_icons:
+        print(f"Missing required UI icons: {', '.join(missing_icons)}")
+        return 1
+
+    if not all(callable(value) for value in (EmptyState, IconButton, SearchField, schedule_ui_review)):
+        print("Music Vault UI components or review hook are unavailable.")
         return 1
 
     expected_data_dir = PROJECT_ROOT / "data"
