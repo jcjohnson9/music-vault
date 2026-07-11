@@ -11,7 +11,7 @@ def test_real_library_mutations_are_wired_to_browser_invalidation():
     expected = {
         "import_music_folder": "BrowserInvalidationReason.IMPORT_FOLDER",
         "youtube_sync_finished": "BrowserInvalidationReason.YOUTUBE_IMPORT",
-        "enrich_selected": "BrowserInvalidationReason.METADATA_ENRICHMENT",
+        "metadata_change_applied": "BrowserInvalidationReason.FUTURE_METADATA",
         "remove_missing_tracks": "BrowserInvalidationReason.REMOVE_MISSING",
         "refresh_artwork": "BrowserInvalidationReason.ARTWORK_REFRESH",
     }

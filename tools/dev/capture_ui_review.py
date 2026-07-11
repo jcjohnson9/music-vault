@@ -24,7 +24,26 @@ DEFAULT_SCENES = (
     "settings",
     "empty_playlist",
 )
-RUNTIME_PREFIX = "MusicVault_Batch5_UI_Runtime_"
+METADATA_SCENES = (
+    "metadata_editor",
+    "metadata_provenance_locks",
+    "metadata_source_context",
+    "metadata_invalid_release_date",
+    "metadata_manual_artwork",
+    "metadata_no_artwork",
+    "metadata_musicbrainz_loading",
+    "metadata_candidates",
+    "metadata_candidate_high_confidence",
+    "metadata_candidate_low_confidence",
+    "metadata_candidate_no_artwork",
+    "metadata_candidate_with_artwork",
+    "metadata_provider_error",
+    "metadata_history",
+    "metadata_undo_confirmation",
+    "metadata_long_values",
+    "metadata_currently_playing",
+)
+RUNTIME_PREFIX = "MusicVault_Batch6_UI_Runtime_"
 OUTPUT_PREFIX = "MusicVault_UI_Review_Output_"
 
 
@@ -62,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--page",
         action="append",
-        choices=(*DEFAULT_SCENES, "artists", "no_results"),
-        help="Repeatable review scene. Defaults to the Batch 5 review matrix.",
+        choices=(*DEFAULT_SCENES, "artists", "no_results", *METADATA_SCENES),
+        help="Repeatable review scene. Defaults to the standard application matrix.",
     )
     parser.add_argument(
         "--offscreen",
@@ -261,21 +280,11 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                 canonical_year = (
                     str(1980 + album_index % 44) if album_index % 4 else None
                 )
-            db.upsert_track(
+            track_id = db.upsert_track(
                 sentinel,
                 title=f"{titles[index % len(titles)]} {index + 1:04d}",
                 artist=artists[index % len(artists)],
                 album=album,
-                duration_seconds=150 + index * 3,
-                source_kind="youtube" if index % 5 == 0 else "local",
-            )
-            row = db.conn.execute(
-                "SELECT id FROM tracks WHERE path=?", (str(sentinel.resolve()),)
-            ).fetchone()
-            track_id = int(row["id"])
-            track_ids.append(track_id)
-            db.update_track_metadata(
-                track_id,
                 album_artist=album_artist,
                 year=canonical_year,
                 cover_path=(
@@ -283,7 +292,12 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                     if index % 11 != 0
                     else None
                 ),
+                duration_seconds=150 + index * 3,
+                source_kind="youtube" if index == 0 else "local",
+                source_video_id="abcdefghijk" if index == 0 else None,
+                source_upload_date="2024-03-02" if index == 0 else None,
             )
+            track_ids.append(track_id)
 
         playlist_specs = (
             ("Synthetic Focus Mix", track_ids[:10]),
@@ -302,7 +316,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         schema = int(db.conn.execute("PRAGMA user_version").fetchone()[0])
         integrity = str(db.conn.execute("PRAGMA integrity_check").fetchone()[0])
         db.close()
-        if schema != 2 or integrity != "ok":
+        if schema != 3 or integrity != "ok":
             raise RuntimeError("Synthetic database validation failed.")
     finally:
         try:
@@ -395,6 +409,26 @@ def validate_output(
     if payload.get("capture_count") != expected_count:
         raise RuntimeError("Synthetic UI review capture matrix is incomplete.")
 
+    captured_scenes = {
+        str(capture.get("scene"))
+        for capture in payload.get("captures", [])
+        if isinstance(capture, dict)
+    }
+    if captured_scenes.intersection(METADATA_SCENES):
+        runtime_checks = payload.get("runtime_checks") or {}
+        metadata_behaviors = runtime_checks.get("metadata_behaviors") or {}
+        required_behaviors = {
+            "manual_save",
+            "candidate_apply",
+            "artwork_replace",
+            "undo",
+            "approved_snapshot",
+            "queue_context_preserved",
+            "playlist_membership_preserved",
+        }
+        if any(metadata_behaviors.get(name) is not True for name in required_behaviors):
+            raise RuntimeError("Synthetic packaged metadata behavior validation failed.")
+
     from PySide6.QtGui import QImage
 
     for capture in payload.get("captures", []):
@@ -446,7 +480,11 @@ def validate_output(
             requested_width - 10,
             requested_height - 8,
         )
-        if brand_signal < 0.04 or player_signal < 0.025:
+        # Player controls keep a mostly fixed pixel footprint while the bar grows
+        # wider at desktop review sizes. Scale the density threshold so a valid
+        # 1920-wide player is not rejected merely for having more empty bar space.
+        player_threshold = 0.025 * min(1.0, 1440 / requested_width)
+        if brand_signal < 0.04 or player_signal < player_threshold:
             raise RuntimeError(
                 f"Synthetic screenshot is missing shared application chrome: {filename}"
             )
@@ -484,6 +522,34 @@ def validate_output(
                     raise RuntimeError(
                         "Enabled artist-photo review did not render a resolved cached portrait."
                     )
+        if scene in METADATA_SCENES:
+            metrics = capture.get("metadata_metrics")
+            if not isinstance(metrics, dict):
+                raise RuntimeError("Synthetic metadata capture lacks aggregate metrics.")
+            if int(metrics.get("editable_field_count", 0)) != 6:
+                raise RuntimeError("Synthetic metadata editor does not expose six fields.")
+            if not metrics.get("source_upload_date_is_read_only"):
+                raise RuntimeError("Synthetic metadata source date is not read-only.")
+            if not metrics.get("database_only_message_present"):
+                raise RuntimeError("Synthetic metadata editor lacks the file-writeback boundary.")
+            if not metrics.get("synthetic_provider_active"):
+                raise RuntimeError("Synthetic metadata provider safety mode is inactive.")
+            if int(metrics.get("public_provider_call_count", -1)) != 0:
+                raise RuntimeError("Synthetic metadata review attempted a public provider call.")
+            if scene == "metadata_manual_artwork" and not metrics.get("manual_artwork_staged"):
+                raise RuntimeError("Synthetic manual artwork was not staged in memory.")
+            if scene == "metadata_manual_artwork" and not metrics.get(
+                "artwork_effective_present"
+            ):
+                raise RuntimeError("Synthetic manual-artwork scene lacks current artwork.")
+            if scene == "metadata_no_artwork" and metrics.get("artwork_effective_present"):
+                raise RuntimeError("Synthetic no-artwork scene still has effective artwork.")
+            if scene in {"metadata_manual_artwork", "metadata_no_artwork"} and not metrics.get(
+                "artwork_editor_visible"
+            ):
+                raise RuntimeError("Synthetic artwork editor is outside the captured viewport.")
+            if scene == "metadata_undo_confirmation" and not metrics.get("undo_confirmation_visible"):
+                raise RuntimeError("Synthetic undo confirmation was not visible.")
 
     database = runtime / "data" / "music_vault.sqlite3"
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
@@ -492,7 +558,7 @@ def validate_output(
         integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
     finally:
         connection.close()
-    if schema != 2 or integrity != "ok":
+    if schema != 3 or integrity != "ok":
         raise RuntimeError("Synthetic database failed final validation.")
     if (runtime / "data" / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
@@ -671,7 +737,7 @@ def main() -> int:
                     "sizes": manifest["sizes"],
                     "pages": manifest["pages"],
                     "dark_title_bar_applied": manifest.get("dark_title_bar_applied"),
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "config_volume_percent": 23,
                     "api_key_present": False,
                     "artist_provider": "synthetic_no_network",

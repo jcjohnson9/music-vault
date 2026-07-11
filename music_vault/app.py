@@ -4,6 +4,7 @@ import sys
 import random
 import json
 import math
+import os
 from functools import partial
 from pathlib import Path
 
@@ -94,8 +95,7 @@ from music_vault.core.paths import (
 from music_vault.core.safety import sanitize_error_text
 from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
 from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
-from music_vault.metadata.musicbrainz_enricher import search_recording
-from music_vault.metadata.cover_art import download_front_cover
+from music_vault.metadata.service import MetadataChangeResult, MetadataService
 from music_vault.metadata.artist_images import (
     ArtistIdentity,
     ArtistImageCache,
@@ -123,6 +123,7 @@ from music_vault.ui.media_grid import (
     MediaItem,
     MediaKind,
 )
+from music_vault.ui.metadata_editor import MetadataEditorDialog
 from music_vault.ui.review import schedule_ui_review
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
 from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
@@ -190,6 +191,7 @@ class MusicVaultWindow(QMainWindow):
             youtube_download_root=self.config.get("download_folder"),
             legacy_failure_file=youtube_failed_ids_path(),
         )
+        self.metadata_service = MetadataService(self.db)
         self.artist_image_cache = ArtistImageCache()
         self.artist_image_service = ArtistImageService(
             create_artist_image_provider(),
@@ -215,6 +217,8 @@ class MusicVaultWindow(QMainWindow):
         self._dark_title_bar_applied = False
         self._dark_title_bar_attempted = False
         self.browser_summary_cache = BrowserSummaryCache()
+        self._detail_browser_context = None
+        self._metadata_editor: MetadataEditorDialog | None = None
         self.browser_summary_loader = BrowserSummaryLoader(self)
         self.browser_summary_loader.loaded.connect(self._browser_summaries_loaded)
         self.browser_summary_loader.failed.connect(self._browser_summaries_failed)
@@ -359,6 +363,8 @@ class MusicVaultWindow(QMainWindow):
         return youtube_api_key_path()
 
     def read_saved_api_key(self) -> str:
+        if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+            return ""
         path = self.api_key_path()
 
         if not path.exists():
@@ -617,9 +623,10 @@ class MusicVaultWindow(QMainWindow):
             self.remove_selected_from_current_playlist,
             destructive=True,
         )
-        self.library_overflow.add_action(
-            "Enrich Selected", "metadata", self.enrich_selected
+        self.edit_metadata_action = self.library_overflow.add_action(
+            "Edit Metadata", "metadata", self.open_metadata_editor
         )
+        self.edit_metadata_action.setEnabled(False)
         self.library_overflow.add_action(
             "Remove Missing", "warning", self.remove_missing_tracks,
             destructive=True,
@@ -678,6 +685,7 @@ class MusicVaultWindow(QMainWindow):
         self.library_table.doubleClicked.connect(self.play_selected)
         self.library_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.library_table.customContextMenuRequested.connect(self.open_song_context_menu)
+        self.library_table.itemSelectionChanged.connect(self.update_metadata_action_state)
         self.library_table.verticalHeader().setVisible(False)
         self.library_table.setAlternatingRowColors(False)
         self.library_table.setShowGrid(False)
@@ -1606,6 +1614,7 @@ class MusicVaultWindow(QMainWindow):
         self.filter_library(self.search_box.text() if hasattr(self, "search_box") else "")
         self.restore_table_selection(selected_track_id)
         self.apply_now_playing_row_state()
+        self.update_metadata_action_state()
         self.write_app_status()
 
     def load_playlists(self) -> None:
@@ -2119,6 +2128,7 @@ class MusicVaultWindow(QMainWindow):
         rows = query_album_tracks(self.db.conn, summary.key)
         self.current_view_kind = "album_tracks"
         self.current_playlist_name = summary.album_title
+        self._detail_browser_context = ("album_tracks", summary.key, summary.album_title)
         self.load_library(rows, summary.album_title, "Album view")
 
     def open_artist(self, browser_key: str) -> None:
@@ -2129,6 +2139,7 @@ class MusicVaultWindow(QMainWindow):
         rows = query_artist_tracks(self.db.conn, summary.key)
         self.current_view_kind = "artist_tracks"
         self.current_playlist_name = summary.display_name
+        self._detail_browser_context = ("artist_tracks", summary.key, summary.display_name)
         self.load_library(rows, summary.display_name, "Artist view")
 
     def refresh_artwork(self) -> None:
@@ -2148,6 +2159,22 @@ class MusicVaultWindow(QMainWindow):
 
 
     def refresh_current_view(self) -> None:
+        if self.current_view_kind in {"album_tracks", "artist_tracks"}:
+            context = self._detail_browser_context
+            if context and context[0] == self.current_view_kind:
+                kind, key, label = context
+                rows = (
+                    query_album_tracks(self.db.conn, key)
+                    if kind == "album_tracks"
+                    else query_artist_tracks(self.db.conn, key)
+                )
+                self.load_library(
+                    rows,
+                    label,
+                    "Album view" if kind == "album_tracks" else "Artist view",
+                )
+                return
+
         if self.current_view_kind == "albums":
             self.show_album_browser()
             self.write_app_status()
@@ -2204,6 +2231,7 @@ class MusicVaultWindow(QMainWindow):
         self.current_view_kind = kind or "library"
         self.current_playlist_id = playlist_id
         self.current_playlist_name = name
+        self._detail_browser_context = None
 
         self.pages.setCurrentIndex(0)
 
@@ -2505,6 +2533,57 @@ class MusicVaultWindow(QMainWindow):
 
         return int(item.data(Qt.UserRole)) if item else None
 
+    def selected_track_ids(self) -> list[int]:
+        selection = self.library_table.selectionModel()
+        if selection is None:
+            return []
+        track_ids: list[int] = []
+        for index in selection.selectedRows(0):
+            item = self.library_table.item(index.row(), 0)
+            if item is not None:
+                track_ids.append(int(item.data(Qt.UserRole)))
+        return list(dict.fromkeys(track_ids))
+
+    def update_metadata_action_state(self) -> None:
+        action = getattr(self, "edit_metadata_action", None)
+        if action is not None:
+            table_active = (
+                getattr(self, "_active_browser_kind", None) is None
+                and (
+                    not hasattr(self, "library_content_stack")
+                    or self.library_content_stack.currentIndex() == 0
+                )
+            )
+            action.setEnabled(table_active and len(self.selected_track_ids()) == 1)
+
+    def open_metadata_editor(self, *, musicbrainz_tab: bool = False) -> None:
+        track_ids = self.selected_track_ids()
+        table_active = (
+            getattr(self, "_active_browser_kind", None) is None
+            and (
+                not hasattr(self, "library_content_stack")
+                or self.library_content_stack.currentIndex() == 0
+            )
+        )
+        if not table_active or len(track_ids) != 1:
+            QMessageBox.information(
+                self,
+                "Select one track",
+                "Select exactly one track to edit its metadata.",
+            )
+            return
+        if self._metadata_editor is not None and self._metadata_editor.isVisible():
+            self._metadata_editor.raise_()
+            self._metadata_editor.activateWindow()
+            return
+        dialog = MetadataEditorDialog(self.metadata_service, track_ids[0], self)
+        dialog.metadata_changed.connect(self.metadata_change_applied)
+        dialog.finished.connect(lambda _result: setattr(self, "_metadata_editor", None))
+        self._metadata_editor = dialog
+        if musicbrainz_tab:
+            dialog.tabs.setCurrentWidget(dialog.musicbrainz_tab)
+        dialog.open()
+
     def play_selected(self) -> None:
         track_id = self.selected_track_id()
 
@@ -2775,6 +2854,9 @@ class MusicVaultWindow(QMainWindow):
         play_next_action.setIcon(ui_icon("queue-next", 18))
         add_playlist_action = menu.addAction("Add to Playlist")
         add_playlist_action.setIcon(ui_icon("playlists", 18))
+        menu.addSeparator()
+        edit_metadata_action = menu.addAction("Edit Metadata")
+        edit_metadata_action.setIcon(ui_icon("metadata", 18))
 
         action = menu.exec(self.library_table.viewport().mapToGlobal(position))
 
@@ -2784,6 +2866,8 @@ class MusicVaultWindow(QMainWindow):
             self.queue_selected_next()
         elif action == add_playlist_action:
             self.add_selected_to_playlist()
+        elif action == edit_metadata_action:
+            self.open_metadata_editor()
 
     def visible_track_rows(self) -> list[int]:
         return [
@@ -2982,85 +3066,67 @@ class MusicVaultWindow(QMainWindow):
         return f"{minutes}:{seconds:02d}"
 
     def enrich_selected(self) -> None:
-        track_id = self.selected_track_id()
+        """Compatibility entry point: open explicit candidate review, never auto-apply."""
 
-        if track_id is None:
-            QMessageBox.information(self, "Select a track", "Select a track first.")
-            return
+        self.open_metadata_editor(musicbrainz_tab=True)
 
+    def refresh_visible_track_metadata(self, track_id: int) -> None:
         track = self.db.get_track(track_id)
-
-        if not track:
+        row = locate_track_row(track_id, self.track_row_map)
+        if track is None or row is None:
             return
+        values = (
+            track["title"] or Path(track["path"]).stem,
+            track["artist"] or "",
+            track["album"] or "",
+            track["year"] or "",
+        )
+        for column, value in enumerate(values):
+            item = self.library_table.item(row, column)
+            if item is not None:
+                item.setText(str(value))
+        title_item = self.library_table.item(row, 0)
+        if title_item is not None:
+            title_item.setToolTip(str(values[0]))
+            title_item.setIcon(QIcon())
+            cover_path = track["cover_path"]
+            if cover_path and Path(cover_path).is_file():
+                title_item.setIcon(QIcon(str(cover_path)))
+        self.apply_now_playing_row_state()
 
-        title = track["title"] or Path(track["path"]).stem
-        artist = track["artist"]
-
-        try:
-            candidates = search_recording(title, artist)
-        except Exception as exc:
-            QMessageBox.warning(self, "Metadata lookup failed", str(exc))
+    def metadata_change_applied(self, result: MetadataChangeResult) -> None:
+        if not isinstance(result, MetadataChangeResult) or not result.changed:
             return
+        changed = set(result.changed_fields)
+        old_artwork = result.before.value("artwork")
+        new_artwork = result.after.value("artwork")
+        if "artwork" in changed:
+            for path in (old_artwork, new_artwork):
+                if path:
+                    self.thumbnail_cache.invalidate_source(path)
 
-        if not candidates:
-            QMessageBox.information(self, "No match", "No MusicBrainz match found.")
-            return
+        identity_fields = {"artist", "album", "album_artist", "release_date"}
+        if changed & identity_fields:
+            self.invalidate_browser_data(BrowserInvalidationReason.FUTURE_METADATA)
+        elif "artwork" in changed:
+            self.invalidate_browser_data(BrowserInvalidationReason.ARTWORK_REFRESH)
 
-        best = max(candidates, key=lambda candidate: candidate.score)
-        confidence = (
-            "\n\nWarning: this is an uncertain match. Review it carefully."
-            if best.score < 80
-            else ""
-        )
-        details = (
-            f"Title: {best.title or 'Unknown'}\n"
-            f"Artist: {best.artist or 'Unknown'}\n"
-            f"Release: {best.album or 'Unknown'}\n"
-            f"Year: {best.year or 'Unknown'}\n"
-            "Provider: MusicBrainz\n"
-            f"Score: {best.score}"
-            f"{confidence}\n\nApply this candidate?"
-        )
-        if QMessageBox.question(
-            self,
-            "Confirm metadata candidate",
-            details,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        ) != QMessageBox.Yes:
-            return
+        self.refresh_visible_track_metadata(result.track_id)
+        if self.current_track_id == result.track_id:
+            track = self.db.get_track(result.track_id)
+            if track is not None:
+                self.now_title.setText(track["title"] or Path(track["path"]).stem)
+                self.now_artist.setText(track["artist"] or "Unknown Artist")
+                self.set_cover_art(track["cover_path"])
 
-        cover_path = None
-
-        if best.release_id:
-            try:
-                cover_path = download_front_cover(best.release_id)
-            except Exception:
-                cover_path = None
-
-        updates = {
-            "title": best.title,
-            "artist": best.artist,
-            "album": best.album,
-            "year": best.year,
-            "musicbrainz_recording_id": best.recording_id,
-            "musicbrainz_release_id": best.release_id,
-            "cover_path": cover_path,
-        }
-        self.db.update_track_metadata(
-            track_id,
-            **{key: value for key, value in updates.items() if value not in (None, "")},
-        )
-
-        self.invalidate_browser_data(BrowserInvalidationReason.METADATA_ENRICHMENT)
-
-        self.refresh_current_view()
-
-        QMessageBox.information(
-            self,
-            "Metadata updated",
-            f"Applied best match with confidence score {best.score}."
-        )
+        if self.current_view_kind in {"albums", "artists"}:
+            if self.current_view_kind == "albums":
+                self.show_album_browser()
+            else:
+                self.show_artist_browser()
+        elif self.current_view_kind in {"album_tracks", "artist_tracks"}:
+            self.refresh_current_view()
+        self.write_app_status()
 
     def filter_library(self, text: str) -> None:
         if (

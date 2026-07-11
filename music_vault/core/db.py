@@ -8,9 +8,14 @@ from typing import Optional
 
 from .paths import database_path
 from .safety import extract_source_video_id, normalize_source_upload_date, sanitize_error_text
+from music_vault.metadata.schema import (
+    create_metadata_schema,
+    normalize_release_date,
+    seed_existing_metadata,
+)
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -62,16 +67,20 @@ class MusicVaultDB:
     def _column_names(self, table: str) -> set[str]:
         return {str(row[1]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
+    @staticmethod
+    def _quoted_identifier(value: str) -> str:
+        return '"' + str(value).replace('"', '""') + '"'
+
     def _has_user_data(self) -> bool:
-        tables = self._table_names()
-        for table in ("tracks", "playlists", "playlist_tracks"):
-            if table in tables:
-                row = self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                if row is not None:
-                    return True
+        for table in self._table_names():
+            identifier = self._quoted_identifier(table)
+            row = self.conn.execute(f"SELECT 1 FROM {identifier} LIMIT 1").fetchone()
+            if row is not None:
+                return True
         return False
 
     def _create_pre_migration_backup(self, target_version: int) -> Path:
+        expected_counts = self._aggregate_counts(self.conn)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         candidate = self.backup_dir / (
@@ -90,8 +99,48 @@ class MusicVaultDB:
         finally:
             destination.close()
 
+        self._verify_backup(candidate, expected_counts=expected_counts)
+
         self.last_migration_backup = candidate
         return candidate
+
+    @staticmethod
+    def _aggregate_counts(connection: sqlite3.Connection) -> dict[str, int]:
+        tables = sorted(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        )
+        return {
+            table: int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {MusicVaultDB._quoted_identifier(table)}"
+                ).fetchone()[0]
+            )
+            for table in tables
+        }
+
+    @classmethod
+    def _verify_backup(
+        cls,
+        path: str | Path,
+        *,
+        expected_counts: dict[str, int] | None = None,
+    ) -> None:
+        backup_path = Path(path)
+        if not backup_path.is_file() or backup_path.stat().st_size <= 0:
+            raise RuntimeError("The pre-migration database backup was not created correctly.")
+        connection = sqlite3.connect(f"file:{backup_path.as_posix()}?mode=ro", uri=True)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or str(integrity[0]).casefold() != "ok":
+                raise RuntimeError("The pre-migration database backup failed integrity verification.")
+            if expected_counts is not None and cls._aggregate_counts(connection) != expected_counts:
+                raise RuntimeError("The pre-migration database backup failed count verification.")
+        finally:
+            connection.close()
 
     def _create_base_tables(self) -> None:
         self.conn.execute("""
@@ -111,6 +160,8 @@ class MusicVaultDB:
                 source_kind TEXT,
                 source_video_id TEXT,
                 source_upload_date TEXT,
+                release_date TEXT,
+                metadata_updated_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
@@ -197,12 +248,17 @@ class MusicVaultDB:
 
         for row in rows:
             video_id = row["source_video_id"] or extract_source_video_id(row["path"])
-            is_youtube = bool(video_id) or self._path_is_in_youtube_root(row["path"])
+            source_kind = str(row["source_kind"] or "").strip().casefold()
+            is_youtube = (
+                source_kind == "youtube"
+                or bool(video_id)
+                or self._path_is_in_youtube_root(row["path"])
+            )
             if not is_youtube:
                 continue
 
             updates: dict[str, object] = {}
-            if not row["source_kind"]:
+            if row["source_kind"] != "youtube":
                 updates["source_kind"] = "youtube"
             if video_id and not row["source_video_id"]:
                 updates["source_video_id"] = video_id
@@ -240,6 +296,7 @@ class MusicVaultDB:
             with self.conn:
                 self._create_base_tables()
                 self._create_support_tables_and_indexes()
+                create_metadata_schema(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
             return
 
@@ -252,6 +309,8 @@ class MusicVaultDB:
                 self._add_track_source_columns()
                 self._create_support_tables_and_indexes()
                 self._backfill_youtube_source_fields()
+                create_metadata_schema(self.conn)
+                seed_existing_metadata(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
 
     def upsert_track(
@@ -260,62 +319,155 @@ class MusicVaultDB:
         title: str | None = None,
         artist: str | None = None,
         album: str | None = None,
+        album_artist: str | None = None,
+        release_date: str | None = None,
+        year: str | None = None,
+        cover_path: str | None = None,
         duration_seconds: float | None = None,
         source_kind: str | None = None,
         source_video_id: str | None = None,
         source_upload_date: str | None = None,
-    ) -> None:
+        commit: bool = True,
+    ) -> int:
         resolved_path = str(Path(path).resolve())
-        self.conn.execute("""
-            INSERT INTO tracks (
-                path, title, artist, album, duration_seconds,
-                source_kind, source_video_id, source_upload_date
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                title=COALESCE(excluded.title, tracks.title),
-                artist=COALESCE(excluded.artist, tracks.artist),
-                album=COALESCE(excluded.album, tracks.album),
-                duration_seconds=COALESCE(excluded.duration_seconds, tracks.duration_seconds),
-                source_kind=COALESCE(excluded.source_kind, tracks.source_kind),
-                source_video_id=COALESCE(excluded.source_video_id, tracks.source_video_id),
-                source_upload_date=COALESCE(excluded.source_upload_date, tracks.source_upload_date),
-                updated_at=CURRENT_TIMESTAMP
-        """, (
-            resolved_path,
-            title,
-            artist,
-            album,
-            duration_seconds,
-            source_kind,
-            source_video_id,
-            source_upload_date,
-        ))
-        self.conn.commit()
+        normalized_source_kind = str(source_kind or "").strip().casefold() or None
+        raw_release_date = release_date if release_date not in (None, "") else year
+        canonical_release_date = (
+            normalize_release_date(raw_release_date)
+            if raw_release_date not in (None, "")
+            else None
+        )
+        metadata_values = {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "album_artist": album_artist,
+            "release_date": canonical_release_date,
+            "artwork": cover_path,
+        }
+        source_values = {
+            "source_video_id": source_video_id,
+            "source_upload_date": source_upload_date,
+        }
+        values = {**metadata_values, **source_values}
+        present = {key: value for key, value in values.items() if value not in (None, "")}
+
+        def perform_upsert() -> int:
+            track_was_present = self.conn.execute(
+                "SELECT 1 FROM tracks WHERE path=?",
+                (resolved_path,),
+            ).fetchone() is not None
+            self.conn.execute("""
+                INSERT INTO tracks (
+                    path, duration_seconds, source_kind, source_video_id, source_upload_date
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    duration_seconds=COALESCE(excluded.duration_seconds, tracks.duration_seconds),
+                    source_kind=COALESCE(excluded.source_kind, tracks.source_kind),
+                    source_video_id=COALESCE(excluded.source_video_id, tracks.source_video_id),
+                    source_upload_date=COALESCE(excluded.source_upload_date, tracks.source_upload_date),
+                    updated_at=CURRENT_TIMESTAMP
+            """, (
+                resolved_path,
+                duration_seconds,
+                normalized_source_kind,
+                source_video_id,
+                source_upload_date,
+            ))
+            row = self.conn.execute(
+                "SELECT id, source_kind, source_video_id FROM tracks WHERE path=?",
+                (resolved_path,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("The track could not be created or refreshed.")
+            track_id = int(row["id"])
+            from music_vault.metadata.service import MetadataService
+
+            service = MetadataService(self)
+            service.ensure_field_states(track_id, commit=False)
+            if present:
+                effective_source = str(
+                    normalized_source_kind or row["source_kind"] or "embedded"
+                ).strip().casefold()
+                service.record_source_observations(
+                    track_id,
+                    provider="youtube" if effective_source == "youtube" else "embedded",
+                    values=present,
+                    provider_reference=source_video_id or row["source_video_id"],
+                    apply_effective=True,
+                    reason=(
+                        "track_upsert" if track_was_present else "initial_track_upsert"
+                    ),
+                    commit=False,
+                )
+            return track_id
+
+        if commit:
+            with self.conn:
+                return perform_upsert()
+        return perform_upsert()
 
     def update_track_metadata(self, track_id: int, **fields) -> None:
-        allowed = {
-            "title", "artist", "album", "album_artist", "year", "duration_seconds",
-            "cover_path", "source_url", "musicbrainz_recording_id",
-            "musicbrainz_release_id", "source_kind", "source_video_id",
+        if "metadata_updated_at" in fields:
+            raise ValueError("metadata_updated_at is owned by MetadataService.")
+
+        effective: dict[str, object] = {
+            name: fields[name]
+            for name in ("title", "artist", "album", "album_artist", "release_date")
+            if name in fields
+        }
+        if "release_date" not in effective and "year" in fields:
+            effective["release_date"] = fields["year"]
+        if "cover_path" in fields:
+            effective["artwork"] = fields["cover_path"]
+
+        direct_allowed = {
+            "duration_seconds",
+            "source_url",
+            "musicbrainz_recording_id",
+            "musicbrainz_release_id",
+            "source_kind",
+            "source_video_id",
             "source_upload_date",
         }
-        updates = {key: value for key, value in fields.items() if key in allowed}
-        if not updates:
+        updates = {key: fields[key] for key in direct_allowed if key in fields}
+        if "source_kind" in updates:
+            updates["source_kind"] = (
+                str(updates["source_kind"] or "").strip().casefold() or None
+            )
+        if not updates and not effective:
             return
 
-        set_clause = ", ".join(f"{key}=?" for key in updates)
-        self.conn.execute(
-            f"UPDATE tracks SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            [*updates.values(), track_id],
-        )
-        self.conn.commit()
+        with self.conn:
+            if updates:
+                set_clause = ", ".join(f"{key}=?" for key in updates)
+                cursor = self.conn.execute(
+                    f"UPDATE tracks SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [*updates.values(), int(track_id)],
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"Track {track_id} does not exist.")
+            if effective:
+                from music_vault.metadata.service import MetadataService
+
+                MetadataService(self).record_source_observations(
+                    int(track_id),
+                    provider="embedded",
+                    values=effective,
+                    apply_effective=True,
+                    actor="system",
+                    reason="legacy_metadata_update",
+                    commit=False,
+                )
 
     @staticmethod
     def _track_select() -> str:
         return (
-            "id, title, artist, album, year, path, cover_path, duration_seconds, "
-            "created_at, source_kind, source_video_id, source_upload_date"
+            "id, title, artist, album, album_artist, release_date, year, path, "
+            "cover_path, duration_seconds, created_at, source_kind, source_video_id, "
+            "source_upload_date, musicbrainz_recording_id, musicbrainz_release_id, "
+            "metadata_updated_at"
         )
 
     def list_tracks(self) -> list[sqlite3.Row]:

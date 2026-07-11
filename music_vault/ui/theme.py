@@ -864,6 +864,89 @@ QSlider::groove:horizontal:focus {{
 QSlider::handle:horizontal:focus {{
     border: 2px solid {c['focus_ring']};
 }}
+
+QDialog#MetadataEditorDialog {{
+    background: {c['app_background']};
+}}
+
+QMessageBox {{
+    background: {c['card_surface']};
+}}
+
+QMessageBox QLabel {{
+    background: transparent;
+    color: {c['text_primary']};
+}}
+
+QDialog#MetadataEditorDialog QTabWidget::pane {{
+    border: 1px solid {c['border']};
+    border-radius: 10px;
+    background: {c['card_surface']};
+    top: -1px;
+}}
+
+QDialog#MetadataEditorDialog QTabBar::tab {{
+    background: transparent;
+    color: {c['text_secondary']};
+    padding: 9px 14px;
+    border-bottom: 2px solid transparent;
+}}
+
+QDialog#MetadataEditorDialog QTabBar::tab:selected {{
+    color: {c['text_primary']};
+    border-bottom-color: {c['accent']};
+}}
+
+QFrame#MetadataFieldCard {{
+    background: {c['elevated_surface']};
+    border: 1px solid {c['border']};
+    border-radius: 9px;
+}}
+
+QLabel#MetadataFieldLabel {{
+    color: {c['text_primary']};
+    font-size: 13px;
+    font-weight: 700;
+}}
+
+QLabel#MetadataBadge,
+QLabel#MetadataLockBadgeLocked {{
+    border-radius: 8px;
+    padding: 3px 7px;
+    font-size: 10px;
+    font-weight: 700;
+}}
+
+QLabel#MetadataBadge {{
+    color: {c['text_secondary']};
+    background: {c['hover_surface']};
+    border: 1px solid {c['border']};
+}}
+
+QLabel#MetadataLockBadgeLocked {{
+    color: {c['accent_hover']};
+    background: {c['selection']};
+    border: 1px solid {c['accent']};
+}}
+
+QLabel#MetadataInfoBanner {{
+    color: {c['text_secondary']};
+    background: {c['hover_surface']};
+    border: 1px solid {c['border']};
+    border-radius: 8px;
+    padding: 10px;
+}}
+
+QLabel#MetadataArtworkPreview {{
+    background: {c['subtle_surface']};
+    border: 1px solid {c['strong_border']};
+    border-radius: 10px;
+}}
+
+QLabel#ErrorLabel {{
+    color: {c['danger']};
+    font-weight: 600;
+}}
 """.strip()
 
 

@@ -7,6 +7,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Added additive SQLite schema version 3 with canonical `release_date`,
+  materialized metadata timestamps, normalized effective field state, retained
+  source observations, grouped metadata history, and verified pre-migration
+  backup behavior.
+- Added a centralized metadata authority and precedence policy so manual and
+  confirmed locks survive imports, weaker or empty observations cannot erase
+  trusted values, and YouTube upload dates never become canonical release
+  dates or years.
+- Added the Trusted Metadata editor for title, artist, album, album artist,
+  release date, and artwork, including provenance/lock visibility, source
+  inspection, explicit clear/unlock/reset operations, grouped history, and
+  library-level undo.
+- Replaced implicit MusicBrainz enrichment with explicit background candidate
+  review, selected-field application, low-confidence warning, confirmed locks,
+  and optional validated Cover Art Archive artwork after user approval.
+- Added content-addressed, validated manual/candidate cover storage under
+  ignored runtime data and immediate metadata refresh without restarting
+  playback or changing playlist, queue, or base-context state.
+- Added typed metadata snapshots and review interfaces for Batch 7 while
+  explicitly deferring bulk remediation and audio-file tag writeback.
 - Added additive SQLite schema version 2 with an automatic database backup
   before migration.
 - Separated YouTube source upload dates from canonical release years and safely

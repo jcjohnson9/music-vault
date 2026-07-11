@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,6 +60,8 @@ def _missing_track_count(db) -> int:
 
 
 def _api_ready() -> bool:
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+        return False
     try:
         return bool(youtube_api_key_path().read_text(encoding="utf-8", errors="ignore").strip())
     except Exception:

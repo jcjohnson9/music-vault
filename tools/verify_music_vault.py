@@ -17,9 +17,15 @@ REQUIRED_FILES = (
     "music_vault/core/watchtower_status.py",
     "music_vault/core/paths.py",
     "music_vault/core/library_browser.py",
+    "music_vault/metadata/schema.py",
+    "music_vault/metadata/service.py",
+    "music_vault/metadata/artwork.py",
+    "music_vault/metadata/musicbrainz_enricher.py",
     "music_vault/metadata/artist_images.py",
     "music_vault/ui/browser_loader.py",
     "music_vault/ui/media_grid.py",
+    "music_vault/ui/metadata_editor.py",
+    "music_vault/ui/metadata_tasks.py",
     "music_vault/ui/thumbnail_cache.py",
     "music_vault/ui/theme.py",
     "music_vault/ui/icons.py",
@@ -61,6 +67,11 @@ def main() -> int:
     from music_vault.ui.media_grid import MediaGridModel, MediaGridView
     from music_vault.ui.thumbnail_cache import ThumbnailCache
     from music_vault.metadata.artist_images import ArtistImageCache, ArtistImageService
+    from music_vault.metadata.artwork import CoverArtArchiveProvider, prepare_local_artwork
+    from music_vault.metadata.musicbrainz_enricher import MusicBrainzProvider
+    from music_vault.metadata.service import MetadataService
+    from music_vault.ui.metadata_editor import MetadataEditorDialog
+    from music_vault.ui.metadata_tasks import MetadataTaskRunner
     from music_vault.ui.review import schedule_ui_review
     from music_vault.ui.theme import application_stylesheet
     import music_vault.app as app
@@ -92,6 +103,12 @@ def main() -> int:
             ThumbnailCache,
             ArtistImageCache,
             ArtistImageService,
+            MetadataService,
+            MusicBrainzProvider,
+            CoverArtArchiveProvider,
+            prepare_local_artwork,
+            MetadataEditorDialog,
+            MetadataTaskRunner,
         )
     ):
         print("Music Vault media-browser components are unavailable.")

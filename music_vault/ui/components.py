@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from collections.abc import Callable
 
 from PySide6.QtCore import Qt, QSize
@@ -81,6 +82,7 @@ class ElidedLabel(QLabel):
         self._full_text = ""
         self._elide_mode = Qt.TextElideMode.ElideRight
         super().__init__("", parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self.setObjectName("ElidedLabel")
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -106,7 +108,11 @@ class ElidedLabel(QLabel):
         width = max(0, self.contentsRect().width())
         shown = self.fontMetrics().elidedText(self._full_text, self._elide_mode, width)
         QLabel.setText(self, shown)
-        self.setToolTip(self._full_text if shown != self._full_text else "")
+        self.setToolTip(
+            f"<qt>{html.escape(self._full_text)}</qt>"
+            if shown != self._full_text
+            else ""
+        )
 
 
 class SearchField(QLineEdit):

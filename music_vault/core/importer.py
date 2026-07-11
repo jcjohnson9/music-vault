@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from mutagen.flac import Picture
 
 from .paths import covers_dir
 from .safety import normalize_source_upload_date
+from music_vault.metadata.service import MetadataService
 
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac"}
@@ -61,16 +63,21 @@ def read_audio_metadata(path: str | Path) -> dict:
             "title": path.stem,
             "artist": None,
             "album": None,
+            "album_artist": None,
+            "release_date": None,
             "year": None,
             "duration_seconds": None,
+            "title_provenance": "filename",
         }
 
     tags = audio.tags or {}
 
-    title = _first_tag(tags, "title") or path.stem
-    artist = _first_tag(tags, "artist", "albumartist", "album_artist")
+    embedded_title = _first_tag(tags, "title")
+    title = embedded_title or path.stem
+    artist = _first_tag(tags, "artist")
     album = _first_tag(tags, "album")
-    year = _first_tag(tags, "date", "year")
+    album_artist = _first_tag(tags, "albumartist", "album_artist")
+    release_date = _first_tag(tags, "date", "year")
 
     duration = None
 
@@ -81,8 +88,11 @@ def read_audio_metadata(path: str | Path) -> dict:
         "title": title,
         "artist": artist,
         "album": album,
-        "year": year,
+        "album_artist": album_artist,
+        "release_date": release_date,
+        "year": release_date,
         "duration_seconds": duration,
+        "title_provenance": "embedded" if embedded_title else "filename",
     }
 
 
@@ -186,43 +196,91 @@ def import_file(
     metadata = read_audio_metadata(path)
     cover_path = extract_embedded_cover(path)
     source_upload_date = None
-    canonical_year = metadata["year"]
+    raw_release_date = metadata.get("release_date", metadata.get("year"))
 
-    if source is not None and source.source_kind == "youtube":
+    existing = db.conn.execute(
+        "SELECT source_kind, source_video_id, source_upload_date FROM tracks WHERE path=?",
+        (resolved_path,),
+    ).fetchone()
+    raw_source_kind = (
+        source.source_kind
+        if source is not None
+        else (existing["source_kind"] if existing is not None else None)
+    )
+    effective_source_kind = str(raw_source_kind or "").strip().casefold() or None
+    is_youtube = effective_source_kind == "youtube"
+    source_video_id = (
+        source.source_video_id
+        if source is not None
+        else (existing["source_video_id"] if existing is not None else None)
+    )
+
+    if is_youtube:
         # yt-dlp commonly writes the source upload date to the generic date tag.
         # That date is useful provenance, but it is not a canonical release year.
         source_upload_date = normalize_source_upload_date(
-            source.source_upload_date or metadata["year"]
+            (source.source_upload_date if source is not None else None)
+            or (existing["source_upload_date"] if existing is not None else None)
+            or raw_release_date
         )
-        canonical_year = None
 
-    db.upsert_track(
-        resolved_path,
-        title=metadata["title"],
-        artist=metadata["artist"],
-        album=metadata["album"],
-        duration_seconds=metadata["duration_seconds"],
-        source_kind=source.source_kind if source else None,
-        source_video_id=source.source_video_id if source else None,
-        source_upload_date=source_upload_date,
+    provider = "youtube" if is_youtube else "embedded"
+    import_reason = (
+        ("youtube_import" if is_youtube else "embedded_import")
+        if existing is not None
+        else ("initial_youtube_import" if is_youtube else "initial_embedded_import")
     )
-
-    row = db.conn.execute(
-        "SELECT id FROM tracks WHERE path=?",
-        (resolved_path,)
-    ).fetchone()
-
-    if row:
-        updates = {}
-
-        if canonical_year:
-            updates["year"] = canonical_year
-
-        if cover_path:
-            updates["cover_path"] = cover_path
-
-        if updates:
-            db.update_track_metadata(row["id"], **updates)
+    filename_title = (
+        metadata.get("title")
+        if not is_youtube and metadata.get("title_provenance") == "filename"
+        else None
+    )
+    values = {
+        "title": None if filename_title is not None else metadata.get("title"),
+        "artist": metadata.get("artist"),
+        "album": metadata.get("album"),
+        "album_artist": metadata.get("album_artist"),
+        "release_date": None if is_youtube else raw_release_date,
+        "artwork": cover_path,
+    }
+    if is_youtube:
+        values.update(
+            {
+                "source_video_id": source_video_id,
+                "source_upload_date": source_upload_date,
+            }
+        )
+    change_group_id = str(uuid.uuid4())
+    with db.conn:
+        track_id = db.upsert_track(
+            resolved_path,
+            duration_seconds=metadata["duration_seconds"],
+            source_kind=effective_source_kind,
+            source_video_id=source_video_id,
+            source_upload_date=source_upload_date,
+            commit=False,
+        )
+        service = MetadataService(db)
+        service.record_source_observations(
+            track_id,
+            provider=provider,
+            values=values,
+            provider_reference=source_video_id,
+            apply_effective=True,
+            reason=import_reason,
+            change_group_id=change_group_id,
+            commit=False,
+        )
+        if filename_title is not None:
+            service.record_source_observations(
+                track_id,
+                provider="filename",
+                values={"title": filename_title},
+                apply_effective=True,
+                reason=import_reason,
+                change_group_id=change_group_id,
+                commit=False,
+            )
 
     return True
 
@@ -261,7 +319,14 @@ def refresh_covers_for_library(db) -> int:
         cover_path = extract_embedded_cover(path)
 
         if cover_path and cover_path != row["cover_path"]:
-            db.update_track_metadata(row["id"], cover_path=cover_path)
-            updated += 1
+            result = MetadataService(db).record_source_observations(
+                int(row["id"]),
+                provider="embedded",
+                values={"artwork": cover_path},
+                apply_effective=True,
+                reason="embedded_artwork_refresh",
+            )
+            if "artwork" in result.changed_fields:
+                updated += 1
 
     return updated

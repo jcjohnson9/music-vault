@@ -170,7 +170,16 @@ def test_public_url_rejects_unsafe_syntax(url):
 
 @pytest.mark.parametrize(
     "address",
-    ["127.0.0.1", "10.0.0.1", "169.254.1.1", "::1", "fc00::1", "fe80::1"],
+    [
+        "127.0.0.1",
+        "10.0.0.1",
+        "169.254.1.1",
+        "224.0.0.1",
+        "::1",
+        "fc00::1",
+        "fe80::1",
+        "ff02::1",
+    ],
 )
 def test_public_url_rejects_every_non_public_dns_answer(address):
     def resolver(*_args):

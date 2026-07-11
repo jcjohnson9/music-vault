@@ -12,6 +12,8 @@ Depending on which features are used, local runtime data can include:
 - synchronization archive history and structured failed-item records;
 - downloaded audio and other media;
 - extracted or downloaded cover and artist artwork;
+- field-level metadata provenance, source observations, confidence, locks, and
+  change history;
 - metadata-remediation reports; and
 - local backups.
 
@@ -36,6 +38,41 @@ issues, pull requests, release archives, or public logs.
 A source checkout does not include a user's music library, credentials, media,
 artwork, synchronization state, or private reports. The public repository is
 source-only.
+
+## Manual metadata and candidate review
+
+Manual metadata editing is local and requires no network. Schema version 3
+stores source observations separately from effective values and records
+field-level provenance, optional confidence, manual/lock state, and grouped
+change history in the private SQLite library. This history can contain old and
+new titles, artists, albums, dates, artwork references, and provider references;
+it must be protected like the rest of the personal database.
+
+The user can explicitly search MusicBrainz from the Trusted Metadata editor.
+That action sends the current or user-entered title and artist to the public
+MusicBrainz service. No search runs automatically across the library, no query
+is added to App Status, and no YouTube API key or browser cookie is sent.
+MusicBrainz candidates remain temporary until the user selects a candidate,
+chooses fields, and confirms application.
+
+Cover Art Archive image retrieval happens only when selected candidate artwork
+is explicitly applied. MusicBrainz and cover requests run with bounded time and
+response sizes, HTTPS and provider-host restrictions, public-address checks,
+sanitized errors, and disabled environment proxy inheritance. They require no
+provider credential. Candidate searches are not persisted as a separate search
+log.
+
+Validated local artwork is copied rather than permanently linked to its
+original path. Content-addressed files are private runtime data under
+`data/covers/manual/`; confirmed candidate covers use the provider-specific
+runtime cover directory. Old artwork is not deleted automatically by clear,
+reset, or undo. Track covers are independent from artist photos under
+`data/artist_images/`.
+
+Batch 6 corrections change only Music Vault's database and managed artwork
+references. Music Vault does not rewrite embedded tags or audio content in this
+batch. Audited, resumable, rollback-capable file-tag remediation is a Batch 7
+boundary.
 
 ## Optional artist photos
 

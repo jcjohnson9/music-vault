@@ -74,7 +74,7 @@ def test_synthetic_seed_has_large_safe_browser_dataset(tmp_path):
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
     try:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     finally:
         connection.close()
 

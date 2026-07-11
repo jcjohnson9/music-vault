@@ -23,6 +23,9 @@
 - Never run a real YouTube sync unless a future batch explicitly authorizes it.
 - Preserve the existing working queue behavior unless a batch explicitly
   changes it.
+- Treat manual and user-confirmed metadata locks as authoritative; preserve
+  provenance/history, and never rewrite audio-file tags without explicit batch
+  authorization.
 - Browser-performance changes must run
   `tools/dev/profile_media_browsers.ps1`; it uses synthetic temporary data only,
   and generated benchmark JSON or screenshots must not be committed.

@@ -28,6 +28,13 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Authorized media acquisition with yt-dlp and FFmpeg
 - Persistent local library backed by SQLite
 - Embedded artwork extraction and artwork display
+- Schema-v3 metadata authority with source observations, field-level
+  provenance/confidence and protected manual or confirmed values
+- Trusted Metadata editor for title, artist, album, album artist, canonical
+  release date, artwork, source inspection, grouped history, and library-level
+  undo
+- Explicit MusicBrainz candidate review with selected-field application and
+  optional validated Cover Art Archive artwork
 - Fast SQL-backed Album and Artist model/view browsers with cached summaries,
   visible-range high-DPI thumbnails, and exact same-title album separation
 - Album cards retain album artwork; Artist cards use a dedicated unknown-artist
@@ -48,8 +55,8 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Versioned, neutral App Status JSON for optional local consumers
 
 Music Vault does not currently provide private-playlist OAuth, multiple source
-playlists, Android support, Prime control, radio stations, AcoustID matching, or
-a complete metadata editor.
+playlists, Android support, Prime control, radio stations, AcoustID matching,
+bulk metadata remediation, or audio-file tag writeback.
 
 ## Product boundaries
 
@@ -112,17 +119,20 @@ sync rather than permanently suppressed.
 
 YouTube upload dates are stored as source provenance. They are not presented as
 canonical musical release years. Local imports may continue to use legitimate
-embedded release-year metadata, and explicit MusicBrainz enrichment can supply
-canonical metadata after user confirmation.
+embedded release metadata. **Edit Metadata** exposes source observations,
+protected manual correction, and an explicit MusicBrainz candidate review.
+Approved changes are stored in the Music Vault library; Batch 6 does not rewrite
+the underlying audio-file tags. See the [Metadata Model](docs/METADATA_MODEL.md).
 
 See [Authorized Use](docs/AUTHORIZED_USE.md) before using synchronization.
 
 ## Local configuration and privacy
 
-The YouTube Data API key, database, configuration, status, artwork, archives,
-downloaded media, and pre-migration database backups are stored locally under
-the runtime data area. Database backups are written to `data/backups/` before a
-non-empty older schema is upgraded. These files
+The YouTube Data API key, database, configuration, status, artwork, metadata
+history, archives, downloaded media, and pre-migration database backups are
+stored locally under the runtime data area. Database backups are written to
+`data/backups/` before a non-empty older schema is upgraded. Validated manual
+and candidate artwork is copied into managed runtime cover storage. These files
 are intentionally excluded from Git and are not part of a source checkout.
 
 Download-folder and audio-quality choices are local settings. Never paste API
@@ -136,6 +146,12 @@ Wikidata/Wikipedia, and Wikimedia services; no API key is required. Photos and
 provenance are cached only under `data/artist_images/`, remain ignored by Git,
 and can be cleared from Music Vault. Disabling fetching prevents new requests
 while allowing an existing valid cache to remain visible.
+
+Manual metadata editing is offline. A MusicBrainz recording search happens only
+after the user clicks **Search MusicBrainz** and sends the entered title and
+artist to that public service. Candidate cover retrieval happens only after the
+user selects and confirms candidate artwork. Neither request uses the YouTube
+API key or browser cookies.
 
 ## Developer workflow
 
@@ -167,7 +183,7 @@ screenshots outside the repository by default. It never uses the personal
 database, API key, media, artwork cache, or network services. Screenshot output
 is for local review only and is not committed automatically.
 
-The media-browser profiler likewise creates temporary schema-v2 synthetic
+The media-browser profiler likewise creates temporary current-schema synthetic
 libraries at 300, 1,000, and 5,000 tracks. It reports SQL-summary, model,
 first-render, cached-revisit, widget, and thumbnail metrics without reading the
 personal library or using network services. Timing variance is informational;
@@ -198,7 +214,7 @@ See [Architecture](docs/ARCHITECTURE.md) for the current code and data flow, and
 
 ## Remaining release-candidate gates
 
-- Manual metadata correction is not yet complete.
+- Batch 6 metadata foundation and manual correction is complete.
 - A clean, blank V1 distribution has not yet been published.
 
 Correction work and release ordering are tracked in
