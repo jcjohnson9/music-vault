@@ -9,11 +9,24 @@ Depending on which features are used, local runtime data can include:
 - a YouTube Data API key;
 - the SQLite library database and its sidecar files;
 - local configuration and status files;
-- synchronization archives and failed-item records;
+- synchronization archive history and structured failed-item records;
 - downloaded audio and other media;
 - extracted or downloaded cover and artist artwork;
 - metadata-remediation reports; and
 - local backups.
+
+Before an existing non-empty database is upgraded to a newer schema, Music
+Vault uses SQLite's backup API to create a timestamped copy under
+`data/backups/`. Backups are private runtime data and remain ignored by Git.
+
+The generic `data/music_vault_status.json` App Status file contains operational
+counts, paths, playback state, and the latest sanitized synchronization result.
+It does not contain the YouTube API key. Music Vault has no Watchtower
+relationship or integration.
+
+Synchronization supports public and unlisted playlists and performs anonymous
+media extraction. It does not silently read Firefox, Chrome, Edge, or other
+browser cookie profiles.
 
 These categories can contain credentials, private library information,
 personal playlist information, local paths, and copyrighted media. They are

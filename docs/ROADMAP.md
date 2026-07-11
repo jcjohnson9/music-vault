@@ -22,9 +22,7 @@ commit.
 **Non-goals:** No app behavior, schema, runtime-path, packaging, metadata,
 playback, sync, or UI changes; no EXE upload; no release tag.
 
-**Status:** Complete only if the local baseline commit succeeds. Remote
-publication status must be reported separately and is not implied by local
-completion.
+**Status:** Complete locally and published remotely as the public baseline.
 
 ## Batch 2 — V1 Trust, Sync Correctness, and Safety
 
@@ -39,7 +37,9 @@ names, and retain proof of a clean incremental-sync acceptance test.
 **Non-goals:** No private-playlist OAuth, multiple-source system, broad metadata
 editor, mobile application, Prime interface, radio system, or app-wide rewrite.
 
-**Status:** Planned; next after Batch 1.
+**Status:** In progress on the feature branch. Implementation and synthetic
+regression checks are complete; final build, staged safety scan, commit, and
+remote-branch review gates must pass before this batch is marked complete.
 
 ## Batch 3 — Playback State and Now-Playing Accuracy
 

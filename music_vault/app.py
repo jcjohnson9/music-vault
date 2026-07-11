@@ -3,7 +3,6 @@
 import sys
 import random
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QSize, QTimer
@@ -40,19 +39,27 @@ from PySide6.QtWidgets import (
 )
 
 from music_vault.core.db import MusicVaultDB
-from music_vault.core.importer import import_folder, refresh_covers_for_library
+from music_vault.core.app_status import write_app_status as export_app_status
+from music_vault.core.importer import (
+    ImportSourceContext,
+    import_file,
+    import_folder,
+    refresh_covers_for_library,
+)
+from music_vault.core.playback_errors import playback_error_message
 from music_vault.core.paths import (
+    app_status_path,
     config_path,
     data_dir,
     database_path,
     default_downloads_dir,
     icon_path,
-    watchtower_status_path,
     youtube_api_key_path,
     youtube_download_archive_path,
     youtube_failed_ids_path,
 )
-from music_vault.core.watchtower_status import write_watchtower_status as export_watchtower_status
+from music_vault.core.safety import sanitize_error_text
+from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
 from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
 from music_vault.metadata.musicbrainz_enricher import search_recording
 from music_vault.metadata.cover_art import download_front_cover
@@ -61,14 +68,20 @@ from music_vault.metadata.cover_art import download_front_cover
 
 class YouTubeSyncWorker(QThread):
     progress = Signal(str)
-    finished_ok = Signal(dict)
-    failed = Signal(str)
+    finished_ok = Signal(object)
 
-    def __init__(self, playlist_url: str, output_dir: str, audio_quality: str = "320") -> None:
+    def __init__(
+        self,
+        playlist_url: str,
+        output_dir: str,
+        audio_quality: str = "320",
+        existing_video_ids: frozenset[str] = frozenset(),
+    ) -> None:
         super().__init__()
         self.playlist_url = playlist_url
         self.output_dir = output_dir
         self.audio_quality = audio_quality
+        self.existing_video_ids = existing_video_ids
 
     def run(self) -> None:
         try:
@@ -79,12 +92,13 @@ class YouTubeSyncWorker(QThread):
                 archive_file=youtube_download_archive_path(),
                 audio_format="mp3",
                 audio_quality=self.audio_quality,
+                existing_video_ids=self.existing_video_ids,
             )
             syncer = AuthorizedYouTubePlaylistSyncer(config, progress=self.progress.emit)
             result = syncer.sync()
             self.finished_ok.emit(result)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.finished_ok.emit(SyncResult.failed_result(exc))
 
 
 class MusicVaultWindow(QMainWindow):
@@ -98,10 +112,15 @@ class MusicVaultWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(app_icon_path)))
         self.resize(1380, 860)
 
-        self.db = MusicVaultDB()
+        self.config = self.load_config()
+        self.db = MusicVaultDB(
+            youtube_download_root=self.config.get("download_folder"),
+            legacy_failure_file=youtube_failed_ids_path(),
+        )
         self.current_track_id: int | None = None
         self.sync_worker: YouTubeSyncWorker | None = None
         self.is_seeking = False
+        self._handling_media_error = False
         self.current_view_kind = "library"
         self.current_playlist_id: int | None = None
         self.current_playlist_name = "Library"
@@ -111,8 +130,7 @@ class MusicVaultWindow(QMainWindow):
         self.manual_queue: list[int] = []
         self.base_playback_context: dict | None = None
 
-        self.config = self.load_config()
-        self.watchtower_sync: dict | None = None
+        self.app_sync_status: dict | None = None
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -130,12 +148,13 @@ class MusicVaultWindow(QMainWindow):
         self.player.durationChanged.connect(self.on_duration_changed)
         self.player.playbackStateChanged.connect(self.on_playback_state_changed)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.errorOccurred.connect(self.on_media_error)
 
         self.build_ui()
         self.load_library()
         self.load_playlists()
         self.refresh_settings_status()
-        self.write_watchtower_status()
+        self.write_app_status()
 
 
     def config_file_path(self) -> Path:
@@ -178,7 +197,7 @@ class MusicVaultWindow(QMainWindow):
 
         return path.read_text(encoding="utf-8", errors="ignore").strip()
 
-    def write_watchtower_status(self, extra: dict | None = None) -> None:
+    def write_app_status(self, extra: dict | None = None) -> None:
         try:
             track = self.db.get_track(self.current_track_id) if self.current_track_id else None
             api_ready = bool(self.read_saved_api_key())
@@ -203,8 +222,8 @@ class MusicVaultWindow(QMainWindow):
                 },
             }
 
-            if self.watchtower_sync is not None:
-                status_extra["sync"] = self.watchtower_sync
+            if self.app_sync_status is not None:
+                status_extra["sync"] = self.app_sync_status
 
             if isinstance(extra, dict):
                 for section in ("health", "playback", "sync"):
@@ -214,7 +233,7 @@ class MusicVaultWindow(QMainWindow):
                     elif isinstance(values, dict):
                         status_extra[section] = values
 
-            export_watchtower_status(self.db, self.config, status_extra)
+            export_app_status(self.db, self.config, status_extra)
         except Exception:
             pass
 
@@ -552,7 +571,7 @@ class MusicVaultWindow(QMainWindow):
         metric_row = QHBoxLayout()
         self.sync_status_card = self.sync_metric_card("Status", "Idle")
         self.sync_downloaded_card = self.sync_metric_card("Downloaded", "0")
-        self.sync_skipped_card = self.sync_metric_card("Skipped", "—")
+        self.sync_skipped_card = self.sync_metric_card("Existing", "—")
         self.sync_failed_card = self.sync_metric_card("Failed", "0")
 
         metric_row.addWidget(self.sync_status_card)
@@ -740,7 +759,7 @@ class MusicVaultWindow(QMainWindow):
         open_data_btn.setObjectName("SoftButton")
         open_data_btn.clicked.connect(self.open_data_folder)
 
-        clear_failed_btn = QPushButton("Clear Failed Downloads")
+        clear_failed_btn = QPushButton("Clear Failure History")
         clear_failed_btn.setObjectName("SoftButton")
         clear_failed_btn.clicked.connect(self.clear_failed_downloads)
 
@@ -773,8 +792,8 @@ class MusicVaultWindow(QMainWindow):
         self.config_status = QLabel()
         self.config_status.setObjectName("StatusLine")
 
-        self.watchtower_status_line = QLabel()
-        self.watchtower_status_line.setObjectName("StatusLine")
+        self.app_status_line = QLabel()
+        self.app_status_line.setObjectName("StatusLine")
 
         settings_layout.addWidget(youtube_title)
         settings_layout.addWidget(api_label)
@@ -793,7 +812,7 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(self.ffmpeg_status)
         settings_layout.addWidget(self.db_status)
         settings_layout.addWidget(self.config_status)
-        settings_layout.addWidget(self.watchtower_status_line)
+        settings_layout.addWidget(self.app_status_line)
         settings_layout.addStretch(1)
 
         layout.addWidget(header)
@@ -1409,7 +1428,7 @@ class MusicVaultWindow(QMainWindow):
             self.page_subtitle.setText(subtitle)
 
         self.filter_library(self.search_box.text() if hasattr(self, "search_box") else "")
-        self.write_watchtower_status()
+        self.write_app_status()
 
     def load_playlists(self) -> None:
         self.playlists.clear()
@@ -1644,12 +1663,12 @@ class MusicVaultWindow(QMainWindow):
     def refresh_current_view(self) -> None:
         if self.current_view_kind == "albums":
             self.show_album_browser()
-            self.write_watchtower_status()
+            self.write_app_status()
             return
 
         if self.current_view_kind == "artists":
             self.show_artist_browser()
-            self.write_watchtower_status()
+            self.write_app_status()
             return
 
         if self.current_view_kind == "recent":
@@ -1818,6 +1837,7 @@ class MusicVaultWindow(QMainWindow):
 
 
     def log_youtube(self, message: str) -> None:
+        message = sanitize_error_text(message)
         if hasattr(self, "youtube_log"):
             self.youtube_log.append(message)
 
@@ -1885,26 +1905,67 @@ class MusicVaultWindow(QMainWindow):
         self.sync_worker = YouTubeSyncWorker(
             playlist_url,
             self.config["download_folder"],
-            self.config["audio_quality"]
+            self.config["audio_quality"],
+            frozenset(self.db.existing_youtube_video_ids()),
         )
 
         self.sync_worker.progress.connect(self.log_youtube)
         self.sync_worker.finished_ok.connect(self.youtube_sync_finished)
-        self.sync_worker.failed.connect(self.youtube_sync_failed)
         self.sync_worker.start()
 
 
-    def youtube_sync_finished(self, result: dict) -> None:
+    def youtube_sync_finished(self, result: SyncResult) -> None:
+        if not isinstance(result, SyncResult):
+            result = SyncResult.failed_result("The sync worker returned an invalid result.")
+
+        imported_count = 0
+        for item in result.import_items:
+            try:
+                if import_file(
+                    self.db,
+                    item.path,
+                    ImportSourceContext(
+                        source_kind="youtube",
+                        source_video_id=item.video_id,
+                        source_upload_date=item.source_upload_date,
+                    ),
+                ):
+                    imported_count += 1
+                    result.successful_video_ids.add(item.video_id)
+            except Exception as exc:
+                result.add_failure(
+                    SyncFailure(
+                        item.video_id,
+                        Path(item.path).stem,
+                        sanitize_error_text(exc),
+                        "import",
+                    )
+                )
+
+        result.finish_imports(imported_count)
+        for failure in result.failures:
+            if not failure.video_id:
+                continue
+            self.db.record_sync_failure(
+                playlist_id=result.playlist_id or "unknown",
+                playlist_title=result.playlist_title,
+                video_id=failure.video_id,
+                title=failure.title,
+                reason=failure.reason,
+                error_category=failure.error_category,
+                attempted_at=result.finished_at,
+            )
+        for video_id in result.successful_video_ids:
+            self.db.resolve_sync_failure(video_id, result.finished_at)
+
         self.youtube_sync_btn.setEnabled(True)
         self.youtube_sync_btn.setText("Start Sync")
 
         self.sync_progress.setRange(0, 100)
-        self.sync_progress.setValue(100)
-        self.sync_progress.setFormat("Complete")
-        self.sync_status_card.value_label.setText("Complete")
-
-        output_dir = result.get("output_dir") or self.youtube_output.text().strip()
-        count = import_folder(self.db, output_dir)
+        self.sync_progress.setValue(0 if result.status == "failed" else 100)
+        values = sync_ui_values(result)
+        self.sync_progress.setFormat(values["status"])
+        self.sync_status_card.value_label.setText(values["status"])
 
         if hasattr(self, "refresh_current_view"):
             self.refresh_current_view()
@@ -1913,63 +1974,33 @@ class MusicVaultWindow(QMainWindow):
 
         self.refresh_settings_status()
 
-        new_items = result.get("new_items", 0)
-        skipped_items = result.get("skipped_items", "—")
-        failed_items = result.get("failed_items", result.get("failures", 0))
-
-        self.sync_downloaded_card.value_label.setText(str(new_items))
-        self.sync_skipped_card.value_label.setText(str(skipped_items))
-        self.sync_failed_card.value_label.setText(str(failed_items))
+        self.sync_downloaded_card.value_label.setText(values["downloaded"])
+        self.sync_skipped_card.value_label.setText(values["existing"])
+        self.sync_failed_card.value_label.setText(values["failed"])
 
         self.log_youtube("")
         self.log_youtube("Sync summary:")
-        self.log_youtube(f"Playlist: {result.get('playlist_title')}")
-        self.log_youtube(f"New downloads: {new_items}")
-        self.log_youtube(f"Library files imported/refreshed: {count}")
-        self.log_youtube("Done.")
+        self.log_youtube(f"Status: {values['status']}")
+        self.log_youtube(f"Playlist: {result.playlist_title or 'Unavailable'}")
+        self.log_youtube(f"New items: {result.new_item_count}")
+        self.log_youtube(f"Downloaded: {result.downloaded_count}")
+        self.log_youtube(f"Existing: {result.existing_count}")
+        self.log_youtube(f"Imported/refreshed: {result.imported_count}")
+        self.log_youtube(f"Failed: {result.failed_count}")
+        for failure in result.failures:
+            self.log_youtube(f"- {failure.title or failure.video_id or 'Sync'}: {failure.reason}")
 
-        self.watchtower_sync = {
-            "last_sync_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "last_sync_status": "complete",
-            "last_sync_playlist_title": result.get("playlist_title"),
-            "last_sync_new_items": new_items,
-            "last_sync_imported_count": count,
-            "last_sync_error": None,
-        }
-        self.write_watchtower_status()
+        self.app_sync_status = result.to_status_dict()
+        self.write_app_status()
 
-        QMessageBox.information(
-            self,
-            "YouTube sync complete",
-            f"Sync complete. Imported/refreshed {count} files."
+        summary = (
+            f"{values['status']}. Downloaded {result.downloaded_count}, "
+            f"imported {result.imported_count}, failed {result.failed_count}."
         )
-
-
-    def youtube_sync_failed(self, error: str) -> None:
-        self.youtube_sync_btn.setEnabled(True)
-        self.youtube_sync_btn.setText("Start Sync")
-
-        self.sync_progress.setRange(0, 100)
-        self.sync_progress.setValue(0)
-        self.sync_progress.setFormat("Failed")
-
-        self.sync_status_card.value_label.setText("Failed")
-        self.sync_failed_card.value_label.setText("1")
-
-        self.log_youtube("")
-        self.log_youtube(f"FAILED: {error}")
-
-        self.watchtower_sync = {
-            "last_sync_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "last_sync_status": "failed",
-            "last_sync_playlist_title": None,
-            "last_sync_new_items": None,
-            "last_sync_imported_count": None,
-            "last_sync_error": error,
-        }
-        self.write_watchtower_status()
-
-        QMessageBox.warning(self, "YouTube sync failed", error)
+        if result.status == "complete":
+            QMessageBox.information(self, "YouTube sync complete", summary)
+        else:
+            QMessageBox.warning(self, "YouTube sync result", summary)
 
     def selected_track_id(self) -> int | None:
         row = self.library_table.currentRow()
@@ -2065,7 +2096,7 @@ class MusicVaultWindow(QMainWindow):
         self.now_artist.setText(artist)
 
         self.set_cover_art(track["cover_path"])
-        self.write_watchtower_status()
+        self.write_app_status()
         return True
 
     def set_cover_art(self, cover_path: str | None) -> None:
@@ -2111,7 +2142,7 @@ class MusicVaultWindow(QMainWindow):
         while self.manual_queue:
             queued_track_id = self.manual_queue.pop(0)
             self.update_queue_label()
-            self.write_watchtower_status()
+            self.write_app_status()
 
             if self.play_track_by_id(
                 queued_track_id,
@@ -2226,7 +2257,7 @@ class MusicVaultWindow(QMainWindow):
         # Manual queue order is FIFO: first queued, first played.
         self.manual_queue.append(track_id)
         self.update_queue_label()
-        self.write_watchtower_status()
+        self.write_app_status()
 
         track = self.db.get_track(track_id)
         title = "Selected song"
@@ -2311,6 +2342,25 @@ class MusicVaultWindow(QMainWindow):
         elif self.repeat_mode == "all":
             self.play_next_from_base_context()
 
+    def on_media_error(self, _error, _error_string: str = "") -> None:
+        if self._handling_media_error:
+            return
+        self._handling_media_error = True
+        track = self.db.get_track(self.current_track_id) if self.current_track_id else None
+        title = track["title"] if track else None
+        self.statusBar().showMessage(playback_error_message(title), 7000)
+        QTimer.singleShot(0, self.continue_after_media_error)
+
+    def continue_after_media_error(self) -> None:
+        """Skip an unplayable item without changing queue/base-context ordering."""
+        self._handling_media_error = False
+        if self.play_next_from_manual_queue():
+            return
+        if self.shuffle_enabled:
+            self.play_random_from_base_context()
+        elif self.autoplay_enabled or self.repeat_mode == "all":
+            self.play_next_from_base_context()
+
 
     def toggle_autoplay(self) -> None:
         self.autoplay_enabled = not self.autoplay_enabled
@@ -2372,7 +2422,7 @@ class MusicVaultWindow(QMainWindow):
             btn.style().polish(btn)
             btn.update()
 
-        self.write_watchtower_status()
+        self.write_app_status()
 
     def on_playback_state_changed(self, state) -> None:
         if state == QMediaPlayer.PlayingState:
@@ -2380,7 +2430,7 @@ class MusicVaultWindow(QMainWindow):
         else:
             self.play_btn.setText("▶")
 
-        self.write_watchtower_status()
+        self.write_app_status()
 
     def on_position_changed(self, position: int) -> None:
         if not self.is_seeking:
@@ -2430,7 +2480,30 @@ class MusicVaultWindow(QMainWindow):
             QMessageBox.information(self, "No match", "No MusicBrainz match found.")
             return
 
-        best = candidates[0]
+        best = max(candidates, key=lambda candidate: candidate.score)
+        confidence = (
+            "\n\nWarning: this is an uncertain match. Review it carefully."
+            if best.score < 80
+            else ""
+        )
+        details = (
+            f"Title: {best.title or 'Unknown'}\n"
+            f"Artist: {best.artist or 'Unknown'}\n"
+            f"Release: {best.album or 'Unknown'}\n"
+            f"Year: {best.year or 'Unknown'}\n"
+            "Provider: MusicBrainz\n"
+            f"Score: {best.score}"
+            f"{confidence}\n\nApply this candidate?"
+        )
+        if QMessageBox.question(
+            self,
+            "Confirm metadata candidate",
+            details,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
         cover_path = None
 
         if best.release_id:
@@ -2439,15 +2512,18 @@ class MusicVaultWindow(QMainWindow):
             except Exception:
                 cover_path = None
 
+        updates = {
+            "title": best.title,
+            "artist": best.artist,
+            "album": best.album,
+            "year": best.year,
+            "musicbrainz_recording_id": best.recording_id,
+            "musicbrainz_release_id": best.release_id,
+            "cover_path": cover_path,
+        }
         self.db.update_track_metadata(
             track_id,
-            title=best.title,
-            artist=best.artist,
-            album=best.album,
-            year=best.year,
-            musicbrainz_recording_id=best.recording_id,
-            musicbrainz_release_id=best.release_id,
-            cover_path=cover_path,
+            **{key: value for key, value in updates.items() if value not in (None, "")},
         )
 
         self.refresh_current_view()
@@ -2492,7 +2568,7 @@ class MusicVaultWindow(QMainWindow):
         self.db.conn.commit()
 
         self.refresh_current_view()
-        self.write_watchtower_status()
+        self.write_app_status()
 
         QMessageBox.information(self, "Cleaned", f"Removed {len(missing)} missing tracks.")
 
@@ -2564,7 +2640,7 @@ class MusicVaultWindow(QMainWindow):
             self.youtube_output.setText(self.config["download_folder"])
 
         self.refresh_settings_status()
-        self.write_watchtower_status()
+        self.write_app_status()
 
         QMessageBox.information(self, "Settings saved", "Music Vault settings were saved.")
 
@@ -2583,24 +2659,21 @@ class MusicVaultWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
     def clear_failed_downloads(self) -> None:
-        failed_path = youtube_failed_ids_path()
-
-        if not failed_path.exists():
-            QMessageBox.information(self, "Failed downloads", "There is no failed downloads list to clear.")
+        if self.db.unresolved_failure_count() == 0:
+            QMessageBox.information(self, "Failure history", "There are no unresolved failures to clear.")
             return
 
         confirm = QMessageBox.question(
             self,
-            "Clear failed downloads?",
-            "Clear the failed downloads list? This does not delete any music."
+            "Clear failure history?",
+            "Clear structured synchronization failure history? This does not delete any music."
         )
 
         if confirm != QMessageBox.Yes:
             return
 
-        failed_path.unlink(missing_ok=True)
-
-        QMessageBox.information(self, "Failed downloads cleared", "The failed downloads list was cleared.")
+        self.db.clear_failure_history()
+        QMessageBox.information(self, "Failure history cleared", "Synchronization failure history was cleared.")
         self.refresh_settings_status()
 
 
@@ -2636,33 +2709,20 @@ class MusicVaultWindow(QMainWindow):
         db_path = getattr(self.db, "db_path", database_path())
         self.db_status.setText(f"Database: {Path(db_path).resolve()}")
 
-        failed_path = youtube_failed_ids_path()
-        failed_count = 0
-
-        if failed_path.exists():
-            try:
-                failed_count = len([
-                    line for line in failed_path.read_text(
-                        encoding="utf-8",
-                        errors="ignore"
-                    ).splitlines()
-                    if line.strip()
-                ])
-            except Exception:
-                failed_count = 0
+        failed_count = self.db.unresolved_failure_count()
 
         config_lines = [
             f"Config: {self.config_file_path().resolve()}",
             f"Download Folder: {download_folder.resolve()}",
             f"Audio Quality: {self.config.get('audio_quality', '320')} kbps",
-            f"Failed Downloads Listed: {failed_count}",
+            f"Unresolved Sync Failures: {failed_count}",
         ]
 
         self.config_status.setText(chr(10).join(config_lines))
 
-        if hasattr(self, "watchtower_status_line"):
-            self.watchtower_status_line.setText(
-                f"Watchtower Status: {watchtower_status_path()}"
+        if hasattr(self, "app_status_line"):
+            self.app_status_line.setText(
+                f"App Status: {app_status_path()}"
             )
 
         if hasattr(self, "settings_download_folder"):

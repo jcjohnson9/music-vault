@@ -11,4 +11,4 @@ if ($LASTEXITCODE -ne 0) { throw "Alternate-working-directory launch script fail
 
 Start-Sleep -Seconds 3
 & (Join-Path $PSScriptRoot "check_status.ps1")
-if ($LASTEXITCODE -ne 0) { throw "Watchtower status check failed." }
+if ($LASTEXITCODE -ne 0) { throw "App Status check failed." }

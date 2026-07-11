@@ -79,8 +79,13 @@ def default_downloads_dir() -> Path:
     return data_dir() / "youtube_downloads"
 
 
-def watchtower_status_path() -> Path:
+def app_status_path() -> Path:
     return data_dir() / "music_vault_status.json"
+
+
+def watchtower_status_path() -> Path:
+    """Compatibility alias for status consumers created before Batch 2."""
+    return app_status_path()
 
 
 def assets_dir() -> Path:

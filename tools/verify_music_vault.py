@@ -13,6 +13,7 @@ REQUIRED_FILES = (
     "music_vault/core/db.py",
     "music_vault/core/importer.py",
     "music_vault/core/youtube_sync.py",
+    "music_vault/core/app_status.py",
     "music_vault/core/watchtower_status.py",
     "music_vault/core/paths.py",
     "assets/icons/music_vault.ico",
@@ -41,11 +42,12 @@ def main() -> int:
         sys.path.insert(0, project_root_text)
 
     from music_vault.core import paths
+    from music_vault.core.app_status import write_app_status
     from music_vault.core.watchtower_status import write_watchtower_status
     import music_vault.app as app
 
-    if not callable(write_watchtower_status):
-        print("Watchtower status exporter is not callable.")
+    if not callable(write_app_status) or write_watchtower_status is not write_app_status:
+        print("App status exporter or compatibility alias is invalid.")
         return 1
 
     expected_data_dir = PROJECT_ROOT / "data"
@@ -54,7 +56,7 @@ def main() -> int:
         "data directory": paths.data_dir(),
         "database": paths.database_path(),
         "config": paths.config_path(),
-        "status": paths.watchtower_status_path(),
+        "status": paths.app_status_path(),
     }
 
     if resolved_paths["project root"] != PROJECT_ROOT:
