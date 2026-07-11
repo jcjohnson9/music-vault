@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QSize, QTimer
-from PySide6.QtGui import QPixmap, QDesktopServices, QIcon
+from PySide6.QtGui import QBrush, QColor, QPixmap, QDesktopServices, QIcon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QMediaDevices
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QTableWidget,
     QTableWidgetItem,
+    QAbstractItemView,
     QMessageBox,
     QInputDialog,
     QListWidget,
@@ -47,6 +48,13 @@ from music_vault.core.importer import (
     refresh_covers_for_library,
 )
 from music_vault.core.playback_errors import playback_error_message
+from music_vault.core.playback_state import (
+    DEFAULT_VOLUME_PERCENT,
+    build_track_row_map,
+    config_for_persistence,
+    locate_track_row,
+    normalize_volume_percent,
+)
 from music_vault.core.paths import (
     app_status_path,
     config_path,
@@ -64,6 +72,9 @@ from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePl
 from music_vault.metadata.musicbrainz_enricher import search_recording
 from music_vault.metadata.cover_art import download_front_cover
 
+
+NOW_PLAYING_ROLE = int(Qt.UserRole) + 1
+VOLUME_SAVE_DEBOUNCE_MS = 500
 
 
 class YouTubeSyncWorker(QThread):
@@ -113,6 +124,12 @@ class MusicVaultWindow(QMainWindow):
         self.resize(1380, 860)
 
         self.config = self.load_config()
+        self.volume_percent = normalize_volume_percent(
+            self.config.get("volume_percent"),
+            DEFAULT_VOLUME_PERCENT,
+        )
+        self.config["volume_percent"] = self.volume_percent
+        self._pending_volume_percent: int | None = None
         self.db = MusicVaultDB(
             youtube_download_root=self.config.get("download_folder"),
             legacy_failure_file=youtube_failed_ids_path(),
@@ -129,13 +146,21 @@ class MusicVaultWindow(QMainWindow):
         self.repeat_mode = "off"  # off, all, one
         self.manual_queue: list[int] = []
         self.base_playback_context: dict | None = None
+        self.track_row_map: dict[int, int] = {}
+        self._playing_row: int | None = None
+        self._styled_now_playing_track_id: int | None = None
 
         self.app_sync_status: dict | None = None
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
-        self.audio_output.setVolume(0.75)
+        self.audio_output.setVolume(self.volume_percent / 100.0)
+
+        self.volume_save_timer = QTimer(self)
+        self.volume_save_timer.setSingleShot(True)
+        self.volume_save_timer.setInterval(VOLUME_SAVE_DEBOUNCE_MS)
+        self.volume_save_timer.timeout.connect(self.flush_pending_volume_save)
 
         self.current_audio_device_key = None
         self.use_system_default_audio_output()
@@ -164,6 +189,7 @@ class MusicVaultWindow(QMainWindow):
         return {
             "download_folder": str(default_downloads_dir()),
             "audio_quality": "320",
+            "volume_percent": DEFAULT_VOLUME_PERCENT,
         }
 
     def load_config(self) -> dict:
@@ -179,12 +205,54 @@ class MusicVaultWindow(QMainWindow):
         except Exception:
             pass
 
+        config["volume_percent"] = normalize_volume_percent(
+            config.get("volume_percent"),
+            DEFAULT_VOLUME_PERCENT,
+        )
         return config
 
     def save_config(self) -> None:
         path = self.config_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(config_for_persistence(self.config), indent=2),
+            encoding="utf-8",
+        )
+
+    def initialize_volume_controls(self) -> int:
+        volume = normalize_volume_percent(
+            self.config.get("volume_percent"),
+            DEFAULT_VOLUME_PERCENT,
+        )
+        self.volume_percent = volume
+        self.config["volume_percent"] = volume
+
+        previous_signal_state = self.volume_slider.blockSignals(True)
+        try:
+            self.volume_slider.setValue(volume)
+        finally:
+            self.volume_slider.blockSignals(previous_signal_state)
+
+        self.audio_output.setVolume(volume / 100.0)
+        return volume
+
+    def on_volume_changed(self, value: int) -> None:
+        volume = normalize_volume_percent(value, self.volume_percent)
+        self.volume_percent = volume
+        self.config["volume_percent"] = volume
+        self.audio_output.setVolume(volume / 100.0)
+        self._pending_volume_percent = volume
+        self.volume_save_timer.start()
+
+    def flush_pending_volume_save(self) -> bool:
+        if self._pending_volume_percent is None:
+            return False
+
+        self.volume_save_timer.stop()
+        self.config["volume_percent"] = self._pending_volume_percent
+        self.save_config()
+        self._pending_volume_percent = None
+        return True
 
     def api_key_path(self) -> Path:
         return youtube_api_key_path()
@@ -925,8 +993,8 @@ class MusicVaultWindow(QMainWindow):
         self.volume_slider.setObjectName("VolumeSlider")
         self.volume_slider.setFixedWidth(140)
         self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(75)
-        self.volume_slider.valueChanged.connect(lambda value: self.audio_output.setVolume(value / 100))
+        self.initialize_volume_controls()
+        self.volume_slider.valueChanged.connect(self.on_volume_changed)
         volume_col.addWidget(volume_label)
         volume_col.addWidget(self.volume_slider)
 
@@ -1384,6 +1452,127 @@ class MusicVaultWindow(QMainWindow):
 
 
 
+    def rebuild_track_row_map(self) -> dict[int, int]:
+        track_ids = []
+        for row in range(self.library_table.rowCount()):
+            item = self.library_table.item(row, 0)
+            track_ids.append(item.data(Qt.UserRole) if item is not None else None)
+
+        self.track_row_map = build_track_row_map(track_ids)
+        return dict(self.track_row_map)
+
+    def locate_visible_track_row(self, track_id: int | None) -> int | None:
+        row = self.locate_track_row_in_table(track_id)
+        if row is None or self.library_table.isRowHidden(row):
+            return None
+        return row
+
+    def locate_track_row_in_table(self, track_id: int | None) -> int | None:
+        row = locate_track_row(track_id, self.track_row_map)
+        if row is not None and 0 <= row < self.library_table.rowCount():
+            item = self.library_table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == track_id:
+                return row
+
+        if track_id is None:
+            return None
+        self.rebuild_track_row_map()
+        return locate_track_row(track_id, self.track_row_map)
+
+    def library_table_is_currently_visible(self) -> bool:
+        if hasattr(self, "pages") and hasattr(self, "library_page"):
+            if self.pages.currentWidget() is not self.library_page:
+                return False
+        if hasattr(self, "library_content_stack"):
+            if self.library_content_stack.currentIndex() != 0:
+                return False
+        return True
+
+    def restore_table_selection(self, track_id: int | None) -> int | None:
+        self.library_table.clearSelection()
+        self.library_table.setCurrentCell(-1, -1)
+        if track_id is None:
+            return None
+
+        row = self.locate_track_row_in_table(track_id)
+        if row is None or self.library_table.isRowHidden(row):
+            return None
+        self.library_table.selectRow(row)
+        return row
+
+    def set_playing_row_treatment(self, row: int, playing: bool) -> None:
+        if row < 0 or row >= self.library_table.rowCount():
+            return
+        title_item = self.library_table.item(row, 0)
+        if title_item is None:
+            return
+
+        title_item.setData(NOW_PLAYING_ROLE, playing)
+        font = title_item.font()
+        font.setBold(playing)
+        title_item.setFont(font)
+        title_item.setForeground(
+            QBrush(QColor("#1DB954")) if playing else QBrush()
+        )
+
+    def apply_now_playing_row_state(
+        self,
+        *,
+        select_if_visible: bool = False,
+        scroll_if_visible: bool = False,
+    ) -> int | None:
+        row = self.locate_track_row_in_table(self.current_track_id)
+
+        if (
+            self._styled_now_playing_track_id is not None
+            and self._styled_now_playing_track_id != self.current_track_id
+        ):
+            previous_row = locate_track_row(
+                self._styled_now_playing_track_id,
+                self.track_row_map,
+            )
+            if previous_row is not None:
+                self.set_playing_row_treatment(previous_row, False)
+
+        if row is None:
+            self._playing_row = None
+            self._styled_now_playing_track_id = None
+            return None
+
+        self.set_playing_row_treatment(row, True)
+        self._playing_row = row
+        self._styled_now_playing_track_id = self.current_track_id
+
+        if (
+            self.library_table.isRowHidden(row)
+            or not self.library_table_is_currently_visible()
+        ):
+            return row
+
+        if select_if_visible:
+            self.library_table.selectRow(row)
+        if scroll_if_visible:
+            item = self.library_table.item(row, 0)
+            if item is not None:
+                self.library_table.scrollToItem(
+                    item,
+                    QAbstractItemView.ScrollHint.PositionAtCenter,
+                )
+        return row
+
+    def update_now_playing_indicator(
+        self,
+        track_id: int,
+        *,
+        select_if_visible: bool = True,
+        scroll_if_visible: bool = True,
+    ) -> int | None:
+        self.current_track_id = int(track_id)
+        return self.apply_now_playing_row_state(
+            select_if_visible=select_if_visible,
+            scroll_if_visible=scroll_if_visible,
+        )
+
     def load_library(self, tracks=None, title: str | None = None, subtitle: str | None = None) -> None:
         if hasattr(self, "library_content_stack"):
             self.library_content_stack.setCurrentIndex(0)
@@ -1391,8 +1580,13 @@ class MusicVaultWindow(QMainWindow):
         if tracks is None:
             tracks = self.db.list_tracks()
 
+        selected_track_id = self.selected_track_id()
+
         self.library_table.setRowCount(len(tracks))
         self.library_table.setIconSize(QSize(42, 42))
+        self.track_row_map = {}
+        self._playing_row = None
+        self._styled_now_playing_track_id = None
 
         for row_idx, track in enumerate(tracks):
             values = [
@@ -1419,6 +1613,8 @@ class MusicVaultWindow(QMainWindow):
 
             self.library_table.setRowHeight(row_idx, 54)
 
+        self.rebuild_track_row_map()
+
         self.track_count_card.value_label.setText(str(len(tracks)))
 
         if title and hasattr(self, "page_title"):
@@ -1428,6 +1624,8 @@ class MusicVaultWindow(QMainWindow):
             self.page_subtitle.setText(subtitle)
 
         self.filter_library(self.search_box.text() if hasattr(self, "search_box") else "")
+        self.restore_table_selection(selected_track_id)
+        self.apply_now_playing_row_state()
         self.write_app_status()
 
     def load_playlists(self) -> None:
@@ -2085,7 +2283,7 @@ class MusicVaultWindow(QMainWindow):
         if capture_base_context:
             self.capture_base_playback_context(track_id)
 
-        self.current_track_id = track_id
+        self.update_now_playing_indicator(track_id)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.player.play()
 
@@ -2736,6 +2934,10 @@ class MusicVaultWindow(QMainWindow):
 
         if hasattr(self, "settings_api_key") and not self.settings_api_key.text().strip():
             self.settings_api_key.setText(self.read_saved_api_key())
+
+    def closeEvent(self, event) -> None:
+        self.flush_pending_volume_save()
+        super().closeEvent(event)
 
     def find_ffmpeg_bin(self) -> str | None:
         tools_root = Path.home() / "Documents" / "MusicVaultTools" / "ffmpeg"

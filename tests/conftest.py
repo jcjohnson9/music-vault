@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
+
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    yield app
 
 
 @pytest.fixture

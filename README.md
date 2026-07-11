@@ -30,7 +30,9 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Embedded artwork extraction and artwork display
 - Album and artist browsing
 - Custom local playlists
-- Local playback with seek and volume controls
+- Local playback with seek and persisted volume controls
+- Independent now-playing identity with active-row tracking across automatic,
+  queued, next, and previous playback
 - Autoplay, shuffle, and repeat modes
 - Temporary FIFO queue that resumes its original playback context
 - Windows default audio-output following
