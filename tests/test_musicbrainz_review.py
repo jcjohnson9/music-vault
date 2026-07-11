@@ -66,6 +66,7 @@ def test_candidate_parser_keeps_all_release_identity_and_stable_score_order():
                     "id": "recording-a",
                     "score": 91,
                     "title": "Synthetic Song",
+                    "length": "245678",
                     "artist-credit": [
                         {"name": "Artist One", "joinphrase": " & "},
                         {"artist": {"name": "Artist Two"}},
@@ -78,6 +79,10 @@ def test_candidate_parser_keeps_all_release_identity_and_stable_score_order():
                             "country": "US",
                             "status": "Official",
                             "cover-art-archive": {"front": True},
+                            "artist-credit": [
+                                {"name": "Release Artist", "joinphrase": " feat. "},
+                                {"artist": {"name": "Guest Artist"}},
+                            ],
                         },
                         {"id": "release-b", "title": "Release B", "date": "2002"},
                     ],
@@ -96,6 +101,8 @@ def test_candidate_parser_keeps_all_release_identity_and_stable_score_order():
     assert [candidate.score for candidate in candidates] == [99, 91, 91]
     release = candidates[1]
     assert release.artist == "Artist One & Artist Two"
+    assert release.duration_seconds == pytest.approx(245.678)
+    assert release.album_artist == "Release Artist feat. Guest Artist"
     assert release.release_id == "release-a"
     assert release.release_date == "2001-02-03" and release.year == "2001"
     assert release.country == "US" and release.release_status == "Official"
@@ -152,6 +159,14 @@ def test_invalid_provider_json_is_sanitized():
         rate_limiter=_RateLimiter(0),
     )
     with pytest.raises(MetadataProviderError, match="response_invalid"):
+        provider.search("Synthetic")
+
+
+def test_malformed_provider_score_is_sanitized():
+    provider, _session = _provider(
+        {"recordings": [{"id": "id", "score": "private malformed value"}]}
+    )
+    with pytest.raises(MetadataProviderError, match="^musicbrainz_response_invalid$"):
         provider.search("Synthetic")
 
 

@@ -29,15 +29,19 @@ supported public/unlisted workflow does not silently access browser cookies.
 Manual field editing, clear/unlock/reset, history, and undo are local database
 operations. Music Vault contacts MusicBrainz only after the user explicitly
 clicks **Search MusicBrainz**; that request contains the entered title and
-artist. It uses no provider API key, YouTube API key, browser cookie, or hidden
-whole-library scan. No candidate is applied without explicit field selection
-and confirmation.
+artist. Separately, **Analyze Library** may send each track's current effective
+title, artist, and duration to MusicBrainz for an explicitly started, resumable
+remediation job. Neither path uses a provider API key, YouTube API key, browser
+cookie, or automatic startup scan.
 
 MusicBrainz searches run outside the GUI thread with rate limiting, explicit
 timeouts, response-size and JSON validation, an HTTPS-only MusicBrainz host
 policy, public-address validation, disabled environment proxy inheritance, and
-sanitized error codes. Cover Art Archive retrieval occurs only after selected
-candidate artwork is confirmed. Cover URLs and redirects are restricted to
+sanitized error codes. In the manual editor, Cover Art Archive retrieval occurs
+only after selected candidate artwork is confirmed. Remediation may retrieve
+front artwork for a validated private preview after explicit candidate review,
+or during an explicitly confirmed apply for one unambiguous release and an
+unlocked artwork field. Cover URLs and redirects are restricted to
 approved HTTPS hosts, public addresses, and standard ports; image bytes, MIME
 type, encoded format, dimensions, pixels, and decodability are bounded and
 validated before storage.
@@ -46,7 +50,19 @@ Chosen local artwork is also decoded and bounded before Music Vault copies it
 to content-addressed runtime storage. Do not commit or publicly attach managed
 covers, metadata observations/history, provider references, or pre-migration
 database backups. Clear, reset, and undo intentionally do not delete artwork
-files. Batch 6 does not rewrite audio-file tags or media content.
+files.
+
+Remediation analysis does not change effective metadata or media. Applying a
+job requires explicit confirmation and is limited to unique strict high-
+confidence matches; ambiguous, needs-review, no-match, skipped, failed, stale,
+and locked items remain unchanged. Supported MP3 writeback requires an
+additional explicit file-write choice, a verified complete original-file
+backup, temporary-copy mutation, tag readback, unchanged audio-payload, codec,
+and duration verification, and conflict-aware rollback. Unsupported formats
+never report a successful write. Private reports, cache rows, candidate
+snapshots, generated artwork, and media/database backups are runtime data and
+must not be shared or committed. See
+[Metadata Remediation](docs/METADATA_REMEDIATION.md).
 
 ## Optional artist-image requests
 

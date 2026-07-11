@@ -27,6 +27,8 @@ FORBIDDEN_DIRECTORY_NAMES = {
     ".codex",
     ".agents",
     "metadata_reports",
+    "metadata_jobs",
+    "provider_cache",
 }
 DATABASE_SUFFIXES = {
     ".db",
@@ -178,6 +180,9 @@ def _path_violations(relative_path: str) -> list[tuple[str, str]]:
 
     if "metadata_report" in lower:
         violations.append(("private metadata report", "remove remediation reports from the Git index"))
+
+    if "provider_cache" in lower or "remediation_job" in lower:
+        violations.append(("private remediation runtime state", "remove remediation caches or job data from the Git index"))
 
     return violations
 

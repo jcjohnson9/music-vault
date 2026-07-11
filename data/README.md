@@ -12,14 +12,23 @@ and a neutral external App Status document named `music_vault_status.json`.
 Both are private runtime data. The status document contains no API-key value and
 does not represent a Watchtower integration.
 
-Schema version 3 keeps effective metadata, source observations, provenance,
+Schema version 4 keeps effective metadata, source observations, provenance,
 confidence, field locks, and grouped change history inside the private SQLite
-database. Manual corrections and undo affect the Music Vault library only; they
-do not rewrite audio-file tags. Validated local artwork is copied into
+database and adds resumable remediation jobs, item snapshots, and a bounded
+provider cache. Manual corrections and undo remain database-only. A separately
+confirmed high-confidence remediation job may write verified tags to supported
+media after creating an exact full-file backup; it must preserve the audio
+payload and retain conflict-aware rollback state. Validated local artwork is copied into
 content-addressed storage under `covers/manual/`, and explicitly approved
 candidate artwork uses a provider-specific directory under `covers/`. These
-files and pre-schema-v3 backups must never be committed or included in a public
+files and schema-migration backups must never be committed or included in a public
 build. Clear, reset, and undo do not automatically delete older cover files.
+
+Private remediation reports live under `metadata_reports/<job-id>/`. Provider
+cache rows remain in the SQLite database, and per-job original media backups
+live under `backups/metadata_jobs/<job-id>/`. Reports, candidate snapshots,
+manifests, cache data, generated artwork, and backups may identify a personal
+library and must never be committed, attached publicly, or bundled in a build.
 
 When optional artist-photo lookup is used, Music Vault stores its versioned
 provenance and negative-result manifest at `artist_images/index.json` and

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import hashlib
 import json
@@ -43,8 +44,53 @@ METADATA_SCENES = (
     "metadata_long_values",
     "metadata_currently_playing",
 )
-RUNTIME_PREFIX = "MusicVault_Batch6_UI_Runtime_"
+REMEDIATION_SCENES = (
+    "remediation_empty",
+    "remediation_analyzing",
+    "remediation_paused",
+    "remediation_mixed_ready",
+    "remediation_high_confirmation",
+    "remediation_insufficient_disk",
+    "remediation_needs_review",
+    "remediation_ambiguous",
+    "remediation_no_match",
+    "remediation_artwork_comparison",
+    "remediation_apply_progress",
+    "remediation_complete_issues",
+    "remediation_failed",
+    "remediation_rollback_confirmation",
+    "remediation_rolled_back",
+    "remediation_long_values",
+)
+RUNTIME_PREFIX = "MusicVault_Batch7_UI_Runtime_"
 OUTPUT_PREFIX = "MusicVault_UI_Review_Output_"
+REMEDIATION_RESTART_PHASE_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_PHASE"
+REMEDIATION_RESTART_REQUIRED_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_REQUIRED"
+REMEDIATION_RESTART_CHECKPOINT = "synthetic_remediation_restart.json"
+
+_SYNTHETIC_MP3_BASE64 = (
+    "//sQxAADwAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFX/+xLE"
+    "KYPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFX/+xDEU4PAAAGk"
+    "AAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVf/7EsR9A8AAAaQAAAAg"
+    "AAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVf/7EMSnA8AAAaQAAAAgAAA0gAAABF"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBV//sSxNCDwAABpAAAACAAADSAAAEVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVX/+xLE1YPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVf/7EsTVg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7"
+    "EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+    "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+)
 
 
 def parse_size(value: str) -> tuple[int, int]:
@@ -81,7 +127,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--page",
         action="append",
-        choices=(*DEFAULT_SCENES, "artists", "no_results", *METADATA_SCENES),
+        choices=(
+            *DEFAULT_SCENES,
+            "artists",
+            "no_results",
+            *METADATA_SCENES,
+            *REMEDIATION_SCENES,
+        ),
         help="Repeatable review scene. Defaults to the standard application matrix.",
     )
     parser.add_argument(
@@ -256,8 +308,24 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
 
         track_ids: list[int] = []
         for index in range(300):
-            sentinel = media / f"track_{index + 1:04d}.synthetic-audio"
-            sentinel.write_bytes(b"synthetic-review-sentinel\n")
+            track_title = f"{titles[index % len(titles)]} {index + 1:04d}"
+            duration_seconds = 150 + index * 3
+            if index == 0:
+                from mutagen.id3 import ID3, TIT2, TPE1
+
+                from music_vault.metadata.tag_writer import inspect_mp3
+
+                sentinel = media / "track_0001.mp3"
+                sentinel.write_bytes(base64.b64decode(_SYNTHETIC_MP3_BASE64))
+                track_title = "Synthetic Review Song (Official Video)"
+                tags = ID3()
+                tags.add(TIT2(encoding=3, text=[track_title]))
+                tags.add(TPE1(encoding=3, text=[str(artists[index])]))
+                tags.save(sentinel, v2_version=3)
+                duration_seconds = inspect_mp3(sentinel).duration_seconds
+            else:
+                sentinel = media / f"track_{index + 1:04d}.synthetic-audio"
+                sentinel.write_bytes(b"synthetic-review-sentinel\n")
             if index == 0:
                 album = "A Shared Synthetic Album Title"
                 album_artist = "Aster Resolved Artist"
@@ -282,7 +350,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                 )
             track_id = db.upsert_track(
                 sentinel,
-                title=f"{titles[index % len(titles)]} {index + 1:04d}",
+                title=track_title,
                 artist=artists[index % len(artists)],
                 album=album,
                 album_artist=album_artist,
@@ -292,7 +360,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                     if index % 11 != 0
                     else None
                 ),
-                duration_seconds=150 + index * 3,
+                duration_seconds=duration_seconds,
                 source_kind="youtube" if index == 0 else "local",
                 source_video_id="abcdefghijk" if index == 0 else None,
                 source_upload_date="2024-03-02" if index == 0 else None,
@@ -316,7 +384,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         schema = int(db.conn.execute("PRAGMA user_version").fetchone()[0])
         integrity = str(db.conn.execute("PRAGMA integrity_check").fetchone()[0])
         db.close()
-        if schema != 3 or integrity != "ok":
+        if schema != 4 or integrity != "ok":
             raise RuntimeError("Synthetic database validation failed.")
     finally:
         try:
@@ -337,6 +405,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         "synthetic_album_target": 100,
         "synthetic_artist_target": 200,
         "artist_image_fetch_enabled_by_default": False,
+        "synthetic_mp3_count": 1,
     }
 
 
@@ -397,6 +466,64 @@ def wait_for_review(process: subprocess.Popen[str], timeout: int) -> tuple[str, 
     return process.communicate()
 
 
+def validate_remediation_restart_checkpoint(
+    runtime: Path,
+    *,
+    packaged: bool,
+) -> dict[str, int | bool]:
+    """Validate only aggregate persisted-job facts between review processes."""
+
+    checkpoint_path = runtime / "data" / REMEDIATION_RESTART_CHECKPOINT
+    payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise RuntimeError("Synthetic remediation restart checkpoint is invalid.")
+    job_id = payload.get("job_id")
+    creator_pid = payload.get("creator_pid")
+    partial_analyzed = payload.get("partial_analyzed")
+    total = payload.get("total")
+    provider_requests = payload.get("provider_requests")
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or isinstance(creator_pid, bool)
+        or not isinstance(creator_pid, int)
+        or creator_pid <= 0
+        or partial_analyzed != 1
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or total <= int(partial_analyzed)
+        or provider_requests != 1
+        or bool(payload.get("creator_packaged")) is not packaged
+    ):
+        raise RuntimeError("Synthetic remediation restart evidence is incomplete.")
+
+    database = runtime / "data" / "music_vault.sqlite3"
+    connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            """
+            SELECT status, analyzed_items, total_items
+            FROM metadata_remediation_jobs WHERE id=?
+            """,
+            (job_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None or not (
+        str(row["status"]) == "paused"
+        and int(row["analyzed_items"]) == 1
+        and int(row["total_items"]) == total
+    ):
+        raise RuntimeError("Synthetic remediation partial job was not persisted.")
+    return {
+        "checkpoint_schema_version": 1,
+        "partial_analyzed": 1,
+        "total": total,
+        "creator_packaged": packaged,
+    }
+
+
 def validate_output(
     output: Path,
     runtime: Path,
@@ -428,6 +555,32 @@ def validate_output(
         }
         if any(metadata_behaviors.get(name) is not True for name in required_behaviors):
             raise RuntimeError("Synthetic packaged metadata behavior validation failed.")
+    if captured_scenes.intersection(REMEDIATION_SCENES):
+        runtime_checks = payload.get("runtime_checks") or {}
+        remediation_behaviors = runtime_checks.get("remediation_behaviors") or {}
+        required_behaviors = {
+            "dashboard_available",
+            "non_destructive_analysis",
+            "high_confidence_apply",
+            "ambiguous_unchanged",
+            "exact_media_backup",
+            "tag_update_verified",
+            "audio_payload_unchanged",
+            "rollback_exact",
+            "resumable_after_restart",
+            "partial_job_persisted_by_prior_process",
+            "fresh_process_database_service_resume",
+            "history_audited",
+            "safe_app_status",
+            "queue_and_membership_preserved",
+            "synthetic_provider_only",
+            "public_provider_call_count_zero",
+        }
+        if any(
+            remediation_behaviors.get(name) is not True
+            for name in required_behaviors
+        ):
+            raise RuntimeError("Synthetic packaged remediation validation failed.")
 
     from PySide6.QtGui import QImage
 
@@ -550,6 +703,69 @@ def validate_output(
                 raise RuntimeError("Synthetic artwork editor is outside the captured viewport.")
             if scene == "metadata_undo_confirmation" and not metrics.get("undo_confirmation_visible"):
                 raise RuntimeError("Synthetic undo confirmation was not visible.")
+        if scene in REMEDIATION_SCENES:
+            metrics = capture.get("remediation_metrics")
+            if not isinstance(metrics, dict):
+                raise RuntimeError("Synthetic remediation capture lacks aggregate metrics.")
+            if not metrics.get("dialog_visible"):
+                raise RuntimeError("Synthetic remediation dashboard is not visible.")
+            if int(metrics.get("metric_card_count", 0)) != 10:
+                raise RuntimeError("Synthetic remediation dashboard lacks aggregate cards.")
+            if int(metrics.get("control_count", 0)) < 12:
+                raise RuntimeError("Synthetic remediation dashboard lacks required controls.")
+            if not metrics.get("synthetic_provider_active"):
+                raise RuntimeError("Synthetic remediation provider safety mode is inactive.")
+            if int(metrics.get("public_provider_call_count", -1)) != 0:
+                raise RuntimeError("Synthetic remediation review attempted a public request.")
+            if metrics.get("private_path_visible"):
+                raise RuntimeError("Synthetic remediation table exposed a private path.")
+            if (
+                int(metrics.get("review_geometry_widget_count", 0)) < 20
+                or int(metrics.get("review_geometry_overlap_count", -1)) != 0
+                or int(metrics.get("review_geometry_clipped_count", -1)) != 0
+                or int(metrics.get("review_group_clipped_count", -1)) != 0
+            ):
+                raise RuntimeError(
+                    "Synthetic remediation controls overlap or are clipped."
+                )
+            if scene == "remediation_empty" and metrics.get("job_present"):
+                raise RuntimeError("Synthetic empty remediation scene contains a job.")
+            if scene != "remediation_empty" and not metrics.get("job_present"):
+                raise RuntimeError("Synthetic remediation state lacks its job.")
+            if scene in {
+                "remediation_high_confirmation",
+                "remediation_insufficient_disk",
+                "remediation_rollback_confirmation",
+            } and not metrics.get("confirmation_visible"):
+                raise RuntimeError("Synthetic remediation confirmation is not visible.")
+            if scene in {
+                "remediation_needs_review",
+                "remediation_ambiguous",
+                "remediation_no_match",
+                "remediation_artwork_comparison",
+            } and int(metrics.get("selected_row_count", 0)) != 1:
+                raise RuntimeError("Synthetic remediation review selection is missing.")
+            if scene in {
+                "remediation_needs_review",
+                "remediation_artwork_comparison",
+            } and (
+                int(metrics.get("release_choice_count", 0)) < 1
+                or not metrics.get("release_identity_complete")
+            ):
+                raise RuntimeError(
+                    "Synthetic remediation review lacks a complete release identity."
+                )
+            if scene == "remediation_artwork_comparison":
+                if not metrics.get("current_artwork_rendered") or not metrics.get(
+                    "candidate_artwork_rendered"
+                ):
+                    raise RuntimeError(
+                        "Synthetic artwork comparison did not render both previews."
+                    )
+                if metrics.get("artwork_field_selected"):
+                    raise RuntimeError(
+                        "Synthetic artwork comparison was preapproved unexpectedly."
+                    )
 
     database = runtime / "data" / "music_vault.sqlite3"
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
@@ -558,7 +774,7 @@ def validate_output(
         integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
     finally:
         connection.close()
-    if schema != 3 or integrity != "ok":
+    if schema != 4 or integrity != "ok":
         raise RuntimeError("Synthetic database failed final validation.")
     if (runtime / "data" / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
@@ -651,12 +867,15 @@ def main() -> int:
                 "MUSIC_VAULT_PROJECT_ROOT": str(runtime),
                 "HOME": str(runtime / "profile"),
                 "USERPROFILE": str(runtime / "profile"),
+                "MUSIC_VAULT_ACCEPTANCE_NO_SECRETS": "1",
                 # The provider factory accepts this only alongside the explicit
                 # isolated review plan/root. It guarantees review cannot reach
                 # public artist metadata or image services.
                 "MUSIC_VAULT_ARTIST_IMAGE_PROVIDER": "synthetic",
             }
         )
+        environment_base.pop(REMEDIATION_RESTART_PHASE_ENV, None)
+        environment_base.pop(REMEDIATION_RESTART_REQUIRED_ENV, None)
         if args.offscreen:
             environment_base["QT_QPA_PLATFORM"] = "offscreen"
         if args.scale is not None:
@@ -669,6 +888,51 @@ def main() -> int:
             command = [str(executable)]
         else:
             command = [sys.executable, "-B", str(project_root / "run.py")]
+
+        restart_checkpoint: dict[str, int | bool] | None = None
+        remediation_scenes = tuple(
+            scene for scene in scenes if scene in REMEDIATION_SCENES
+        )
+        if remediation_scenes:
+            # The preparatory launch is intentionally a real application
+            # process. It persists a one-item partial job and exits normally.
+            # The first accepted capture then runs in another fresh process and
+            # must resume that exact durable job before validation can pass.
+            preparation_plan = write_review_plan(
+                runtime,
+                output,
+                (sizes[0],),
+                (remediation_scenes[0],),
+                args.settle_ms,
+            )
+            preparation_environment = environment_base.copy()
+            preparation_environment["MUSIC_VAULT_UI_REVIEW"] = str(preparation_plan)
+            preparation_environment[REMEDIATION_RESTART_PHASE_ENV] = "prepare"
+            process = subprocess.Popen(
+                command,
+                cwd=runtime,
+                env=preparation_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            stdout, stderr = wait_for_review(process, args.timeout)
+            if process.returncode != 0:
+                summary = (stderr or stdout).strip()[-1200:]
+                raise RuntimeError(
+                    "Music Vault remediation restart preparation exited with code "
+                    f"{process.returncode}: {summary}"
+                )
+            process = None
+            restart_checkpoint = validate_remediation_restart_checkpoint(
+                runtime,
+                packaged=args.exe is not None,
+            )
+            environment_base[REMEDIATION_RESTART_REQUIRED_ENV] = (
+                "packaged" if args.exe is not None else "source"
+            )
 
         # A fresh process per page/size avoids stale Qt native backing-store
         # regions after rapid stacked-page changes on Windows. It also keeps
@@ -707,6 +971,18 @@ def main() -> int:
 
         write_aggregate_manifest(output, child_manifests, sizes, scenes)
         manifest = validate_output(output, runtime, len(sizes) * len(scenes))
+        if restart_checkpoint is not None:
+            remediation_behaviors = (
+                (manifest.get("runtime_checks") or {}).get(
+                    "remediation_behaviors", {}
+                )
+            )
+            if args.exe is not None and remediation_behaviors.get(
+                "fresh_packaged_process_resume"
+            ) is not True:
+                raise RuntimeError(
+                    "Synthetic restart was not resumed by a second packaged process."
+                )
         enabled_captures = [
             capture
             for capture in manifest.get("captures", [])
@@ -737,10 +1013,17 @@ def main() -> int:
                     "sizes": manifest["sizes"],
                     "pages": manifest["pages"],
                     "dark_title_bar_applied": manifest.get("dark_title_bar_applied"),
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "config_volume_percent": 23,
                     "api_key_present": False,
                     "artist_provider": "synthetic_no_network",
+                    "remediation_provider": "synthetic_no_network",
+                    "remediation_restart_process_count": (
+                        2 if restart_checkpoint is not None else 0
+                    ),
+                    "remediation_fresh_packaged_resume": bool(
+                        restart_checkpoint is not None and args.exe is not None
+                    ),
                     "scale_factor": args.scale or 1.0,
                     "dataset": dataset,
                 },

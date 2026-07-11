@@ -49,8 +49,9 @@ from 0 through 100, manual flag, lock flag, and update time. This normalized
 shape allows future fields without adding a new lock column to `tracks`.
 
 Common provenance values include `manual`, `musicbrainz_confirmed`,
-`provider_confirmed`, `embedded`, `youtube`, `youtube_thumbnail`,
-`cover_art_archive`, `filename`, and `unknown`.
+`provider_confirmed`, `musicbrainz_high_confidence`,
+`cover_art_archive_high_confidence`, `embedded`, `youtube`,
+`youtube_thumbnail`, `cover_art_archive`, `filename`, and `unknown`.
 
 ## Authority and precedence
 
@@ -59,9 +60,10 @@ Automatic observations use a centralized precedence policy:
 1. locked manual values;
 2. locked user-confirmed MusicBrainz values;
 3. other locked user-confirmed provider values;
-4. credible embedded metadata;
-5. YouTube/source fallback;
-6. filename fallback or unknown.
+4. strict high-confidence remediation values;
+5. credible embedded metadata;
+6. YouTube/source fallback;
+7. filename fallback or unknown.
 
 Locked values are not replaced by automatic imports. A lower-priority or empty
 automatic observation cannot erase a stronger populated value, but the
@@ -144,7 +146,12 @@ playlists, memberships, source identity, paths, and canonical values, seeds
 conservative provenance without marking ordinary values manual, and does not
 query providers, read media tags, fabricate release dates, or create history.
 
-## Batch 7 boundary
+Schema version 4 additively introduces persisted remediation jobs/items and a
+bounded provider cache. It does not reinterpret existing effective values,
+locks, observations, or history during migration. A verified SQLite backup is
+created before a non-empty schema-v3 database is upgraded.
+
+## Existing-library remediation
 
 Batch 6 corrections are authoritative inside the Music Vault database only.
 They update visible library and current-player metadata without restarting the
@@ -152,7 +159,26 @@ media or changing playback position, queue, base context, or playlist
 membership. Batch 6 never rewrites embedded audio-file tags.
 
 The metadata service exposes effective and approved snapshots, observations,
-review state, field actions, history, and undo for the audited Batch 7
-remediation workflow. Batch 7 may use those interfaces for resumable,
-reviewed, rollback-capable file-tag writeback and existing-library remediation;
-no bulk scan, bulk apply, or tag mutation is part of Batch 6.
+review state, field actions, history, undo, strict high-confidence application,
+and exact snapshot restoration for the audited remediation workflow.
+
+Remediation analysis stores a private snapshot and candidate assessment without
+changing effective fields or history. Query normalization is comparison-only;
+presentation suffix cleanup never rewrites stored text by itself. Recording
+identity and field confidence are separate: a unique high-confidence recording
+can still leave album, release date, album artist, or artwork for review when
+multiple releases remain plausible. Source upload dates never become canonical
+release dates.
+
+Eligible automatic changes use unlocked `musicbrainz_high_confidence` or
+`cover_art_archive_high_confidence` provenance, retain provider references and
+confidence, and write one grouped history event. They remain below manual and
+confirmed locks and remain editable. User-confirmed candidates continue to use
+locked `musicbrainz_confirmed` provenance.
+
+An explicit file-writeback action may mirror approved fields into a supported
+MP3 only after exact backup and unchanged-audio verification. Database and file
+rollback restores the pre-apply field values, provenance, confidence, locks,
+provider IDs, and original file while retaining auditable apply/rollback
+history. Later metadata or media changes cause a conflict instead of being
+overwritten. See [Metadata Remediation](METADATA_REMEDIATION.md).

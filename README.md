@@ -28,13 +28,20 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 - Authorized media acquisition with yt-dlp and FFmpeg
 - Persistent local library backed by SQLite
 - Embedded artwork extraction and artwork display
-- Schema-v3 metadata authority with source observations, field-level
-  provenance/confidence and protected manual or confirmed values
+- Schema-v4 metadata authority with source observations, field-level
+  provenance/confidence, protected manual or confirmed values, and resumable
+  remediation jobs
 - Trusted Metadata editor for title, artist, album, album artist, canonical
   release date, artwork, source inspection, grouped history, and library-level
   undo
 - Explicit MusicBrainz candidate review with selected-field application and
   optional validated Cover Art Archive artwork
+- Existing-library remediation with non-destructive analysis, strict confidence
+  classes, private reports, provider caching, pause/resume, manual review,
+  explicitly confirmed high-confidence apply, verification, and rollback
+- Audited MP3 tag writeback using exact full-file backups, temporary-copy
+  mutation, tag readback, and unchanged audio-payload checks; unsupported
+  formats remain truthful database-only updates
 - Fast SQL-backed Album and Artist model/view browsers with cached summaries,
   visible-range high-DPI thumbnails, and exact same-title album separation
 - Album cards retain album artwork; Artist cards use a dedicated unknown-artist
@@ -56,7 +63,8 @@ local-first use; its source code is available under the [MIT License](LICENSE).
 
 Music Vault does not currently provide private-playlist OAuth, multiple source
 playlists, Android support, Prime control, radio stations, AcoustID matching,
-bulk metadata remediation, or audio-file tag writeback.
+general-web metadata scraping, automatic uncertain-match application, or tag
+writeback beyond the currently audited MP3 path.
 
 ## Product boundaries
 
@@ -122,7 +130,11 @@ canonical musical release years. Local imports may continue to use legitimate
 embedded release metadata. **Edit Metadata** exposes source observations,
 protected manual correction, and an explicit MusicBrainz candidate review.
 Approved changes are stored in the Music Vault library; Batch 6 does not rewrite
-the underlying audio-file tags. See the [Metadata Model](docs/METADATA_MODEL.md).
+the underlying audio-file tags. The separate Batch 7 workflow can analyze the
+existing library and, only after explicit confirmation, apply strict high-
+confidence database changes and optionally verified MP3 tags. See the
+[Metadata Model](docs/METADATA_MODEL.md) and
+[Metadata Remediation](docs/METADATA_REMEDIATION.md).
 
 See [Authorized Use](docs/AUTHORIZED_USE.md) before using synchronization.
 
@@ -134,6 +146,12 @@ stored locally under the runtime data area. Database backups are written to
 `data/backups/` before a non-empty older schema is upgraded. Validated manual
 and candidate artwork is copied into managed runtime cover storage. These files
 are intentionally excluded from Git and are not part of a source checkout.
+
+Remediation jobs, provider-cache data, candidate snapshots, reports, apply and
+rollback manifests, generated artwork, and original-media backups are also
+private runtime data. Reports live under `data/metadata_reports/`; per-job media
+backups live under `data/backups/metadata_jobs/`. They can identify a personal
+library and must never be committed or attached publicly.
 
 Download-folder and audio-quality choices are local settings. Never paste API
 keys, private playlist details, database files, status files, or unsanitized
@@ -153,6 +171,12 @@ artist to that public service. Candidate cover retrieval happens only after the
 user selects and confirms candidate artwork. Neither request uses the YouTube
 API key or browser cookies.
 
+Library remediation is also explicit and never starts at launch. Analysis may
+send current effective title, artist, and duration to MusicBrainz, but it does
+not change effective metadata or files. Apply requires a separate confirmation;
+media writeback and rollback require additional explicit choices. No remediation
+operation starts YouTube synchronization or uses the YouTube API key.
+
 ## Developer workflow
 
 The PowerShell helpers resolve the project root and use the project-local
@@ -170,6 +194,7 @@ virtual environment:
 .\tools\dev\v1_sanity_check.ps1
 .\tools\dev\capture_ui_review.ps1
 .\tools\dev\profile_media_browsers.ps1
+.\tools\dev\remediate_library_metadata.ps1 status
 ```
 
 Run the synthetic regression suite with:
@@ -215,7 +240,11 @@ See [Architecture](docs/ARCHITECTURE.md) for the current code and data flow, and
 ## Remaining release-candidate gates
 
 - Batch 6 metadata foundation and manual correction is complete.
-- A clean, blank V1 distribution has not yet been published.
+- Batch 7 existing-library remediation is complete only when its automated,
+  packaged-sandbox, controlled-live dry-run/apply, backup, verification,
+  publication, and merge gates are all recorded as passed.
+- Batch 8 clean blank distribution is next; a clean V1 package has not yet been
+  published.
 
 Correction work and release ordering are tracked in
 [the roadmap](docs/ROADMAP.md).

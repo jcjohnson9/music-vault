@@ -27,6 +27,8 @@ PROVENANCE_PRIORITY = {
     "embedded": 40,
     "musicbrainz": 60,
     "cover_art_archive": 60,
+    "musicbrainz_high_confidence": 70,
+    "cover_art_archive_high_confidence": 70,
     "provider_confirmed": 80,
     "musicbrainz_confirmed": 90,
     "manual": 100,
@@ -281,6 +283,69 @@ class MetadataService:
             metadata_updated_at=track["metadata_updated_at"],
             fields=MappingProxyType(states),
         )
+
+    @staticmethod
+    def _matches_remediation_snapshot(
+        current: EffectiveMetadataSnapshot,
+        expected: Mapping[str, object],
+    ) -> bool:
+        """Compare the complete effective metadata state used by remediation."""
+
+        required_keys = {
+            "track_id",
+            "path",
+            "source_kind",
+            "source_video_id",
+            "source_upload_date",
+            "musicbrainz_recording_id",
+            "musicbrainz_release_id",
+            "metadata_updated_at",
+            "fields",
+        }
+        if not required_keys.issubset(expected):
+            return False
+        try:
+            expected_track_id = int(expected["track_id"])
+        except (TypeError, ValueError):
+            return False
+        if (
+            current.track_id != expected_track_id
+            or current.path != expected.get("path")
+            or current.source_kind != expected.get("source_kind")
+            or current.source_video_id != expected.get("source_video_id")
+            or current.source_upload_date != expected.get("source_upload_date")
+            or current.musicbrainz_recording_id
+            != expected.get("musicbrainz_recording_id")
+            or current.musicbrainz_release_id != expected.get("musicbrainz_release_id")
+            or current.metadata_updated_at != expected.get("metadata_updated_at")
+        ):
+            return False
+
+        raw_fields = expected.get("fields")
+        if not isinstance(raw_fields, Mapping) or set(raw_fields) != set(current.fields):
+            return False
+        required_field_keys = {
+            "value",
+            "provenance",
+            "provider_reference",
+            "confidence",
+            "is_manual",
+            "is_locked",
+        }
+        for field_name, state in current.fields.items():
+            raw_state = raw_fields.get(field_name)
+            if (
+                not isinstance(raw_state, Mapping)
+                or not required_field_keys.issubset(raw_state)
+                or state.value != raw_state.get("value")
+                or state.provenance != raw_state.get("provenance")
+                or state.provider_reference != raw_state.get("provider_reference")
+                or state.confidence != raw_state.get("confidence")
+                or state.is_manual != raw_state.get("is_manual")
+                or state.is_locked != raw_state.get("is_locked")
+            ):
+                return False
+        return True
 
     def ensure_field_states(self, track_id: int, *, commit: bool = True) -> None:
         """Persist one effective-state row for every editable metadata field."""
@@ -932,7 +997,11 @@ class MetadataService:
                 value = self._normalized_value(field_name, raw_value)
                 if value is None:
                     continue
-                reference = release_id if field_name in {"album", "release_date", "artwork"} else recording_id
+                reference = (
+                    release_id
+                    if field_name in {"album", "album_artist", "release_date", "artwork"}
+                    else recording_id
+                )
                 provider = "cover_art_archive" if field_name == "artwork" else "musicbrainz"
                 self._write_observation(
                     track_id=track_id,
@@ -975,6 +1044,166 @@ class MetadataService:
                     (_clean_optional(recording_id), _clean_optional(release_id), int(track_id)),
                 )
         after = self.snapshot(track_id)
+        return MetadataChangeResult(
+            int(track_id), group_id, frozenset(pending), before, after
+        )
+
+    def apply_high_confidence_candidate(
+        self,
+        track_id: int,
+        values: Mapping[str, object],
+        *,
+        recording_id: str | None,
+        release_id: str | None,
+        confidence: float | None,
+        artwork_path: str | None = None,
+        commit: bool = True,
+    ) -> MetadataChangeResult:
+        """Apply only unlocked fields from a strict remediation assessment.
+
+        Unlike explicit user confirmation, these changes remain editable and
+        unlocked. Manual and confirmed states are never replaced here.
+        """
+
+        before = self.snapshot(track_id)
+        track = self._track(track_id)
+        observed_at = utc_now()
+        pending: dict[str, tuple[MetadataFieldState, MetadataFieldState]] = {}
+        selected = dict(values)
+        if artwork_path is not None:
+            selected["artwork"] = artwork_path
+        protected_provenance = {
+            "manual",
+            "musicbrainz_confirmed",
+            "provider_confirmed",
+        }
+        with self._transaction(commit=commit):
+            for raw_name, raw_value in selected.items():
+                field_name = self._validate_field(raw_name)
+                value = self._normalized_value(field_name, raw_value)
+                if value is None:
+                    continue
+                old = self._state(track_id, field_name, track)
+                if old.is_locked or old.provenance in protected_provenance:
+                    continue
+                reference = (
+                    release_id
+                    if field_name in {"album", "album_artist", "release_date", "artwork"}
+                    else recording_id
+                )
+                provenance = (
+                    "cover_art_archive_high_confidence"
+                    if field_name == "artwork"
+                    else "musicbrainz_high_confidence"
+                )
+                provider = provenance
+                self._write_observation(
+                    track_id=track_id,
+                    provider=provider,
+                    field_name=field_name,
+                    value=value,
+                    provider_reference=_clean_optional(reference),
+                    confidence=confidence,
+                    observed_at=observed_at,
+                )
+                new = MetadataFieldState(
+                    field_name=field_name,
+                    value=value,
+                    provenance=provenance,
+                    provider_reference=_clean_optional(reference),
+                    confidence=confidence,
+                    is_manual=False,
+                    is_locked=False,
+                    updated_at=old.updated_at,
+                )
+                if not self._same_state(old, new):
+                    pending[field_name] = (old, new)
+            group_id = self._commit_changes(
+                track_id=track_id,
+                changes=pending,
+                actor="remediation",
+                reason="musicbrainz_high_confidence",
+            )
+            if pending:
+                self.conn.execute(
+                    """
+                    UPDATE tracks SET
+                        musicbrainz_recording_id=COALESCE(?, musicbrainz_recording_id),
+                        musicbrainz_release_id=COALESCE(?, musicbrainz_release_id)
+                    WHERE id=?
+                    """,
+                    (_clean_optional(recording_id), _clean_optional(release_id), int(track_id)),
+                )
+        after = self.snapshot(track_id)
+        return MetadataChangeResult(
+            int(track_id), group_id, frozenset(pending), before, after
+        )
+
+    def restore_remediation_snapshot(
+        self,
+        track_id: int,
+        snapshot: Mapping[str, object],
+        *,
+        expected_current_snapshot: Mapping[str, object] | None = None,
+        actor: str = "remediation_rollback",
+        reason: str = "remediation_rollback",
+        commit: bool = True,
+    ) -> MetadataChangeResult:
+        """Restore a private pre-remediation snapshot while preserving history."""
+
+        raw_fields = snapshot.get("fields")
+        if not isinstance(raw_fields, Mapping):
+            raise ValueError("A remediation snapshot requires field state.")
+        pending: dict[str, tuple[MetadataFieldState, MetadataFieldState]] = {}
+        with self._transaction(commit=commit):
+            before = self.snapshot(track_id)
+            if expected_current_snapshot is not None and not self._matches_remediation_snapshot(
+                before,
+                expected_current_snapshot,
+            ):
+                raise RuntimeError("metadata_changed_after_remediation")
+            track = self._track(track_id)
+            for raw_name, raw_state in raw_fields.items():
+                field_name = self._validate_field(str(raw_name))
+                if not isinstance(raw_state, Mapping):
+                    raise ValueError("A remediation field snapshot is invalid.")
+                old = self._state(track_id, field_name, track)
+                new = MetadataFieldState(
+                    field_name=field_name,
+                    value=self._normalized_value(field_name, raw_state.get("value")),
+                    provenance=_clean_optional(raw_state.get("provenance")) or "unknown",
+                    provider_reference=_clean_optional(raw_state.get("provider_reference")),
+                    confidence=(
+                        float(raw_state["confidence"])
+                        if raw_state.get("confidence") is not None
+                        else None
+                    ),
+                    is_manual=bool(raw_state.get("is_manual")),
+                    is_locked=bool(raw_state.get("is_locked")),
+                    updated_at=old.updated_at,
+                )
+                if not self._same_state(old, new):
+                    pending[field_name] = (old, new)
+            group_id = self._commit_changes(
+                track_id=track_id,
+                changes=pending,
+                actor=actor,
+                reason=reason,
+            )
+            self.conn.execute(
+                """
+                UPDATE tracks SET
+                    musicbrainz_recording_id=?,
+                    musicbrainz_release_id=?
+                WHERE id=?
+                """,
+                (
+                    _clean_optional(snapshot.get("musicbrainz_recording_id")),
+                    _clean_optional(snapshot.get("musicbrainz_release_id")),
+                    int(track_id),
+                ),
+            )
+            after = self.snapshot(track_id)
         return MetadataChangeResult(
             int(track_id), group_id, frozenset(pending), before, after
         )

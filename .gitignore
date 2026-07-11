@@ -49,6 +49,8 @@ data/covers/
 data/artist_images/
 data/metadata_reports/
 data/backups/
+data/backups/metadata_jobs/
+data/provider_cache/
 
 # Archived local material
 _archive/

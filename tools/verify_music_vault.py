@@ -21,11 +21,16 @@ REQUIRED_FILES = (
     "music_vault/metadata/service.py",
     "music_vault/metadata/artwork.py",
     "music_vault/metadata/musicbrainz_enricher.py",
+    "music_vault/metadata/remediation_schema.py",
+    "music_vault/metadata/matching.py",
+    "music_vault/metadata/remediation.py",
+    "music_vault/metadata/tag_writer.py",
     "music_vault/metadata/artist_images.py",
     "music_vault/ui/browser_loader.py",
     "music_vault/ui/media_grid.py",
     "music_vault/ui/metadata_editor.py",
     "music_vault/ui/metadata_tasks.py",
+    "music_vault/ui/metadata_remediation.py",
     "music_vault/ui/thumbnail_cache.py",
     "music_vault/ui/theme.py",
     "music_vault/ui/icons.py",
@@ -34,6 +39,8 @@ REQUIRED_FILES = (
     "assets/icons/music_vault.ico",
     "assets/icons/ui/README.md",
     "assets/icons/ui/artist-unknown.svg",
+    "tools/dev/remediate_library_metadata.py",
+    "tools/dev/remediate_library_metadata.ps1",
 )
 
 
@@ -69,9 +76,13 @@ def main() -> int:
     from music_vault.metadata.artist_images import ArtistImageCache, ArtistImageService
     from music_vault.metadata.artwork import CoverArtArchiveProvider, prepare_local_artwork
     from music_vault.metadata.musicbrainz_enricher import MusicBrainzProvider
+    from music_vault.metadata.matching import classify_candidates
+    from music_vault.metadata.remediation import RemediationService
+    from music_vault.metadata.tag_writer import SafeTagWriter
     from music_vault.metadata.service import MetadataService
     from music_vault.ui.metadata_editor import MetadataEditorDialog
     from music_vault.ui.metadata_tasks import MetadataTaskRunner
+    from music_vault.ui.metadata_remediation import MetadataRemediationDialog
     from music_vault.ui.review import schedule_ui_review
     from music_vault.ui.theme import application_stylesheet
     import music_vault.app as app
@@ -109,6 +120,10 @@ def main() -> int:
             prepare_local_artwork,
             MetadataEditorDialog,
             MetadataTaskRunner,
+            MetadataRemediationDialog,
+            RemediationService,
+            SafeTagWriter,
+            classify_candidates,
         )
     ):
         print("Music Vault media-browser components are unavailable.")
@@ -122,6 +137,8 @@ def main() -> int:
         "config": paths.config_path(),
         "status": paths.app_status_path(),
         "artist images": paths.artist_images_dir(),
+        "metadata reports": paths.metadata_reports_dir(),
+        "metadata job backups": paths.metadata_job_backups_dir(),
     }
 
     if resolved_paths["project root"] != PROJECT_ROOT:
@@ -134,6 +151,11 @@ def main() -> int:
 
     for name in ("database", "config", "status", "artist images"):
         if resolved_paths[name].parent != expected_data_dir:
+            print(f"{name.title()} path is outside the data directory: {resolved_paths[name]}")
+            return 1
+
+    for name in ("metadata reports", "metadata job backups"):
+        if not resolved_paths[name].is_relative_to(expected_data_dir):
             print(f"{name.title()} path is outside the data directory: {resolved_paths[name]}")
             return 1
 
