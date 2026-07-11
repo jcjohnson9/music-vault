@@ -7,17 +7,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Added schema-versioned, additive SQLite migration with backup-before-change.
-- Separated YouTube source upload dates from canonical release years.
-- Added one typed sync result shared by the engine, UI, log, and App Status.
-- Added structured failed-item tracking, retry, resolution, and legacy-file import.
-- Reconciled archive history against valid database and local-file identity.
-- Removed silent Firefox, Chrome, and Edge cookie access from synchronization.
+- Added additive SQLite schema version 2 with an automatic database backup
+  before migration.
+- Separated YouTube source upload dates from canonical release years and safely
+  cleared unverified YouTube-derived canonical years.
+- Added one typed sync result shared by the engine, UI, log, and App Status,
+  with truthful `complete`, `complete_with_issues`, and `failed` outcomes.
+- Added structured failed-item tracking, retry, resolution, and legacy-file
+  compatibility import.
+- Made valid database/file identity authoritative over stale archive history.
+- Standardized anonymous public/unlisted extraction and removed silent Firefox,
+  Chrome, and Edge cookie probing.
 - Added centralized secret redaction and Windows-safe playlist output paths.
 - Changed Downloaded identity from folder-name matching to `source_kind`.
 - Added visible non-blocking playback errors while preserving queue ordering.
-- Renamed active Watchtower wording to neutral App Status wording while retaining
-  a compatibility import shim and the existing status filename/schema.
+- Standardized user-facing status terminology as neutral App Status while
+  retaining the compatibility import shim and existing status filename/schema.
 - Added explicit confirmation and confidence display before MusicBrainz changes.
 - Added synthetic pytest coverage for migrations, sync truth, safety, and identity.
 
