@@ -196,6 +196,10 @@ class FirstRunWizard(QWizard):
         parent=None,
     ) -> None:
         super().__init__(parent)
+        # Windows defaults QWizard to its native Aero surface, which can keep a
+        # white page behind the application's light-on-dark text.  ClassicStyle
+        # consistently honors the shared Qt stylesheet across supported hosts.
+        self.setWizardStyle(QWizard.WizardStyle.ClassicStyle)
         self.setObjectName("FirstRunWizard")
         self.setWindowTitle(f"Welcome to Music Vault {DISPLAY_VERSION}")
         self.setStyleSheet(

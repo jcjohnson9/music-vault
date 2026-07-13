@@ -221,6 +221,14 @@ def test_authorization_acknowledgement_gates_sync_but_not_local_import(tmp_path,
         wizard.close()
 
 
+def test_first_run_wizard_uses_stylesheet_compatible_classic_surface(tmp_path, qapp):
+    wizard = _wizard(tmp_path, qapp)
+    try:
+        assert wizard.wizardStyle() == QWizard.WizardStyle.ClassicStyle
+    finally:
+        wizard.close()
+
+
 def test_local_only_result_allows_no_api_key_or_ffmpeg_and_persists_quality(
     tmp_path, qapp
 ):
