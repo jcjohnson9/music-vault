@@ -233,7 +233,7 @@ def test_native_scanner_distinguishes_qt_markers_from_real_private_data(
     private_key_header = b"-----BEGIN " + b"PRIVATE KEY-----"
     qt_binary = tmp_path / "Qt6Network.dll"
     qt_binary.write_bytes(
-        b"MZ" + rb"C:\Users\qt\work\qtbase" + private_key_header
+        b"MZ" + b"C:\\Users\\" + b"qt\\work\\qtbase" + private_key_header
     )
     assert release_common.scan_sensitive_bytes(qt_binary) == []
 
@@ -257,6 +257,28 @@ def test_base_library_archive_is_scanned_after_decompression(tmp_path: Path) -> 
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("types.pyc", b"AIza" + b"A" * 35)
     assert "likely Google API key" in release_common.scan_sensitive_bytes(archive_path)
+
+
+def test_source_compliance_scanner_reports_personal_path_without_crashing(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / f"MusicVault-v{APP_VERSION}-Source-Compliance"
+    source_root.mkdir()
+    (source_root / "note.txt").write_bytes(
+        b"C:\\Users\\" + b"private\\Music"
+    )
+    archive = tmp_path / release_common.COMPLIANCE_FILENAME
+    release_common.deterministic_zip(source_root, archive, prefix=source_root.name)
+    archive.with_name(archive.name + ".sha256").write_text(
+        f"{release_common.sha256_file(archive)}  {archive.name}\n",
+        encoding="ascii",
+    )
+
+    findings = verifier.verify_source_compliance(archive)
+    assert any(
+        finding.path == "note.txt" and finding.rule == "personal absolute path"
+        for finding in findings
+    )
 
 
 def test_zip_entries_are_sorted_relative_and_unique(synthetic_release: dict[str, Path]) -> None:
@@ -390,7 +412,9 @@ def test_verifier_rejects_private_or_unexpected_injections(
     elif mutation == "api-key":
         (root / "note.txt").write_text("AIza" + "A" * 35, encoding="utf-8")
     elif mutation == "personal-path":
-        (root / "note.txt").write_text(r"C:\Users\private\Music", encoding="utf-8")
+        (root / "note.txt").write_text(
+            "C:\\Users\\" + "private\\Music", encoding="utf-8"
+        )
     else:
         (root / "ffmpeg.exe").write_bytes(b"cli")
     findings = verifier.verify_directory(root)

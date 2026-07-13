@@ -477,10 +477,6 @@ def verify_source_compliance(
             if item.suffix.casefold() in {".exe", ".dll", ".pyd", ".pyc", ".pyo", ".mp3", ".flac", ".m4a", ".wav", ".webm"}:
                 findings.append(Finding(relative, "binary/runtime content in source artifact", "compliance"))
             for issue in scan_sensitive_bytes(item):
-                if issue == "personal absolute path":
-                    data = item.read_bytes().casefold()
-                    if b"c:\\users\\jerjo" not in data and b"c:/users/jerjo" not in data:
-                        continue
                 findings.append(Finding(relative, issue, "compliance safety"))
 
         manifest_path = root / "source-compliance-manifest.json"
