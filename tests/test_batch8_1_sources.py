@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tarfile
 import urllib.error
 from pathlib import Path
@@ -20,6 +21,39 @@ REAL_DNS_VALIDATOR = sources._validate_public_dns
 @pytest.fixture(autouse=True)
 def no_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sources, "_validate_public_dns", lambda _host: None)
+
+
+def isolate_temp_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    standard_root: Path,
+) -> None:
+    standard_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(sources.tempfile, "gettempdir", lambda: str(standard_root))
+    for name in ("TEMP", "TMP", "TMPDIR", "RUNNER_TEMP", "GITHUB_ACTIONS"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def patch_canonical_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    alias_root: Path,
+    canonical_root: Path,
+) -> None:
+    original_realpath = sources.os.path.realpath
+    alias_key = sources._comparison_path(alias_root)
+
+    def alias_aware_realpath(value: str | bytes | os.PathLike[str]) -> str:
+        absolute = sources._comparison_path(
+            sources._absolute_release_path(os.fspath(value))
+        )
+        if absolute == alias_key or sources._path_is_within(
+            Path(absolute), Path(alias_key)
+        ):
+            relative = os.path.relpath(absolute, alias_key)
+            mapped = canonical_root if relative == os.curdir else canonical_root / relative
+            return original_realpath(os.fspath(mapped))
+        return original_realpath(value)
+
+    monkeypatch.setattr(sources.os.path, "realpath", alias_aware_realpath)
 
 
 class FakeResponse:
@@ -598,3 +632,352 @@ def test_21_redirect_dns_is_validated_before_urllib_follows_it(
             {},
             "https://allowed.example/source.tar.gz?temporary=signature",
         )
+
+
+def test_22_real_pytest_tmp_path_is_an_approved_cache_root(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    result = sources._prepare_cache(cache)
+    assert sources._comparison_path(result) == sources._comparison_path(cache.resolve())
+
+
+def test_23_cache_below_stdlib_temp_root_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_root = tmp_path / "stdlib-temp"
+    isolate_temp_roots(monkeypatch, standard_root)
+    cache = standard_root / "cache"
+    result = sources._prepare_cache(cache)
+    assert sources._comparison_path(result) == sources._comparison_path(cache.resolve())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path-case semantics")
+def test_24_windows_case_differences_are_canonicalized(tmp_path: Path) -> None:
+    cache = tmp_path / "Case-Different-Cache"
+    alternate_case = Path(str(cache).swapcase())
+    result = sources._prepare_cache(alternate_case)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(cache)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows separator semantics")
+def test_25_windows_separator_variants_are_equivalent(tmp_path: Path) -> None:
+    cache = tmp_path / "separator-cache"
+    forward_slashes = Path(str(cache).replace("\\", "/"))
+    result = sources._prepare_cache(forward_slashes)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(cache)
+
+
+def test_26_resolved_pytest_path_matches_unresolved_temp_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_root = tmp_path / "long-temp-root"
+    long_root.mkdir()
+    alias_root = tmp_path / "RUNNER~1"
+    isolate_temp_roots(monkeypatch, long_root)
+    monkeypatch.setattr(sources.tempfile, "gettempdir", lambda: str(alias_root))
+    patch_canonical_alias(monkeypatch, alias_root, long_root)
+    cache = long_root / "pytest-cache"
+    result = sources._prepare_cache(cache)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(cache)
+
+
+def test_26_inverse_temp_alias_is_accepted_without_trusting_reparse_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_root = tmp_path / "long-temp-root"
+    long_root.mkdir()
+    alias_root = tmp_path / "RUNNER~1"
+    alias_root.mkdir()
+    isolate_temp_roots(monkeypatch, long_root)
+    patch_canonical_alias(monkeypatch, alias_root, long_root)
+    cache = alias_root / "pytest-cache"
+    result = sources._prepare_cache(cache)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(
+        long_root / "pytest-cache"
+    )
+
+
+def test_26_reparse_alias_cannot_become_an_approved_temp_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_root = tmp_path / "long-temp-root"
+    long_root.mkdir()
+    alias_root = tmp_path / "linked-temp-root"
+    alias_root.mkdir()
+    isolate_temp_roots(monkeypatch, long_root)
+    patch_canonical_alias(monkeypatch, alias_root, long_root)
+    original = sources.is_reparse_or_link
+    alias_key = sources._comparison_path(alias_root)
+    monkeypatch.setattr(
+        sources,
+        "is_reparse_or_link",
+        lambda path: sources._comparison_path(path) == alias_key or original(path),
+    )
+    cache = alias_root / "cache"
+    with pytest.raises(ReleaseError, match="approved operating-system temp"):
+        sources._prepare_cache(cache)
+    assert not cache.exists()
+
+
+@pytest.mark.parametrize("environment_name", ["TEMP", "TMP", "TMPDIR"])
+def test_27_environment_temp_roots_are_accepted_after_canonicalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
+) -> None:
+    standard_root = tmp_path / "stdlib-temp"
+    environment_root = tmp_path / f"{environment_name.casefold()}-root"
+    environment_root.mkdir()
+    isolate_temp_roots(monkeypatch, standard_root)
+    monkeypatch.setenv(environment_name, str(environment_root))
+    cache = environment_root / "cache"
+    result = sources._prepare_cache(cache)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(cache)
+
+
+def test_28_runner_temp_is_accepted_only_in_github_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_root = tmp_path / "stdlib-temp"
+    runner_root = tmp_path / "runner-temp"
+    runner_root.mkdir()
+    isolate_temp_roots(monkeypatch, standard_root)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_root))
+    cache = runner_root / "cache"
+    result = sources._prepare_cache(cache)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(cache)
+
+
+def test_29_runner_temp_is_not_trusted_outside_github_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_root = tmp_path / "stdlib-temp"
+    runner_root = tmp_path / "runner-temp"
+    runner_root.mkdir()
+    isolate_temp_roots(monkeypatch, standard_root)
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_root))
+    cache = runner_root / "cache"
+    with pytest.raises(ReleaseError, match="approved operating-system temp"):
+        sources._prepare_cache(cache)
+    assert not cache.exists()
+
+
+def test_30_duplicate_temp_aliases_are_deduplicated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_root = tmp_path / "long-temp-root"
+    long_root.mkdir()
+    alias_root = tmp_path / "RUNNER~1"
+    isolate_temp_roots(monkeypatch, long_root)
+    monkeypatch.setattr(sources.tempfile, "gettempdir", lambda: str(alias_root))
+    monkeypatch.setenv("TEMP", str(long_root))
+    patch_canonical_alias(monkeypatch, alias_root, long_root)
+    records = sources._approved_temp_root_records()
+    assert len(records) == 1
+    assert len(records[0][1]) == 2
+
+
+def test_31_most_specific_matching_temp_root_is_selected(tmp_path: Path) -> None:
+    outer = sources._canonicalize_release_path(tmp_path)
+    inner = sources._canonicalize_release_path(tmp_path / "nested")
+    cache = sources._canonicalize_release_path(tmp_path / "nested" / "cache")
+    selected = sources._select_cache_boundary(cache, [outer, inner])
+    assert selected == inner
+
+
+def test_32_component_containment_rejects_sibling_prefix(tmp_path: Path) -> None:
+    approved = sources._canonicalize_release_path(tmp_path / "Temp")
+    sibling = sources._canonicalize_release_path(tmp_path / "TempEvil" / "cache")
+    assert not sources._path_is_within(sibling, approved)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive semantics")
+def test_33_different_windows_drive_is_rejected_without_crashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_root = tmp_path / "stdlib-temp"
+    isolate_temp_roots(monkeypatch, standard_root)
+    current_drive = tmp_path.drive.casefold()
+    other_drive = "Z:" if current_drive != "z:" else "Y:"
+    cache = Path(f"{other_drive}\\MusicVaultBatch84\\cache")
+    with pytest.raises(ReleaseError, match="approved operating-system temp"):
+        sources._prepare_cache(cache)
+    assert not cache.exists()
+
+
+def test_34_relative_parent_traversal_cannot_escape_release_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(PROJECT_ROOT)
+    target = PROJECT_ROOT / "data" / "batch8_4_parent_escape_cache"
+    with pytest.raises(ReleaseError, match="ignored release_artifacts"):
+        sources._prepare_cache(
+            Path("release_artifacts") / ".." / "data" / target.name
+        )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "cache",
+    [
+        PROJECT_ROOT / "tests" / "test_batch8_1_sources.py",
+        PROJECT_ROOT / "batch8_4_unignored_cache",
+    ],
+    ids=["tracked", "unignored"],
+)
+def test_35_tracked_and_unignored_repository_caches_remain_rejected(cache: Path) -> None:
+    with pytest.raises(ReleaseError, match="ignored release_artifacts"):
+        sources._prepare_cache(cache)
+    if cache.name == "batch8_4_unignored_cache":
+        assert not cache.exists()
+
+
+def test_36_release_artifacts_cache_must_be_ignored_and_untracked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_project = tmp_path / "fake-project"
+    fake_project.mkdir()
+    isolate_temp_roots(monkeypatch, tmp_path / "stdlib-temp")
+    monkeypatch.setattr(sources, "PROJECT_ROOT", fake_project)
+    monkeypatch.setattr(sources, "_git_cache_is_ignored_and_untracked", lambda _relative: False)
+    cache = fake_project / "release_artifacts" / "cache"
+    with pytest.raises(ReleaseError, match="ignored and untracked"):
+        sources._prepare_cache(cache)
+    assert not cache.exists()
+
+
+def test_37_ignored_untracked_release_artifacts_cache_remains_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_project = tmp_path / "fake-project"
+    fake_project.mkdir()
+    isolate_temp_roots(monkeypatch, tmp_path / "stdlib-temp")
+    monkeypatch.setattr(sources, "PROJECT_ROOT", fake_project)
+    monkeypatch.setattr(sources, "_git_cache_is_ignored_and_untracked", lambda _relative: True)
+    cache = fake_project / "release_artifacts" / "cache"
+    result = sources._prepare_cache(cache)
+    assert sources._canonicalize_release_path(result) == sources._canonicalize_release_path(cache)
+
+
+def test_38_intermediate_reparse_cache_component_remains_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe_parent = tmp_path / "unsafe-parent"
+    unsafe_parent.mkdir()
+    cache = unsafe_parent / "cache"
+    original = sources.is_reparse_or_link
+    unsafe_key = sources._comparison_path(unsafe_parent)
+    monkeypatch.setattr(
+        sources,
+        "is_reparse_or_link",
+        lambda path: sources._comparison_path(path) == unsafe_key or original(path),
+    )
+    with pytest.raises(ReleaseError, match="symlink or reparse"):
+        sources._prepare_cache(cache)
+    assert not cache.exists()
+
+
+def test_39_post_creation_canonical_resolution_escape_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved = tmp_path / "approved-temp"
+    approved.mkdir()
+    outside = tmp_path / "outside"
+    isolate_temp_roots(monkeypatch, approved)
+    cache = approved / "cache"
+    escaped = outside / "cache"
+    original_realpath = sources.os.path.realpath
+    cache_key = sources._comparison_path(cache)
+
+    def escaping_realpath(value: str | bytes | os.PathLike[str]) -> str:
+        absolute = sources._comparison_path(sources._absolute_release_path(os.fspath(value)))
+        if absolute == cache_key and cache.exists():
+            return os.fspath(escaped)
+        return original_realpath(value)
+
+    monkeypatch.setattr(sources.os.path, "realpath", escaping_realpath)
+    with pytest.raises(ReleaseError, match="escaped its approved boundary"):
+        sources._prepare_cache(cache)
+    assert cache.is_dir()
+    assert not escaped.exists()
+
+
+def test_40_repository_cache_cannot_resolve_outside_release_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_project = tmp_path / "fake-project"
+    fake_project.mkdir()
+    isolate_temp_roots(monkeypatch, tmp_path / "stdlib-temp")
+    monkeypatch.setattr(sources, "PROJECT_ROOT", fake_project)
+    monkeypatch.setattr(sources, "_git_cache_is_ignored_and_untracked", lambda _relative: True)
+    cache = fake_project / "release_artifacts" / "cache"
+    escaped = fake_project / "data" / "cache"
+    original_realpath = sources.os.path.realpath
+    cache_key = sources._comparison_path(cache)
+
+    def escaping_realpath(value: str | bytes | os.PathLike[str]) -> str:
+        absolute = sources._comparison_path(sources._absolute_release_path(os.fspath(value)))
+        if absolute == cache_key and cache.exists():
+            return os.fspath(escaped)
+        return original_realpath(value)
+
+    monkeypatch.setattr(sources.os.path, "realpath", escaping_realpath)
+    with pytest.raises(ReleaseError, match="escaped its approved boundary"):
+        sources._prepare_cache(cache)
+    assert not escaped.exists()
+
+
+def test_41_cache_entries_still_reject_links_or_reparse_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = tmp_path / "cache" / "source.tar.gz"
+    entry.parent.mkdir()
+    entry.write_bytes(b"synthetic")
+    monkeypatch.setattr(sources, "is_reparse_or_link", lambda path: path == entry)
+    with pytest.raises(ReleaseError, match="link or reparse point"):
+        sources._validate_cache_entry(entry)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX containment semantics")
+def test_42_posix_temp_containment_remains_component_aware(tmp_path: Path) -> None:
+    approved = sources._canonicalize_release_path(tmp_path / "temp")
+    child = sources._canonicalize_release_path(tmp_path / "temp" / "cache")
+    sibling = sources._canonicalize_release_path(tmp_path / "temp-evil" / "cache")
+    assert sources._path_is_within(child, approved)
+    assert not sources._path_is_within(sibling, approved)
+
+
+def test_43_relative_or_empty_environment_temp_roots_are_ignored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    standard_root = tmp_path / "stdlib-temp"
+    isolate_temp_roots(monkeypatch, standard_root)
+    monkeypatch.setenv("TEMP", "")
+    monkeypatch.setenv("TMP", "relative-temp")
+    roots = sources._approved_temp_roots()
+    assert roots == (sources._canonicalize_release_path(standard_root),)
+
+
+def test_44_current_working_directory_cannot_be_the_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ReleaseError, match="current working directory"):
+        sources._prepare_cache(Path.cwd())
