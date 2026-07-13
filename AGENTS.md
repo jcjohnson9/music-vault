@@ -19,6 +19,10 @@
   is `dist\MusicVault\MusicVault.exe`; an isolated alternate build does not
   count when the normal desktop target is stale.
 - Never merge a feature branch before all required automated gates pass.
+- Treat every pushed release tag as immutable. A corrective release must build
+  application code from the original tag, identify later release tooling as
+  separate provenance, and must never delete, move, recreate, or force-update
+  the tag.
 - Never commit runtime or private data.
 - Never run a real YouTube sync unless a future batch explicitly authorizes it.
 - Preserve the existing working queue behavior unless a batch explicitly

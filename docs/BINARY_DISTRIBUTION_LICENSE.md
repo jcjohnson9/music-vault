@@ -43,6 +43,28 @@ commit rather than from an unchecked working tree.
 The one-folder form deliberately keeps the LGPL DLLs outside the executable;
 the compliance instructions describe replacement and rebuilding.
 
+The corrective v1.0.0 publication keeps application source and build inputs at
+the existing annotated `v1.0.0` tag. Later release tooling may fetch and verify
+the corresponding-source set, so the release manifest records the tagged
+application commit and release-tooling commit separately. In particular, zlib
+1.3.1 is identified by the official versioned fossil archive at
+`https://zlib.net/fossils/zlib-1.3.1.tar.gz`, SHA-256
+`9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23`.
+The retrieval gate validates its transport metadata, gzip/tar structure, safe
+member paths and links, `zlib-1.3.1` root, required source and license files,
+and internal version declaration. An offline source cache never bypasses those
+checks.
+
+The first automated publication attempt failed closed because the bytes
+returned for that source did not match the established pin. The same official
+fossil currently matches the documented size and hash, so the pin itself was
+not replaced. The former one-shot downloader retained neither the received
+digest nor final response metadata; consequently, the historical transport
+subtype (for example, an incomplete or intermediary response) cannot be
+distinguished after the fact. The corrective downloader emits sanitized
+mismatch diagnostics, retries the fossil within fixed bounds, and permits only
+an equally verified official upstream fallback that yields identical bytes.
+
 The Microsoft Visual C++ runtime DLLs are treated as Windows compiler/runtime
 System Libraries under GPL section 1 and remain subject to Microsoft's own
 redistribution terms; they are not represented as open-source components.

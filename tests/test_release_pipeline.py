@@ -32,7 +32,7 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
         )
         return archive, checksum
 
-    def release_documents(portable_root: Path) -> None:
+    def release_documents(portable_root: Path, *_args) -> None:
         documents = {
             "README_FIRST_RUN.md": "Synthetic first-run guide\n",
             "LICENSE": "MIT License\n",
@@ -56,7 +56,7 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
     monkeypatch.setattr(
         builder,
         "_verified_build_environment",
-        lambda: {
+        lambda *_args: {
             "python": "3.11.9",
             "python_implementation": "CPython",
             "openssl": "OpenSSL 3.0.13 synthetic",
@@ -66,8 +66,22 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
         },
     )
 
+    inventory_path = (
+        release_common.PROJECT_ROOT
+        / release_common.RELEASE_LICENSE_INVENTORY_PATH
+    )
+    inventory_blob = release_common.git_blob_sha1_file(inventory_path)
+
     def git_value(*args: str) -> str:
         value = args[-1]
+        if args[:2] == ("cat-file", "-t"):
+            return "tag" if str(value).startswith("refs/tags/") else "blob"
+        if args[0] == "hash-object":
+            return inventory_blob
+        if str(value).endswith(release_common.RELEASE_LICENSE_INVENTORY_PATH):
+            return inventory_blob
+        if value == f"refs/tags/v{APP_VERSION}":
+            return "a" * 40
         if value.endswith("^{tree}"):
             return "c" * 40
         if value.endswith("^{commit}"):
@@ -96,6 +110,7 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
     monkeypatch.setattr(verifier, "verify_source_compliance", lambda *args, **kwargs: [])
     monkeypatch.setattr(verifier, "verify_license_inventory", lambda *args, **kwargs: [])
     monkeypatch.setattr(verifier, "missing_embedded_artifact_mappings", lambda *args: [])
+    monkeypatch.setattr(verifier, "git_value", git_value)
     extract = tmp_path / "extracted"
     extract.mkdir()
     root = verifier.safe_extract(Path(result["portable_zip"]), extract)

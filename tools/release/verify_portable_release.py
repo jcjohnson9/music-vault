@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -18,10 +19,13 @@ try:
         PACKAGE_DIRECTORY,
         PORTABLE_MARKER,
         PROJECT_ROOT,
+        RELEASE_LICENSE_INVENTORY_PATH,
         ReleaseError,
         canonical_payload_hash,
         exact_requirements,
+        git_tree_entries_at,
         git_value,
+        is_reparse_or_link,
         load_license_inventory,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
@@ -38,10 +42,13 @@ except ImportError:  # Direct script execution.
         PACKAGE_DIRECTORY,
         PORTABLE_MARKER,
         PROJECT_ROOT,
+        RELEASE_LICENSE_INVENTORY_PATH,
         ReleaseError,
         canonical_payload_hash,
         exact_requirements,
+        git_tree_entries_at,
         git_value,
+        is_reparse_or_link,
         load_license_inventory,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
@@ -75,6 +82,245 @@ class Finding:
 
     def render(self) -> str:
         return f"{self.path}: {self.rule} [{self.category}]"
+
+
+PROVENANCE_KEYS = (
+    "source_tag",
+    "source_tag_object",
+    "source_commit",
+    "source_tree_hash",
+    "release_tooling_commit",
+    "release_tooling_tree_hash",
+    "release_license_inventory_git_blob",
+)
+
+
+def verify_provenance_fields(
+    manifest: dict[str, object], path: str
+) -> list[Finding]:
+    findings: list[Finding] = []
+    if manifest.get("manifest_schema_version") != 2:
+        findings.append(Finding(path, "dual-provenance manifest schema mismatch", "provenance"))
+    if manifest.get("source_tag") != f"v{APP_VERSION}":
+        findings.append(Finding(path, "source tag does not match product version", "provenance"))
+    for key in PROVENANCE_KEYS[1:]:
+        if not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get(key) or "")):
+            findings.append(Finding(path, f"{key} is not an exact SHA-1", "provenance"))
+    return findings
+
+
+def verify_release_inventory_anchor(
+    manifest: dict[str, object], inventory_path: Path, display_path: str
+) -> list[Finding]:
+    findings: list[Finding] = []
+    inventory_hash = str(manifest.get("release_license_inventory_sha256") or "")
+    inventory_blob = str(manifest.get("release_license_inventory_git_blob") or "")
+    tooling_commit = str(manifest.get("release_tooling_commit") or "")
+    valid_hash = re.fullmatch(r"[0-9a-f]{64}", inventory_hash) is not None
+    valid_blob = re.fullmatch(r"[0-9a-f]{40}", inventory_blob) is not None
+    valid_commit = re.fullmatch(r"[0-9a-f]{40}", tooling_commit) is not None
+    if not valid_hash:
+        findings.append(Finding(
+            display_path,
+            "corrected release license inventory hash is invalid",
+            "provenance",
+        ))
+    if not valid_blob:
+        findings.append(Finding(
+            display_path,
+            "corrected release license inventory Git blob is invalid",
+            "provenance",
+        ))
+    if not inventory_path.is_file() or is_reparse_or_link(inventory_path):
+        findings.append(Finding(
+            display_path,
+            "corrected release license inventory is absent or unsafe",
+            "provenance",
+        ))
+        return findings
+    if valid_hash and sha256_file(inventory_path) != inventory_hash:
+        findings.append(Finding(
+            display_path,
+            "corrected release license inventory hash mismatch",
+            "provenance",
+        ))
+    if valid_blob:
+        try:
+            packaged_blob = git_value(
+                "hash-object",
+                f"--path={RELEASE_LICENSE_INVENTORY_PATH}",
+                "--",
+                str(inventory_path.resolve()),
+            )
+        except ReleaseError:
+            findings.append(Finding(
+                display_path,
+                "packaged release inventory blob could not be canonicalized",
+                "provenance",
+            ))
+        else:
+            if packaged_blob != inventory_blob:
+                findings.append(Finding(
+                    display_path,
+                    "corrected release license inventory blob mismatch",
+                    "provenance",
+                ))
+    if valid_blob and valid_commit:
+        object_expression = f"{tooling_commit}:{RELEASE_LICENSE_INVENTORY_PATH}"
+        try:
+            if git_value("cat-file", "-t", object_expression) != "blob":
+                findings.append(Finding(
+                    display_path,
+                    "release tooling commit inventory object is not a blob",
+                    "provenance",
+                ))
+            elif git_value("rev-parse", object_expression) != inventory_blob:
+                findings.append(Finding(
+                    display_path,
+                    "inventory blob does not belong to the release tooling commit",
+                    "provenance",
+                ))
+        except ReleaseError:
+            findings.append(Finding(
+                display_path,
+                "release tooling inventory blob is unavailable for verification",
+                "provenance",
+            ))
+    return findings
+
+
+def _export_expected_source_snapshot(source_commit: str, destination: Path) -> Path:
+    archive_path = destination.parent / "expected-tagged-source.zip"
+    command = [
+        "git",
+        "-c",
+        f"safe.directory={PROJECT_ROOT.resolve().as_posix()}",
+        "archive",
+        "--format=zip",
+        "--prefix=expected-tagged-source/",
+        f"--output={archive_path}",
+        source_commit,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if completed.returncode:
+        raise ReleaseError("Exact tagged source archive could not be reconstructed.")
+    return safe_extract(archive_path, destination)
+
+
+def verify_tagged_source_snapshot(source_root: Path, source_commit: str) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        entries = git_tree_entries_at(PROJECT_ROOT, source_commit)
+    except ReleaseError:
+        return [Finding(
+            "source-snapshot.json",
+            "tagged Git tree is unavailable for exact source comparison",
+            "provenance",
+        )]
+    with tempfile.TemporaryDirectory(prefix="MusicVault_Tagged_Source_Verify_") as temp:
+        try:
+            expected_root = _export_expected_source_snapshot(
+                source_commit, Path(temp) / "extract"
+            )
+        except ReleaseError:
+            return findings + [Finding(
+                "source-snapshot.json",
+                "tagged Git source bytes are unavailable for exact comparison",
+                "provenance",
+            )]
+        seen: set[str] = set()
+        for mode, kind, object_id, raw_relative in entries:
+            try:
+                relative = validate_zip_name(raw_relative).as_posix()
+            except ReleaseError:
+                findings.append(Finding(
+                    "source-snapshot.json",
+                    "tagged Git tree contains an unsafe path",
+                    "provenance",
+                ))
+                continue
+            folded = unicodedata.normalize("NFC", relative).casefold()
+            if folded in seen:
+                findings.append(Finding(
+                    relative,
+                    "tagged Git tree contains a conflicting path",
+                    "provenance",
+                ))
+                continue
+            seen.add(folded)
+            if mode == "160000" or kind == "commit":
+                findings.append(Finding(
+                    relative,
+                    "tagged Git tree contains an unsupported gitlink",
+                    "provenance",
+                ))
+                continue
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                findings.append(Finding(
+                    relative,
+                    "tagged Git tree contains an unsupported tracked entry",
+                    "provenance",
+                ))
+                continue
+            if not re.fullmatch(r"[0-9a-f]{40}", object_id):
+                findings.append(Finding(
+                    relative,
+                    "tagged Git tree blob identity is invalid",
+                    "provenance",
+                ))
+                continue
+            parts = PurePosixPath(relative).parts
+            target = source_root.joinpath(*parts)
+            expected = expected_root.joinpath(*parts)
+            if (
+                not target.is_file()
+                or is_reparse_or_link(target)
+                or not expected.is_file()
+                or is_reparse_or_link(expected)
+            ):
+                findings.append(Finding(
+                    relative,
+                    "tagged tracked source blob is missing or unsafe",
+                    "provenance",
+                ))
+            elif (
+                target.stat().st_size != expected.stat().st_size
+                or sha256_file(target) != sha256_file(expected)
+            ):
+                findings.append(Finding(
+                    relative,
+                    "tagged tracked source blob does not match the Git tree",
+                    "provenance",
+                ))
+    return findings
+
+
+def verify_corresponding_source_semantics(
+    source_root: Path, inventory_path: Path
+) -> tuple[list[dict[str, object]], list[Finding]]:
+    try:
+        from .fetch_compliance_sources import fetch_sources
+    except ImportError:  # Direct script execution.
+        from fetch_compliance_sources import fetch_sources
+    try:
+        rows = fetch_sources(
+            source_root / "third-party-sources",
+            True,
+            inventory_path,
+        )
+    except (OSError, ReleaseError, ValueError, json.JSONDecodeError):
+        return [], [Finding(
+            "third-party-sources",
+            "corresponding-source semantic validation failed",
+            "licensing",
+        )]
+    return rows, []
 
 
 def inspect_zip_structure(path: Path) -> None:
@@ -294,13 +540,15 @@ def verify_directory(root: Path) -> list[Finding]:
     manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
     if manifest.get("version") != APP_VERSION:
         findings.append(Finding("release-manifest.json", "product version mismatch", "version"))
+    findings.extend(verify_provenance_fields(manifest, "release-manifest.json"))
+    findings.extend(verify_release_inventory_anchor(
+        manifest,
+        root / "licenses/third_party_licenses.json",
+        "licenses/third_party_licenses.json",
+    ))
     for key in ("ffmpeg_bundled", "api_credentials_bundled", "runtime_data_bundled"):
         if manifest.get(key) is not False:
             findings.append(Finding("release-manifest.json", f"{key} must be false", "manifest"))
-    if not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("source_commit") or "")):
-        findings.append(Finding("release-manifest.json", "source commit is not an exact SHA-1", "provenance"))
-    if not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("source_tree_hash") or "")):
-        findings.append(Finding("release-manifest.json", "source tree is not an exact SHA-1", "provenance"))
     environment = manifest.get("build_environment")
     if not isinstance(environment, dict):
         findings.append(Finding("release-manifest.json", "verified build environment is absent", "provenance"))
@@ -460,6 +708,7 @@ def verify_source_compliance(
             "music_vault/version.py", "SOURCE_COMPLIANCE_README.md",
             "source-snapshot.json", "source-compliance-manifest.json",
             "tools/release/third_party_licenses.json",
+            "release-tooling/third_party_licenses.json",
         }
         for relative in sorted(required - existing):
             findings.append(Finding(relative, "required corresponding source input is absent", "compliance"))
@@ -484,6 +733,15 @@ def verify_source_compliance(
         if manifest_path.is_file() and snapshot_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            findings.extend(
+                verify_provenance_fields(manifest, "source-compliance-manifest.json")
+            )
+            if snapshot.get("schema_version") != 2:
+                findings.append(Finding(
+                    "source-snapshot.json",
+                    "dual-provenance snapshot schema mismatch",
+                    "provenance",
+                ))
             records = manifest.get("files")
             if not isinstance(records, list):
                 findings.append(Finding("source-compliance-manifest.json", "file inventory is absent", "compliance"))
@@ -515,26 +773,57 @@ def verify_source_compliance(
                 findings.append(Finding("source-compliance-manifest.json", "source payload hash mismatch", "compliance"))
             if manifest.get("file_count") != len(existing):
                 findings.append(Finding("source-compliance-manifest.json", "source file count mismatch", "compliance"))
-            for key in ("source_commit", "source_tree_hash"):
+            for key in PROVENANCE_KEYS:
                 if manifest.get(key) != snapshot.get(key):
                     findings.append(Finding("source-snapshot.json", f"{key} disagrees with compliance manifest", "compliance"))
                 if expected_release_manifest and manifest.get(key) != expected_release_manifest.get(key):
                     findings.append(Finding("source-compliance-manifest.json", f"{key} disagrees with portable manifest", "provenance"))
+            inventory_hash = str(manifest.get("release_license_inventory_sha256") or "")
+            if snapshot.get("release_license_inventory_sha256") != inventory_hash:
+                findings.append(Finding("source-snapshot.json", "license inventory hash disagrees with compliance manifest", "provenance"))
+            if expected_release_manifest and expected_release_manifest.get("release_license_inventory_sha256") != inventory_hash:
+                findings.append(Finding("source-compliance-manifest.json", "license inventory hash disagrees with portable manifest", "provenance"))
+            tooling_inventory = root / "release-tooling" / "third_party_licenses.json"
+            findings.extend(verify_release_inventory_anchor(
+                manifest,
+                tooling_inventory,
+                "release-tooling/third_party_licenses.json",
+            ))
+            source_tag = str(manifest.get("source_tag") or "")
+            tag_object = str(manifest.get("source_tag_object") or "")
             commit = str(manifest.get("source_commit") or "")
             tree = str(manifest.get("source_tree_hash") or "")
-            if not re.fullmatch(r"[0-9a-f]{40}", commit) or not re.fullmatch(r"[0-9a-f]{40}", tree):
+            tooling_commit = str(manifest.get("release_tooling_commit") or "")
+            tooling_tree = str(manifest.get("release_tooling_tree_hash") or "")
+            if any(
+                not re.fullmatch(r"[0-9a-f]{40}", value)
+                for value in (tag_object, commit, tree, tooling_commit, tooling_tree)
+            ):
                 findings.append(Finding("source-snapshot.json", "source commit/tree is not an exact SHA-1", "provenance"))
             else:
                 try:
+                    tag_ref = f"refs/tags/{source_tag}"
+                    if git_value("cat-file", "-t", tag_ref) != "tag":
+                        findings.append(Finding("source-snapshot.json", "source tag is not annotated", "provenance"))
+                    if git_value("rev-parse", tag_ref) != tag_object:
+                        findings.append(Finding("source-snapshot.json", "source tag object provenance mismatch", "provenance"))
+                    if git_value("rev-parse", f"{tag_ref}^{{commit}}") != commit:
+                        findings.append(Finding("source-snapshot.json", "source tag/commit provenance mismatch", "provenance"))
                     if git_value("rev-parse", f"{commit}^{{tree}}") != tree:
                         findings.append(Finding("source-snapshot.json", "Git commit/tree provenance mismatch", "provenance"))
+                    if git_value("rev-parse", f"{tooling_commit}^{{tree}}") != tooling_tree:
+                        findings.append(Finding("source-snapshot.json", "release tooling commit/tree provenance mismatch", "provenance"))
                 except ReleaseError:
-                    findings.append(Finding("source-snapshot.json", "source commit is unavailable for provenance verification", "provenance"))
+                    findings.append(Finding("source-snapshot.json", "source/tooling provenance is unavailable for verification", "provenance"))
+                findings.extend(verify_tagged_source_snapshot(root, commit))
 
-            inventory = load_license_inventory(root / "tools" / "release" / "third_party_licenses.json")
+            semantic_rows, semantic_findings = verify_corresponding_source_semantics(
+                root, tooling_inventory
+            )
+            findings.extend(semantic_findings)
             expected_archives = {
                 str(row["filename"]): row
-                for row in inventory.get("corresponding_source_archives", [])
+                for row in semantic_rows
             }
             manifest_archives = {
                 str(row.get("filename")): row
@@ -548,10 +837,9 @@ def verify_source_compliance(
                 if (
                     not source.is_file()
                     or sha256_file(source) != expected_row.get("sha256")
-                    or manifest_row.get("sha256") != expected_row.get("sha256")
-                    or manifest_row.get("size") != source.stat().st_size
+                    or manifest_row != expected_row
                 ):
-                    findings.append(Finding(f"third-party-sources/{filename}", "corresponding source is absent or does not match its audited hash", "licensing"))
+                    findings.append(Finding(f"third-party-sources/{filename}", "corresponding source or semantic attestation does not match independent validation", "licensing"))
     return findings
 
 

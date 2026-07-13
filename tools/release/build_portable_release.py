@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import ssl
@@ -25,6 +26,7 @@ try:
         PORTABLE_MARKER_VERSION,
         PRODUCT_NAME,
         PROJECT_ROOT,
+        RELEASE_LICENSE_INVENTORY_PATH,
         RELEASE_CHANNEL,
         ReleaseError,
         canonical_file_records,
@@ -32,6 +34,7 @@ try:
         deterministic_zip,
         exact_requirements,
         git_value,
+        git_value_at,
         is_reparse_or_link,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
@@ -52,6 +55,7 @@ except ImportError:  # Direct script execution.
         PORTABLE_MARKER_VERSION,
         PRODUCT_NAME,
         PROJECT_ROOT,
+        RELEASE_LICENSE_INVENTORY_PATH,
         RELEASE_CHANNEL,
         ReleaseError,
         canonical_file_records,
@@ -59,6 +63,7 @@ except ImportError:  # Direct script execution.
         deterministic_zip,
         exact_requirements,
         git_value,
+        git_value_at,
         is_reparse_or_link,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
@@ -89,22 +94,68 @@ def _inside(candidate: Path, parent: Path) -> bool:
         return False
 
 
-def validate_output(output: Path, dist_dir: Path) -> Path:
+def _git(repository_root: Path, *args: str) -> str:
+    root = repository_root.expanduser().resolve()
+    if root == PROJECT_ROOT.resolve():
+        return git_value(*args)
+    return git_value_at(root, *args)
+
+
+def _resolve_release_inventory(
+    inventory_path: Path, tooling_commit: str
+) -> tuple[Path, str, str]:
+    expected = (PROJECT_ROOT / RELEASE_LICENSE_INVENTORY_PATH).resolve()
+    selected = inventory_path.expanduser().resolve()
+    if selected != expected:
+        raise ReleaseError(
+            "Release license inventory must be the tracked tooling inventory."
+        )
+    if not selected.is_file() or is_reparse_or_link(selected):
+        raise ReleaseError("The tracked release license inventory is unavailable or unsafe.")
+    object_expression = f"{tooling_commit}:{RELEASE_LICENSE_INVENTORY_PATH}"
+    if _git(PROJECT_ROOT, "cat-file", "-t", object_expression) != "blob":
+        raise ReleaseError("The release tooling commit does not contain the inventory blob.")
+    blob_id = _git(PROJECT_ROOT, "rev-parse", object_expression)
+    if not re.fullmatch(r"[0-9a-f]{40}", blob_id):
+        raise ReleaseError("The release license inventory Git blob identity is invalid.")
+    filtered_blob_id = _git(
+        PROJECT_ROOT,
+        "hash-object",
+        f"--path={RELEASE_LICENSE_INVENTORY_PATH}",
+        "--",
+        str(selected),
+    )
+    if filtered_blob_id != blob_id:
+        raise ReleaseError(
+            "The selected release license inventory differs from the tooling commit."
+        )
+    return selected, blob_id, sha256_file(selected)
+
+
+def validate_output(output: Path, dist_dir: Path, application_root: Path = PROJECT_ROOT) -> Path:
     expanded = output.expanduser()
     if expanded.exists() and is_reparse_or_link(expanded):
         raise ReleaseError("Release output may not be a symlink or reparse point.")
     if dist_dir.exists() and is_reparse_or_link(dist_dir):
         raise ReleaseError("Official distribution may not be a symlink or reparse point.")
     resolved = expanded.resolve()
-    live_data = (PROJECT_ROOT / "data").resolve()
-    if resolved == live_data or _inside(resolved, live_data):
-        raise ReleaseError("Release staging may not use the live data directory.")
+    live_data_roots = {
+        (application_root / "data").resolve(),
+        (PROJECT_ROOT / "data").resolve(),
+    }
+    if any(resolved == live_data or _inside(resolved, live_data) for live_data in live_data_roots):
+        raise ReleaseError("Release staging may not use a live data directory.")
     if resolved == dist_dir.resolve() or _inside(resolved, dist_dir.resolve()):
         raise ReleaseError("Release staging may not be placed inside the PyInstaller distribution.")
     return resolved
 
 
-def copy_distribution(dist_dir: Path, portable_root: Path) -> None:
+def copy_distribution(
+    dist_dir: Path,
+    portable_root: Path,
+    application_root: Path = PROJECT_ROOT,
+    license_inventory: Path | None = None,
+) -> None:
     if not (dist_dir / "MusicVault.exe").is_file():
         raise ReleaseError(f"Official executable is missing: {dist_dir / 'MusicVault.exe'}")
     files = safe_files(dist_dir)
@@ -127,10 +178,10 @@ def copy_distribution(dist_dir: Path, portable_root: Path) -> None:
             expected_prefix = ("_internal", "assets")
             if tuple(part.casefold() for part in relative.parts[:2]) != expected_prefix:
                 raise ReleaseError(f"Unexpected image in official distribution: {relative.as_posix()}")
-            source_asset = PROJECT_ROOT / "assets" / Path(*relative.parts[2:])
+            source_asset = application_root / "assets" / Path(*relative.parts[2:])
             if not source_asset.is_file() or sha256_file(source_asset) != sha256_file(path):
                 raise ReleaseError(f"Unreviewed image in official distribution: {relative.as_posix()}")
-    assignments = native_artifact_owners(dist_dir)
+    assignments = native_artifact_owners(dist_dir, license_inventory)
     unmatched = [relative for relative, owners in assignments.items() if not owners]
     if unmatched:
         raise ReleaseError(
@@ -142,7 +193,7 @@ def copy_distribution(dist_dir: Path, portable_root: Path) -> None:
             "Native release artifacts have ambiguous license ownership: "
             + ", ".join(ambiguous)
         )
-    missing_embedded = missing_embedded_artifact_mappings(dist_dir)
+    missing_embedded = missing_embedded_artifact_mappings(dist_dir, license_inventory)
     if missing_embedded:
         raise ReleaseError(
             "Embedded component mapping does not match the release: "
@@ -155,15 +206,19 @@ def copy_distribution(dist_dir: Path, portable_root: Path) -> None:
         shutil.copy2(path, destination)
 
 
-def copy_release_documents(portable_root: Path) -> None:
+def copy_release_documents(
+    portable_root: Path,
+    application_root: Path = PROJECT_ROOT,
+    license_inventory: Path | None = None,
+) -> None:
     for source_name, destination_name in ROOT_DOCUMENTS.items():
-        source = PROJECT_ROOT / source_name
+        source = application_root / source_name
         if not source.is_file():
             raise ReleaseError(f"Required release document is missing: {source_name}")
         if is_reparse_or_link(source):
             raise ReleaseError(f"Release document may not be a link/reparse point: {source_name}")
         shutil.copy2(source, portable_root / destination_name)
-    source_licenses = PROJECT_ROOT / "licenses"
+    source_licenses = application_root / "licenses"
     destination_licenses = portable_root / "licenses"
     destination_licenses.mkdir()
     for source in safe_files(source_licenses):
@@ -171,13 +226,13 @@ def copy_release_documents(portable_root: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
     shutil.copy2(
-        PROJECT_ROOT / "tools/release/third_party_licenses.json",
+        license_inventory or application_root / "tools/release/third_party_licenses.json",
         destination_licenses / "third_party_licenses.json",
     )
 
 
-def _verified_build_environment() -> dict[str, object]:
-    expected = exact_requirements()
+def _verified_build_environment(requirements_path: Path | None = None) -> dict[str, object]:
+    expected = exact_requirements(requirements_path)
     installed: dict[str, str] = {}
     for name, version in expected.items():
         try:
@@ -207,22 +262,59 @@ def _verified_build_environment() -> dict[str, object]:
     }
 
 
-def _resolve_source(source_commit: str, *, require_clean: bool) -> tuple[str, str]:
-    resolved = git_value("rev-parse", f"{source_commit}^{{commit}}")
-    tree = git_value("rev-parse", f"{resolved}^{{tree}}")
+def _resolve_source(
+    source_commit: str,
+    *,
+    repository_root: Path = PROJECT_ROOT,
+    require_clean: bool,
+) -> tuple[str, str]:
+    resolved = _git(repository_root, "rev-parse", f"{source_commit}^{{commit}}")
+    tree = _git(repository_root, "rev-parse", f"{resolved}^{{tree}}")
     if require_clean:
-        if git_value("status", "--porcelain=v1", "--untracked-files=all"):
+        if _git(repository_root, "status", "--porcelain=v1", "--untracked-files=all"):
             raise ReleaseError("An exact public source snapshot requires a clean working tree.")
-        if resolved != git_value("rev-parse", "HEAD"):
+        if resolved != _git(repository_root, "rev-parse", "HEAD"):
             raise ReleaseError("The requested public source commit is not the checked-out HEAD.")
     return resolved, tree
+
+
+def _resolve_tagged_source(
+    application_root: Path,
+    source_tag: str,
+    source_commit: str | None,
+    *,
+    require_clean: bool,
+) -> tuple[str, str, str]:
+    if source_tag != f"v{APP_VERSION}" or source_tag != Path(source_tag).name:
+        raise ReleaseError("The public source tag is invalid.")
+    tag_ref = f"refs/tags/{source_tag}"
+    if _git(application_root, "cat-file", "-t", tag_ref) != "tag":
+        raise ReleaseError("The public source tag must be an exact annotated tag.")
+    tag_object = _git(application_root, "rev-parse", tag_ref)
+    tagged_commit = _git(application_root, "rev-parse", f"{tag_ref}^{{commit}}")
+    if source_commit is not None:
+        requested = _git(application_root, "rev-parse", f"{source_commit}^{{commit}}")
+        if requested != tagged_commit:
+            raise ReleaseError("The requested source commit does not match the public tag.")
+    commit, tree = _resolve_source(
+        tagged_commit,
+        repository_root=application_root,
+        require_clean=require_clean,
+    )
+    return tag_object, commit, tree
 
 
 def build_manifest(
     portable_root: Path,
     *,
+    source_tag: str,
+    source_tag_object: str,
     source_commit: str,
     source_tree_hash: str,
+    release_tooling_commit: str,
+    release_tooling_tree_hash: str,
+    release_license_inventory_git_blob: str,
+    release_license_inventory_sha256: str,
     build_timestamp: str,
     build_environment: dict[str, object],
 ) -> dict[str, object]:
@@ -232,7 +324,7 @@ def build_manifest(
     )
     executable = portable_root / "MusicVault.exe"
     return {
-        "manifest_schema_version": 1,
+        "manifest_schema_version": 2,
         "product_name": PRODUCT_NAME,
         "version": APP_VERSION,
         "release_channel": RELEASE_CHANNEL,
@@ -242,8 +334,14 @@ def build_manifest(
         "pyinstaller_version": build_environment["pyinstaller"],
         "sqlite_schema_version": 4,
         "app_status_schema_version": 1,
+        "source_tag": source_tag,
+        "source_tag_object": source_tag_object,
         "source_commit": source_commit,
         "source_tree_hash": source_tree_hash,
+        "release_tooling_commit": release_tooling_commit,
+        "release_tooling_tree_hash": release_tooling_tree_hash,
+        "release_license_inventory_git_blob": release_license_inventory_git_blob,
+        "release_license_inventory_sha256": release_license_inventory_sha256,
         "build_timestamp_utc": build_timestamp,
         "portable_root_marker_version": PORTABLE_MARKER_VERSION,
         "build_environment": build_environment,
@@ -267,15 +365,17 @@ def write_package_checksums(portable_root: Path) -> None:
     (portable_root / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _export_git_commit(destination: Path, source_commit: str) -> None:
+def _export_git_commit(
+    destination: Path, source_commit: str, application_root: Path = PROJECT_ROOT
+) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     archive_path = destination.parent / "music-vault-exact-source.zip"
     command = [
-        "git", "-c", f"safe.directory={PROJECT_ROOT.as_posix()}",
+        "git", "-c", f"safe.directory={application_root.resolve().as_posix()}",
         "archive", "--format=zip", f"--output={archive_path}", source_commit,
     ]
     completed = subprocess.run(
-        command, cwd=PROJECT_ROOT, check=False, capture_output=True, timeout=60
+        command, cwd=application_root, check=False, capture_output=True, timeout=60
     )
     if completed.returncode:
         raise ReleaseError("The exact Git source archive could not be created.")
@@ -302,13 +402,21 @@ def _export_git_commit(destination: Path, source_commit: str) -> None:
         archive_path.unlink(missing_ok=True)
 
 
-def _copy_corresponding_sources(destination: Path, source_cache: Path) -> list[dict[str, object]]:
+def _copy_corresponding_sources(
+    destination: Path,
+    source_cache: Path,
+    license_inventory: Path,
+) -> list[dict[str, object]]:
     try:
         from .fetch_compliance_sources import fetch_sources
     except ImportError:
         from fetch_compliance_sources import fetch_sources
 
-    rows = fetch_sources(source_cache, offline=True)
+    rows = fetch_sources(
+        source_cache,
+        offline=True,
+        inventory_path=license_inventory,
+    )
     target_root = destination / "third-party-sources"
     target_root.mkdir()
     for row in rows:
@@ -322,15 +430,27 @@ def _copy_corresponding_sources(destination: Path, source_cache: Path) -> list[d
 
 def _write_source_availability(
     destination: Path,
+    source_tag: str,
+    source_tag_object: str,
     source_commit: str,
     source_tree_hash: str,
+    release_tooling_commit: str,
+    release_tooling_tree_hash: str,
+    release_license_inventory_git_blob: str,
+    release_license_inventory_sha256: str,
     archives: list[dict[str, object]],
 ) -> None:
     lines = [
-        "# Music Vault v1.0.0 source compliance",
+        f"# Music Vault v{APP_VERSION} source compliance",
         "",
+        f"Music Vault source tag: `{source_tag}`",
+        f"Music Vault tag object: `{source_tag_object}`",
         f"Music Vault source commit: `{source_commit}`",
         f"Music Vault source tree: `{source_tree_hash}`",
+        f"Release tooling commit: `{release_tooling_commit}`",
+        f"Release tooling tree: `{release_tooling_tree_hash}`",
+        f"Corrected release license inventory Git blob: `{release_license_inventory_git_blob}`",
+        f"Corrected release license inventory SHA-256: `{release_license_inventory_sha256}`",
         "",
         "This archive contains the exact Git-committed Music Vault source and build inputs.",
         "It also carries the unmodified, hash-pinned corresponding-source archives under",
@@ -366,32 +486,83 @@ def build_source_compliance(
     staging_owner: Path,
     source_commit: str,
     *,
+    application_root: Path = PROJECT_ROOT,
+    source_tag: str,
+    source_tag_object: str,
     source_tree_hash: str | None = None,
+    release_tooling_commit: str,
+    release_tooling_tree_hash: str,
+    license_inventory: Path,
+    release_license_inventory_git_blob: str,
+    release_license_inventory_sha256: str,
     source_cache: Path | None = None,
 ) -> tuple[Path, Path]:
     staging = staging_owner / "source-compliance"
     if staging.exists():
         raise ReleaseError("Unique source-compliance staging unexpectedly exists.")
-    tree_hash = source_tree_hash or git_value("rev-parse", f"{source_commit}^{{tree}}")
-    _export_git_commit(staging, source_commit)
+    tree_hash = source_tree_hash or _git(
+        application_root, "rev-parse", f"{source_commit}^{{tree}}"
+    )
+    _export_git_commit(staging, source_commit, application_root)
+    tooling_inventory = staging / "release-tooling" / "third_party_licenses.json"
+    tooling_inventory.parent.mkdir()
+    shutil.copy2(license_inventory, tooling_inventory)
+    inventory_sha256 = sha256_file(tooling_inventory)
+    if (
+        inventory_sha256 != release_license_inventory_sha256
+        or _git(
+            PROJECT_ROOT,
+            "hash-object",
+            f"--path={RELEASE_LICENSE_INVENTORY_PATH}",
+            "--",
+            str(tooling_inventory),
+        )
+        != release_license_inventory_git_blob
+    ):
+        raise ReleaseError("Copied release license inventory lost its Git provenance.")
     archive_rows = _copy_corresponding_sources(
-        staging, (source_cache or output_dir / ".source-cache").resolve()
+        staging,
+        (source_cache or output_dir / ".source-cache").resolve(),
+        license_inventory,
     )
     write_json(staging / "source-snapshot.json", {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_kind": "exact Git commit",
+        "source_tag": source_tag,
+        "source_tag_object": source_tag_object,
         "source_commit": source_commit,
         "source_tree_hash": tree_hash,
+        "release_tooling_commit": release_tooling_commit,
+        "release_tooling_tree_hash": release_tooling_tree_hash,
+        "release_license_inventory_git_blob": release_license_inventory_git_blob,
+        "release_license_inventory_sha256": inventory_sha256,
         "repository": "https://github.com/jcjohnson9/music-vault",
     })
-    _write_source_availability(staging, source_commit, tree_hash, archive_rows)
+    _write_source_availability(
+        staging,
+        source_tag,
+        source_tag_object,
+        source_commit,
+        tree_hash,
+        release_tooling_commit,
+        release_tooling_tree_hash,
+        release_license_inventory_git_blob,
+        inventory_sha256,
+        archive_rows,
+    )
     records = canonical_file_records(staging, excluded={"source-compliance-manifest.json"})
     write_json(staging / "source-compliance-manifest.json", {
-        "manifest_schema_version": 1,
+        "manifest_schema_version": 2,
         "product": PRODUCT_NAME,
         "version": APP_VERSION,
+        "source_tag": source_tag,
+        "source_tag_object": source_tag_object,
         "source_commit": source_commit,
         "source_tree_hash": tree_hash,
+        "release_tooling_commit": release_tooling_commit,
+        "release_tooling_tree_hash": release_tooling_tree_hash,
+        "release_license_inventory_git_blob": release_license_inventory_git_blob,
+        "release_license_inventory_sha256": inventory_sha256,
         "payload_sha256": canonical_payload_hash(records),
         "file_count": len(records) + 1,
         "corresponding_source_archives": archive_rows,
@@ -409,24 +580,54 @@ def build_release(
     dist_dir: Path,
     source_commit: str | None = None,
     *,
+    application_root: Path = PROJECT_ROOT,
+    source_tag: str | None = None,
+    release_tooling_commit: str | None = None,
+    license_inventory: Path | None = None,
     require_clean_source: bool = True,
     source_cache: Path | None = None,
 ) -> dict[str, object]:
     if platform.machine().casefold() not in {"amd64", "x86_64"}:
         raise ReleaseError("The Windows x64 portable release requires a 64-bit x86 build host.")
-    output_dir = validate_output(output_dir, dist_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    commit, tree_hash = _resolve_source(
-        source_commit or git_value("rev-parse", "HEAD"), require_clean=require_clean_source
+    application_root = application_root.expanduser().resolve()
+    dist_dir = dist_dir.expanduser().resolve()
+    inventory_candidate = (
+        license_inventory
+        or PROJECT_ROOT / RELEASE_LICENSE_INVENTORY_PATH
     )
-    build_environment = _verified_build_environment()
+    requirements_path = application_root / "requirements-release.txt"
+    if not requirements_path.is_file():
+        raise ReleaseError("The tagged application release lock is missing.")
+    output_dir = validate_output(output_dir, dist_dir, application_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_tag = source_tag or f"v{APP_VERSION}"
+    tag_object, commit, tree_hash = _resolve_tagged_source(
+        application_root,
+        resolved_tag,
+        source_commit,
+        require_clean=require_clean_source,
+    )
+    tooling_commit, tooling_tree_hash = _resolve_source(
+        release_tooling_commit or _git(PROJECT_ROOT, "rev-parse", "HEAD"),
+        repository_root=PROJECT_ROOT,
+        require_clean=require_clean_source,
+    )
+    inventory_path, inventory_blob_id, inventory_sha256 = _resolve_release_inventory(
+        inventory_candidate, tooling_commit
+    )
+    build_environment = _verified_build_environment(requirements_path)
     staging_owner = Path(tempfile.mkdtemp(prefix=".staging-", dir=output_dir))
     try:
         portable_root = staging_owner / PACKAGE_DIRECTORY
         portable_root.mkdir()
 
-        copy_distribution(dist_dir.resolve(), portable_root)
-        copy_release_documents(portable_root)
+        copy_distribution(
+            dist_dir,
+            portable_root,
+            application_root,
+            inventory_path,
+        )
+        copy_release_documents(portable_root, application_root, inventory_path)
         write_json(portable_root / PORTABLE_MARKER, {
             "schema_version": PORTABLE_MARKER_VERSION,
             "product": PRODUCT_NAME,
@@ -437,8 +638,14 @@ def build_release(
         timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         internal_manifest = build_manifest(
             portable_root,
+            source_tag=resolved_tag,
+            source_tag_object=tag_object,
             source_commit=commit,
             source_tree_hash=tree_hash,
+            release_tooling_commit=tooling_commit,
+            release_tooling_tree_hash=tooling_tree_hash,
+            release_license_inventory_git_blob=inventory_blob_id,
+            release_license_inventory_sha256=inventory_sha256,
             build_timestamp=timestamp,
             build_environment=build_environment,
         )
@@ -470,7 +677,15 @@ def build_release(
             output_dir,
             staging_owner,
             commit,
+            application_root=application_root,
+            source_tag=resolved_tag,
+            source_tag_object=tag_object,
             source_tree_hash=tree_hash,
+            release_tooling_commit=tooling_commit,
+            release_tooling_tree_hash=tooling_tree_hash,
+            license_inventory=inventory_path,
+            release_license_inventory_git_blob=inventory_blob_id,
+            release_license_inventory_sha256=inventory_sha256,
             source_cache=source_cache,
         )
         return {
@@ -493,7 +708,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the clean Music Vault portable release.")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "release_artifacts")
     parser.add_argument("--dist-dir", type=Path, default=PROJECT_ROOT / "dist" / "MusicVault")
+    parser.add_argument("--application-root", type=Path, default=PROJECT_ROOT)
+    parser.add_argument("--source-tag", default=f"v{APP_VERSION}")
     parser.add_argument("--source-commit")
+    parser.add_argument("--release-tooling-commit")
+    parser.add_argument(
+        "--license-inventory",
+        type=Path,
+        default=PROJECT_ROOT / RELEASE_LICENSE_INVENTORY_PATH,
+    )
     parser.add_argument("--source-cache", type=Path)
     # Retained for explicit CI readability; public release builds are always
     # clean-source builds even when the flag is omitted by the local wrapper.
@@ -508,6 +731,10 @@ def main() -> int:
             args.output_dir,
             args.dist_dir,
             args.source_commit,
+            application_root=args.application_root,
+            source_tag=args.source_tag,
+            release_tooling_commit=args.release_tooling_commit,
+            license_inventory=args.license_inventory,
             require_clean_source=args.require_clean_source,
             source_cache=args.source_cache,
         )

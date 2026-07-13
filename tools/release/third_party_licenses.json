@@ -143,7 +143,68 @@
       "component": "zlib 1.3.1 used by CPython and Qt Multimedia FFmpeg",
       "filename": "zlib-1.3.1.tar.gz",
       "url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
-      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+      "fallback_urls": [
+        "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz"
+      ],
+      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+      "size_bytes": 1512791,
+      "archive_format": "tar.gz",
+      "allowed_hosts": [
+        "zlib.net",
+        "www.zlib.net",
+        "github.com",
+        "release-assets.githubusercontent.com"
+      ],
+      "content_types": [
+        "application/gzip",
+        "application/x-gzip",
+        "application/octet-stream"
+      ],
+      "timeout_seconds": 60,
+      "max_redirects": 5,
+      "primary_attempts": 2,
+      "fallback_attempts": 1,
+      "top_level": "zlib-1.3.1",
+      "required_paths": [
+        "zlib-1.3.1/zlib.h",
+        "zlib-1.3.1/zutil.c",
+        "zlib-1.3.1/LICENSE"
+      ],
+      "version_checks": [
+        {
+          "path": "zlib-1.3.1/zlib.h",
+          "contains": [
+            "#define ZLIB_VERSION \"1.3.1\""
+          ]
+        }
+      ],
+      "license_checks": [
+        {
+          "path": "zlib-1.3.1/LICENSE",
+          "sha256": "845efc77857d485d91fb3e0b884aaa929368c717ae8186b66fe1ed2495753243",
+          "contains": [
+            "Permission is granted to anyone to use this software for any purpose",
+            "This notice may not be removed or altered from any source distribution.",
+            "Jean-loup Gailly",
+            "Mark Adler"
+          ]
+        }
+      ],
+      "source_provenance": {
+        "primary": {
+          "kind": "official zlib fossil",
+          "immutable": true
+        },
+        "fallback": {
+          "kind": "official madler/zlib GitHub release asset",
+          "immutable": false,
+          "release_asset_id": 147136750,
+          "tag": "v1.3.1",
+          "tag_object": "925af44f3cde53c6b076611c297850091b5dc7bb",
+          "commit": "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf"
+        },
+        "integrity_note": "Both endpoints must match the same preapproved hash, size, archive layout, version marker, and license semantics."
+      }
     },
     {
       "component": "Mutagen",

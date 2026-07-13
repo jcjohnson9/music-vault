@@ -99,6 +99,7 @@ Common engineering commands:
 ```powershell
 .\tools\dev\verify.ps1
 .\tools\dev\pre_public_commit_check.ps1
+.\tools\dev\pre_public_history_check.ps1
 .\tools\dev\run_source.ps1
 .\tools\dev\build_exe.ps1
 .\tools\dev\run_exe.ps1
@@ -117,6 +118,19 @@ checked-in `MusicVault.spec`:
 .\tools\release\verify_portable_release.ps1 `
   .\release_artifacts\MusicVault-v1.0.0-Windows-x64-Portable.zip
 ```
+
+The ordinary commands above build the checked-out tree. Corrective publication
+for the already-pushed immutable `v1.0.0` tag instead uses the separate tagged
+application/current-tooling rehearsal after the corrective tooling is committed
+and the working tree is clean:
+
+```powershell
+.\tools\dev\pre_public_history_check.ps1
+.\tools\release\rehearse_tagged_release.ps1 -ReleaseTag v1.0.0
+```
+
+That path does not move or recreate the tag. Its release manifests identify the
+tagged application commit and later release-tooling commit separately.
 
 Generated builds, screenshots, benchmarks, release staging, and all runtime
 data remain untracked. See [Architecture](docs/ARCHITECTURE.md) and

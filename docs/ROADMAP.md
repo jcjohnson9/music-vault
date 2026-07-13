@@ -136,7 +136,11 @@ file, or playlist data in the distribution.
 **Status:** Complete. Music Vault v1.0.0 is the stable, blank-by-default Windows
 portable release. The repository's own source remains MIT; the combined
 portable distribution carries GPL-3.0-or-later and the preserved terms of its
-separately licensed third-party components.
+separately licensed third-party components. Batch 8.1 adds corrective
+publication without retagging: application artifacts remain tied to the
+immutable v1.0.0 tag, while the manifest separately identifies the later
+release-tooling commit that performs hardened corresponding-source validation
+and complete-history publication scanning.
 
 ## Batch 9 — Full-Screen Party Mode
 
