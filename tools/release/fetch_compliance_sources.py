@@ -132,20 +132,171 @@ def _validate_public_dns(host: str) -> None:
             raise ReleaseError(f"Source host resolved to a non-public address: {host}")
 
 
-def _is_within(path: Path, parent: Path) -> bool:
+def _absolute_release_path(path: Path | str) -> Path:
     try:
-        path.relative_to(parent)
-    except ValueError:
+        expanded = Path(path).expanduser()
+        return Path(os.path.abspath(os.fspath(expanded)))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ReleaseError("Source cache path could not be made absolute.") from exc
+
+
+def _canonicalize_release_path(path: Path | str) -> Path:
+    """Return a stable comparison form without requiring the final child to exist."""
+
+    try:
+        absolute = _absolute_release_path(path)
+        resolved = os.path.realpath(os.fspath(absolute))
+        normalized = os.path.normcase(os.path.normpath(resolved))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ReleaseError("Source cache path could not be canonicalized.") from exc
+    return Path(normalized)
+
+
+def _comparison_path(path: Path | str) -> str:
+    return os.path.normcase(os.path.normpath(os.fspath(path)))
+
+
+def _path_is_within(path: Path, parent: Path, *, allow_equal: bool = True) -> bool:
+    """Compare path components without unsafe prefix or case-sensitive assumptions."""
+
+    candidate = _comparison_path(path)
+    boundary = _comparison_path(parent)
+    try:
+        common = _comparison_path(Path(os.path.commonpath([candidate, boundary])))
+    except (OSError, ValueError):
         return False
-    return True
+    if common != boundary:
+        return False
+    return allow_equal or candidate != boundary
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    """Compatibility wrapper for existing release-tool callers and tests."""
+
+    return _path_is_within(path, parent)
+
+
+def _select_cache_boundary(
+    path: Path,
+    boundaries: tuple[Path, ...] | list[Path],
+    *,
+    allow_equal: bool = False,
+) -> Path | None:
+    matches = [
+        boundary
+        for boundary in boundaries
+        if _path_is_within(path, boundary, allow_equal=allow_equal)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda boundary: (len(boundary.parts), len(_comparison_path(boundary))))
+
+
+def _github_actions_enabled() -> bool:
+    return os.environ.get("GITHUB_ACTIONS", "").strip().casefold() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }
+
+
+def _approved_temp_root_records() -> tuple[tuple[Path, tuple[Path, ...]], ...]:
+    values: list[str] = [str(tempfile.gettempdir())]
+    values.extend(os.environ.get(name, "") for name in ("TEMP", "TMP", "TMPDIR"))
+    if _github_actions_enabled():
+        values.append(os.environ.get("RUNNER_TEMP", ""))
+
+    records: dict[str, tuple[Path, list[Path]]] = {}
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        supplied = Path(text)
+        if not supplied.is_absolute():
+            continue
+        try:
+            raw = _absolute_release_path(supplied)
+            canonical = _canonicalize_release_path(raw)
+        except ReleaseError:
+            continue
+        if not canonical.is_dir() or _comparison_path(canonical.parent) == _comparison_path(
+            canonical
+        ):
+            continue
+        key = _comparison_path(canonical)
+        record = records.setdefault(key, (canonical, []))
+        raw_key = _comparison_path(raw)
+        if all(_comparison_path(item) != raw_key for item in record[1]):
+            record[1].append(raw)
+
+    return tuple(
+        (canonical, tuple(spellings))
+        for canonical, spellings in sorted(
+            records.values(), key=lambda item: _comparison_path(item[0])
+        )
+    )
+
+
+def _approved_temp_roots() -> tuple[Path, ...]:
+    return tuple(canonical for canonical, _spellings in _approved_temp_root_records())
+
+
+def _lexical_boundary_for_temp_root(
+    raw: Path,
+    canonical_boundary: Path,
+    records: tuple[tuple[Path, tuple[Path, ...]], ...],
+) -> Path | None:
+    spellings: list[Path] = [canonical_boundary]
+    for canonical, raw_spellings in records:
+        if _comparison_path(canonical) == _comparison_path(canonical_boundary):
+            spellings.extend(raw_spellings)
+            break
+    direct = _select_cache_boundary(raw, spellings, allow_equal=False)
+    if direct is not None:
+        return direct
+
+    # Accept the inverse long/short-name case only when an existing raw
+    # ancestor is the same canonical directory and is not itself a link.
+    current = raw.parent
+    visited: set[str] = set()
+    while True:
+        current_key = _comparison_path(current)
+        if current_key in visited:
+            break
+        visited.add(current_key)
+        if current.is_dir():
+            try:
+                current_canonical = _canonicalize_release_path(current)
+            except ReleaseError:
+                current_canonical = None
+            if (
+                current_canonical is not None
+                and _comparison_path(current_canonical)
+                == _comparison_path(canonical_boundary)
+            ):
+                if is_reparse_or_link(current):
+                    return None
+                return current
+        if _comparison_path(current.parent) == current_key:
+            break
+        current = current.parent
+    return None
 
 
 def _reject_reparse_components(path: Path, boundary: Path) -> None:
-    relative = path.relative_to(boundary)
+    if not _path_is_within(path, boundary):
+        raise ReleaseError("Source cache resolution escaped its approved boundary.")
+    try:
+        relative = Path(os.path.relpath(os.fspath(path), os.fspath(boundary)))
+    except ValueError as exc:
+        raise ReleaseError("Source cache resolution escaped its approved boundary.") from exc
+    if relative == Path(os.curdir):
+        return
     current = boundary
     for part in relative.parts:
         current = current / part
-        if (current.exists() or current.is_symlink()) and is_reparse_or_link(current):
+        if is_reparse_or_link(current):
             raise ReleaseError("Source cache may not contain symlink or reparse-point components.")
 
 
@@ -169,29 +320,69 @@ def _git_cache_is_ignored_and_untracked(relative: Path) -> bool:
 
 
 def _prepare_cache(cache: Path) -> Path:
-    raw = Path(os.path.abspath(cache.expanduser()))
-    project_root = Path(os.path.abspath(PROJECT_ROOT))
-    temp_root = Path(os.path.abspath(Path(tempfile.gettempdir())))
-    if _is_within(raw, project_root):
-        relative = raw.relative_to(project_root)
+    raw = _absolute_release_path(cache)
+    canonical = _canonicalize_release_path(raw)
+    if _comparison_path(canonical) == _comparison_path(
+        _canonicalize_release_path(Path.cwd())
+    ):
+        raise ReleaseError("The current working directory may not be used as a source cache.")
+    raw_project_root = _absolute_release_path(PROJECT_ROOT)
+    canonical_project_root = _canonicalize_release_path(PROJECT_ROOT)
+    lexical_project_boundary = _select_cache_boundary(
+        raw,
+        [raw_project_root, canonical_project_root],
+        allow_equal=True,
+    )
+    canonical_is_in_project = _path_is_within(canonical, canonical_project_root)
+
+    if lexical_project_boundary is not None or canonical_is_in_project:
+        if lexical_project_boundary is None or not canonical_is_in_project:
+            raise ReleaseError("Source cache resolution escaped its approved boundary.")
+        relative = Path(
+            os.path.relpath(os.fspath(canonical), os.fspath(canonical_project_root))
+        )
         if not relative.parts or relative.parts[0].casefold() != "release_artifacts":
             raise ReleaseError(
                 "A repository-local source cache must stay under ignored release_artifacts."
             )
         if not _git_cache_is_ignored_and_untracked(relative):
             raise ReleaseError("A repository-local source cache must be ignored and untracked.")
-        boundary = project_root
-    elif _is_within(raw, temp_root):
-        boundary = temp_root
-    else:
-        raise ReleaseError(
-            "A source cache outside the repository must stay under the operating-system temp directory."
+        canonical_boundary = _canonicalize_release_path(
+            canonical_project_root / "release_artifacts"
         )
-    _reject_reparse_components(raw, boundary)
+        lexical_boundary = lexical_project_boundary
+    else:
+        # Pytest resolves tempfile.gettempdir() before creating tmp_path. Hosted
+        # Windows runners may expose that same root through a different alias,
+        # so both cache and approved roots must be compared canonically.
+        temp_records = _approved_temp_root_records()
+        canonical_boundary = _select_cache_boundary(
+            canonical,
+            [item[0] for item in temp_records],
+            allow_equal=False,
+        )
+        if canonical_boundary is None:
+            raise ReleaseError(
+                "A source cache outside the repository must stay under an approved "
+                "operating-system temp directory."
+            )
+        lexical_boundary = _lexical_boundary_for_temp_root(
+            raw,
+            canonical_boundary,
+            temp_records,
+        )
+        if lexical_boundary is None:
+            raise ReleaseError(
+                "A source cache outside the repository must stay under an approved "
+                "operating-system temp directory."
+            )
+
+    _reject_reparse_components(raw, lexical_boundary)
     raw.mkdir(parents=True, exist_ok=True)
-    _reject_reparse_components(raw, boundary)
-    resolved = raw.resolve()
-    if not _is_within(resolved, boundary.resolve()):
+    _reject_reparse_components(raw, lexical_boundary)
+    resolved = Path(os.path.realpath(os.fspath(raw)))
+    resolved_canonical = Path(_comparison_path(resolved))
+    if not _path_is_within(resolved_canonical, canonical_boundary, allow_equal=False):
         raise ReleaseError("Source cache resolution escaped its approved boundary.")
     return resolved
 
