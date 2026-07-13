@@ -21,6 +21,7 @@ from music_vault.version import APP_VERSION, RELEASE_CHANNEL  # noqa: E402
 
 
 PRODUCT_NAME = "Music Vault"
+RELEASE_LICENSE_INVENTORY_PATH = "tools/release/third_party_licenses.json"
 PORTABLE_MARKER = "music-vault.portable.json"
 PORTABLE_MARKER_VERSION = 1
 PACKAGE_DIRECTORY = f"MusicVault-v{APP_VERSION}-Windows-x64-Portable"
@@ -289,13 +290,14 @@ def exact_requirements(path: Path | None = None) -> dict[str, str]:
     return result
 
 
-def git_value(*args: str) -> str:
+def git_value_at(repository_root: Path, *args: str) -> str:
+    repository_root = repository_root.expanduser().resolve()
     command = [
-        "git", "-c", f"safe.directory={PROJECT_ROOT.as_posix()}", *args
+        "git", "-c", f"safe.directory={repository_root.as_posix()}", *args
     ]
     completed = subprocess.run(
         command,
-        cwd=PROJECT_ROOT,
+        cwd=repository_root,
         check=False,
         capture_output=True,
         text=True,
@@ -304,6 +306,62 @@ def git_value(*args: str) -> str:
     if completed.returncode:
         raise ReleaseError("Git release metadata could not be resolved.")
     return completed.stdout.strip()
+
+
+def git_value(*args: str) -> str:
+    return git_value_at(PROJECT_ROOT, *args)
+
+
+def git_blob_sha1_file(path: Path) -> str:
+    path = path.expanduser().resolve()
+    size = path.stat().st_size
+    digest = hashlib.sha1(usedforsecurity=False)
+    digest.update(f"blob {size}\0".encode("ascii"))
+    with path.open("rb") as source:
+        while block := source.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def git_tree_entries_at(
+    repository_root: Path, commit: str
+) -> list[tuple[str, str, str, str]]:
+    repository_root = repository_root.expanduser().resolve()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ReleaseError("Git tree commit identity is invalid.")
+    command = [
+        "git",
+        "-c",
+        f"safe.directory={repository_root.as_posix()}",
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        commit,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if completed.returncode:
+        raise ReleaseError("Git source tree entries could not be resolved.")
+    entries: list[tuple[str, str, str, str]] = []
+    try:
+        for raw in completed.stdout.split(b"\0"):
+            if not raw:
+                continue
+            metadata, separator, encoded_path = raw.partition(b"\t")
+            if not separator:
+                raise ValueError
+            mode, kind, object_id = metadata.decode("ascii").split()
+            relative = encoded_path.decode("utf-8")
+            entries.append((mode, kind, object_id, relative))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ReleaseError("Git source tree contains an unsupported entry.") from exc
+    return entries
 
 
 def canonical_file_records(root: Path, *, excluded: Iterable[str] = ()) -> list[dict[str, object]]:

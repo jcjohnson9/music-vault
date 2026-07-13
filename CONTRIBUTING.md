@@ -36,11 +36,18 @@ Run the read-only public-candidate safety scanner as well:
 
 ```powershell
 .\tools\dev\pre_public_commit_check.ps1
+.\tools\dev\pre_public_history_check.ps1
 ```
 
-The scanner must pass without tracked or staged runtime data, media, secrets,
-personal paths, or build output. Never paste a discovered secret or matching
-source line into an issue; report only the affected file and remediation type.
+Both scanners must pass. The first checks the tracked/staged publication
+candidate; the second checks all local and remote-tracking refs, commits, tags,
+annotated-tag messages, historical paths, and bounded reachable objects without
+checking out history. Never paste a discovered secret or matching source line
+into an issue; report only the affected object/path and remediation type.
+
+Pushed release tags are immutable. A corrective release must build application
+code from the original annotated tag and record later release tooling as
+separate provenance; never delete, move, recreate, or force-update the tag.
 
 For architecture, release ordering, data handling, and security guidance, read
 [Architecture](docs/ARCHITECTURE.md), [Roadmap](docs/ROADMAP.md),

@@ -38,6 +38,14 @@ mismatches. It includes the explicit `music-vault.portable.json` root marker
 and creates private runtime data only after launch. Do not redistribute an
 initialized portable folder as though it were the clean release.
 
+Before public source publication, maintainers run both the current-candidate
+scanner and the complete reachable-history scanner. The history gate examines
+branches, remote-tracking refs, commits, tags and annotated-tag messages,
+bounded blobs, and historical paths through read-only Git plumbing; it reports
+only sanitized object/path/rule identities. A finding blocks publication and
+must never be worked around by printing a secret or automatically rewriting
+history.
+
 Music Vault's repository source remains MIT licensed. The combined portable
 binary includes separately licensed components and is distributed under the
 terms described in [Binary Distribution License](docs/BINARY_DISTRIBUTION_LICENSE.md)

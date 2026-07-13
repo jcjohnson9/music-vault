@@ -32,5 +32,15 @@ The companion compliance archive carries exact hash-pinned source for every
 bundled FOSS runtime component. Microsoft runtime DLLs remain subject to their
 redistribution terms and are treated as compiler/runtime System Libraries.
 
+For the corrective v1.0.0 publication, corresponding-source retrieval remains
+fail closed: every archive is constrained to declared authoritative HTTPS
+origins, a pinned hash, response bounds, expected archive format, and safe
+member/link structure. Component-specific internal checks are enforced where
+the audited inventory declares them; the zlib 1.3.1 record additionally checks
+its exact root, required implementation/header/license files, internal version,
+and license identity. Cached archives undergo the same applicable validation.
+The release manifest distinguishes the immutable tagged application source
+from the later corrective release-tooling source.
+
 This notice states the release's factual packaging and licensing basis; it is
 not legal advice.

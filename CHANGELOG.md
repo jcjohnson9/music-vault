@@ -5,7 +5,18 @@ Notable changes to Music Vault are documented here. The format follows
 
 ## Unreleased
 
-No changes yet.
+### Fixed
+
+- Added a corrective publication path for the existing immutable `v1.0.0`
+  application tag without changing the application or retagging its source.
+  Corrective release tooling now records the tagged application commit and the
+  later tooling commit as separate provenance identities.
+- Pinned zlib 1.3.1 corresponding source to the official versioned fossil
+  archive and added fail-closed hash, response, archive-safety, layout,
+  license, and internal-version validation. Verified offline-cache bytes pass
+  the same checks as network downloads.
+- Added an exact release-payload transfer index and a complete reachable-Git-
+  history publication scanner for the public-release gate.
 
 ## 1.0.0 - 2026-07-13
 
