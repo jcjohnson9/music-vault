@@ -281,6 +281,11 @@ def test_source_compliance_scanner_reports_personal_path_without_crashing(
     )
 
 
+def test_sensitive_scanner_does_not_match_its_own_pattern_source() -> None:
+    source = Path(release_common.__file__)
+    assert "personal absolute path" not in release_common.scan_sensitive_bytes(source)
+
+
 def test_zip_entries_are_sorted_relative_and_unique(synthetic_release: dict[str, Path]) -> None:
     with zipfile.ZipFile(synthetic_release["zip"]) as archive:
         names = archive.namelist()

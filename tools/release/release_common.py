@@ -62,7 +62,8 @@ SECRET_PATTERNS = (
 PERSONAL_PATH_PATTERNS = (
     re.compile(rb"(?i)[A-Z]:\\Users\\[^\\\r\n]+"),
     re.compile(rb"(?i)[A-Z]:/Users/[^/\r\n]+"),
-    re.compile(rb"(?i)/home/[^/\r\n]+"),
+    # Split the POSIX prefix so this scanner does not match its own source.
+    re.compile(rb"(?i)/" + rb"home/[^/\r\n]+"),
 )
 QT_VENDOR_BUILD_PATH_PATTERNS = (
     re.compile(rb"(?i)[A-Z]:\\Users\\qt(?:\\|$)"),
