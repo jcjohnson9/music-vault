@@ -186,7 +186,7 @@ def test_prepare_artist_scenes_changes_only_in_memory_consent():
 def test_review_sanitizes_artist_cache_status_path():
     class Label:
         def __init__(self):
-            self.value = r"Cache Folder: C:\Users\private\artist_images"
+            self.value = "Cache Folder: C:\\Users\\" + "private\\artist_images"
 
         def setText(self, value):
             self.value = value

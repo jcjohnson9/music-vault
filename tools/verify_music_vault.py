@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = PROJECT_ROOT / "music_vault"
 REQUIRED_FILES = (
     "run.py",
+    "music_vault/version.py",
     "music_vault/app.py",
     "music_vault/core/db.py",
     "music_vault/core/importer.py",
@@ -16,6 +17,8 @@ REQUIRED_FILES = (
     "music_vault/core/app_status.py",
     "music_vault/core/watchtower_status.py",
     "music_vault/core/paths.py",
+    "music_vault/core/ffmpeg.py",
+    "music_vault/core/desktop_shortcut.py",
     "music_vault/core/library_browser.py",
     "music_vault/metadata/schema.py",
     "music_vault/metadata/service.py",
@@ -36,11 +39,25 @@ REQUIRED_FILES = (
     "music_vault/ui/icons.py",
     "music_vault/ui/components.py",
     "music_vault/ui/review.py",
+    "music_vault/ui/onboarding.py",
     "assets/icons/music_vault.ico",
     "assets/icons/ui/README.md",
     "assets/icons/ui/artist-unknown.svg",
     "tools/dev/remediate_library_metadata.py",
     "tools/dev/remediate_library_metadata.ps1",
+    "requirements-release.txt",
+    "tools/release/build_portable_release.py",
+    "tools/release/fetch_compliance_sources.py",
+    "tools/release/generate_qt_attributions.py",
+    "tools/release/verify_portable_release.py",
+    "tools/release/third_party_licenses.json",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/MPL-2.0.txt",
+    "licenses/OPENSSL-APACHE-2.0.txt",
+    "licenses/qt-attrib/INDEX.md",
+    "licenses/qt-attrib/SOURCE_ARCHIVES.json",
+    "docs/BINARY_DISTRIBUTION_LICENSE.md",
+    ".github/workflows/release.yml",
 )
 
 
@@ -66,6 +83,8 @@ def main() -> int:
         sys.path.insert(0, project_root_text)
 
     from music_vault.core import paths
+    from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
+    from music_vault.core.ffmpeg import discover_ffmpeg
     from music_vault.core.library_browser import load_album_summaries, load_artist_summaries
     from music_vault.core.app_status import write_app_status
     from music_vault.core.watchtower_status import write_watchtower_status
@@ -85,10 +104,28 @@ def main() -> int:
     from music_vault.ui.metadata_remediation import MetadataRemediationDialog
     from music_vault.ui.review import schedule_ui_review
     from music_vault.ui.theme import application_stylesheet
+    from music_vault.ui.onboarding import FirstRunWizard, inspect_runtime_evidence
+    from music_vault.version import APP_VERSION, RELEASE_CHANNEL
     import music_vault.app as app
 
     if not callable(write_app_status) or write_watchtower_status is not write_app_status:
         print("App status exporter or compatibility alias is invalid.")
+        return 1
+
+    if APP_VERSION != "1.0.0" or RELEASE_CHANNEL != "stable":
+        print("Central release version metadata is invalid.")
+        return 1
+
+    if not all(
+        callable(value)
+        for value in (
+            discover_ffmpeg,
+            create_or_update_desktop_shortcut,
+            FirstRunWizard,
+            inspect_runtime_evidence,
+        )
+    ):
+        print("Music Vault portable-release components are unavailable.")
         return 1
 
     if not application_stylesheet().strip():

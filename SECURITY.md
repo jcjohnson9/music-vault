@@ -1,7 +1,6 @@
 # Security Policy
 
-Music Vault is currently supported as a **v1.0.0 Release Candidate** on the
-`main` branch. Security handling may evolve before V1 Stable.
+Music Vault is currently supported as **v1.0.0 Stable** on the `main` branch.
 
 ## Protect personal and secret data
 
@@ -23,6 +22,26 @@ Synchronization sanitizes external error text before it reaches the activity
 log, structured failure history, or App Status. Common Google API keys, query
 tokens, bearer/authorization values, and private-key blocks are redacted. The
 supported public/unlisted workflow does not silently access browser cookies.
+
+## Portable release integrity
+
+Obtain the portable ZIP from the project's GitHub Release and compare its
+SHA-256 value with the published checksum before extraction. Version 1.0.0 is
+not code-signed, so Windows SmartScreen may show an unsigned-publisher warning;
+that warning is not a substitute for checksum verification. Music Vault has no
+automatic updater and does not request administrator access.
+
+The published portable package is blank by construction and is checked for
+credentials, personal paths, databases, configuration, status, archives,
+media, artwork, reports, backups, unsafe ZIP entries, and manifest/hash
+mismatches. It includes the explicit `music-vault.portable.json` root marker
+and creates private runtime data only after launch. Do not redistribute an
+initialized portable folder as though it were the clean release.
+
+Music Vault's repository source remains MIT licensed. The combined portable
+binary includes separately licensed components and is distributed under the
+terms described in [Binary Distribution License](docs/BINARY_DISTRIBUTION_LICENSE.md)
+and [Third-Party Notices](THIRD_PARTY_NOTICES.md); it is not an MIT-only binary.
 
 ## Metadata provider requests and artwork
 
@@ -104,6 +123,6 @@ part of a credential; remove it entirely.
 
 ## Scope and response expectations
 
-Security reports concerning the current release-candidate source are welcome.
-This is a personal open-source project, and no response-time or remediation SLA
-is promised.
+Security reports concerning the current stable source and portable release are
+welcome. This is a personal open-source project, and no response-time or
+remediation SLA is promised.

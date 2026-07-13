@@ -35,5 +35,13 @@
 - Browser-performance changes must run
   `tools/dev/profile_media_browsers.ps1`; it uses synthetic temporary data only,
   and generated benchmark JSON or screenshots must not be committed.
+- A batch that is not primarily visual should use only the minimum sanitized
+  visual evidence needed for its acceptance criteria (normally no more than
+  about three captures). Add more captures only to diagnose a real rendering
+  defect.
+- Add targeted tests for new batch behavior without duplicating prior complete
+  acceptance matrices. Run the existing full regression suite once as the
+  batch gate, and rerun it only when source changes afterward or a failure needs
+  correction.
 - Music Vault is standalone and has no Watchtower relationship. Prime
   interoperability remains optional and external.

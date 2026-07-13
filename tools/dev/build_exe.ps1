@@ -20,5 +20,28 @@ foreach ($relativePath in @("build", "dist")) {
 }
 
 Set-Location $projectRoot
-& $python -m PyInstaller --noconfirm --clean .\MusicVault.spec
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
+$basePython = (& $python -c "import sys; print(sys.base_prefix)").Trim()
+if ($LASTEXITCODE -ne 0 -or -not $basePython) {
+    throw "Could not resolve the release Python base directory."
+}
+
+# PyInstaller searches PATH while resolving native dependencies. Keep that
+# search deterministic and prevent DLLs from unrelated installed applications
+# from entering Analysis provenance or the release candidate.
+$originalPath = $env:PATH
+$safePathEntries = @(
+    (Split-Path -Parent $python),
+    $basePython,
+    (Join-Path $basePython "DLLs"),
+    (Join-Path $env:SystemRoot "System32"),
+    $env:SystemRoot
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique
+
+try {
+    $env:PATH = $safePathEntries -join [IO.Path]::PathSeparator
+    & $python -m PyInstaller --noconfirm --clean .\MusicVault.spec
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
+}
+finally {
+    $env:PATH = $originalPath
+}

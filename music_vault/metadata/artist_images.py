@@ -28,12 +28,11 @@ from music_vault.core.paths import (
     artist_image_index_path,
     artist_images_dir,
 )
+from music_vault.version import user_agent
 
 
 ARTIST_IMAGE_CACHE_SCHEMA_VERSION = 1
-ARTIST_IMAGE_USER_AGENT = (
-    "MusicVault/1.0.0 (https://github.com/jcjohnson9/music-vault)"
-)
+ARTIST_IMAGE_USER_AGENT = user_agent()
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000

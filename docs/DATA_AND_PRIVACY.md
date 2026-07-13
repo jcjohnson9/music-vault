@@ -1,8 +1,10 @@
 # Data and Privacy
 
 Music Vault is a local-first application. Its runtime state is stored locally
-under the project's `data/` directory rather than in the public source
-repository.
+and never in the public source repository. A default portable installation uses
+`data/` beside `MusicVault.exe`; first-run setup can select another writable
+private data directory. Source development continues to use the project-local
+`data/` directory.
 
 Depending on which features are used, local runtime data can include:
 
@@ -16,6 +18,13 @@ Depending on which features are used, local runtime data can include:
   change history;
 - metadata-remediation reports; and
 - local backups.
+
+When a portable user selects a different data directory, Music Vault stores a
+small per-executable location pointer under
+`%LOCALAPPDATA%\Music Vault\runtime-locations\`. The pointer contains no API
+key or library contents, but its local path can still be personal information.
+Runtime files are never resolved relative to an arbitrary shell working
+directory or written inside the packaged `_internal` directory.
 
 Before an existing non-empty database is upgraded to a newer schema, Music
 Vault uses SQLite's backup API to create a timestamped copy under
@@ -36,8 +45,17 @@ private runtime data and are ignored by Git. They must not be added to commits,
 issues, pull requests, release archives, or public logs.
 
 A source checkout does not include a user's music library, credentials, media,
-artwork, synchronization state, or private reports. The public repository is
-source-only.
+artwork, synchronization state, or private reports. The v1.0.0 portable release
+also starts blank: it includes no populated data directory, database, config,
+status, API key, archive, failed-item record, media, artwork, report, cache, or
+backup. Its manifest and verifier record and enforce those boundaries.
+
+The first-run guide supports entirely local use. A YouTube API key and FFmpeg
+are optional for startup, local import, and local playback. If synchronization
+is configured, the API key is written only through the local secret-file
+mechanism; it is not added to JSON configuration, App Status, release manifests,
+or logs. The release neither bundles nor automatically downloads the
+`ffmpeg.exe` and `ffprobe.exe` command-line tools.
 
 ## Manual metadata and candidate review
 
@@ -162,5 +180,8 @@ incomplete. Back up the local `data/` directory before future metadata
 remediation, database-schema work, or other maintenance that may alter runtime
 state.
 
-A later blank release package will bootstrap empty runtime data on first use.
-It will not contain a maintainer's or another user's library.
+The v1.0.0 portable package bootstraps empty schema-v4 runtime data on first use.
+Moving, copying, or sharing an initialized portable folder can also move its
+private `data` directory, so inspect and remove runtime data before sharing an
+application folder. The clean release ZIP should be obtained from the published
+release rather than recreated from an initialized personal copy.

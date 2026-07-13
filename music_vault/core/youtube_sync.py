@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 import yt_dlp
 
+from .ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
 from .paths import youtube_api_key_path
 from .safety import (
     extract_source_video_id,
@@ -48,6 +49,7 @@ class YouTubeSyncConfig:
     audio_format: str = "mp3"
     audio_quality: str = "320"
     existing_video_ids: frozenset[str] = field(default_factory=frozenset)
+    ffmpeg_location: str | Path | None = None
 
 
 class AuthorizedYouTubePlaylistSyncer:
@@ -62,6 +64,7 @@ class AuthorizedYouTubePlaylistSyncer:
     ) -> None:
         self.config = config
         self.progress = progress or (lambda message: None)
+        self._ffmpeg_discovery: FFmpegDiscoveryResult | None = None
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.config.archive_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -86,13 +89,19 @@ class AuthorizedYouTubePlaylistSyncer:
             raise RuntimeError("The YouTube Data API key file is empty.")
         return key
 
+    def _resolve_ffmpeg_once(self) -> FFmpegDiscoveryResult:
+        if self._ffmpeg_discovery is None:
+            self._ffmpeg_discovery = discover_ffmpeg(self.config.ffmpeg_location)
+        result = self._ffmpeg_discovery
+        configured = self.config.ffmpeg_location
+        if configured is not None and str(configured).strip() and not result.ready:
+            detail = result.error or "Both ffmpeg.exe and ffprobe.exe are required."
+            raise RuntimeError(f"Configured FFmpeg is not ready: {detail}")
+        return result
+
     def _ffmpeg_location(self) -> str | None:
-        tools_root = Path.home() / "Documents" / "MusicVaultTools" / "ffmpeg"
-        if tools_root.exists():
-            for bin_dir in tools_root.glob("*/bin"):
-                if (bin_dir / "ffmpeg.exe").exists():
-                    return str(bin_dir)
-        return None
+        result = self._resolve_ffmpeg_once()
+        return result.yt_dlp_location
 
     def _archive_ids(self) -> set[str]:
         if not self.config.archive_file.is_file():
@@ -274,6 +283,9 @@ class AuthorizedYouTubePlaylistSyncer:
     def sync(self) -> SyncResult:
         started_at = utc_now()
         try:
+            # Resolve once for the whole worker. In particular, a configured
+            # but invalid location must fail before yt-dlp can search elsewhere.
+            self._resolve_ffmpeg_once()
             playlist_id, playlist_title, entries = self._extract_playlist_entries_via_api()
         except Exception as exc:
             return SyncResult.failed_result(exc, started_at=started_at)
