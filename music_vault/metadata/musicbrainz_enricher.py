@@ -11,10 +11,11 @@ import requests
 
 from music_vault.metadata.artist_images import validate_public_url
 from music_vault.metadata.schema import normalize_release_date
+from music_vault.version import user_agent
 
 
 MUSICBRAINZ_ENDPOINT = "https://musicbrainz.org/ws/2/recording/"
-MUSICBRAINZ_USER_AGENT = "MusicVault/1.0.0 (https://github.com/jcjohnson9/music-vault)"
+MUSICBRAINZ_USER_AGENT = user_agent()
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 LOW_CONFIDENCE_SCORE = 80
 

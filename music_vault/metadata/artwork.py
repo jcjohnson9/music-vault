@@ -16,6 +16,7 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QImage, QImageReader, QImageWriter
 
 from music_vault.core.paths import cover_art_archive_dir, manual_covers_dir
+from music_vault.version import user_agent
 
 
 MAX_ARTWORK_BYTES = 8 * 1024 * 1024
@@ -25,7 +26,7 @@ TARGET_EMBEDDED_ARTWORK_BYTES = 1_500_000
 MAX_REDIRECTS = 3
 CONNECT_TIMEOUT_SECONDS = 5
 READ_TIMEOUT_SECONDS = 15
-MUSIC_VAULT_USER_AGENT = "MusicVault/1.0.0 (https://github.com/jcjohnson9/music-vault)"
+MUSIC_VAULT_USER_AGENT = user_agent()
 
 _MIME_FORMATS = {
     "image/png": (".png", frozenset({"png"})),

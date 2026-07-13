@@ -9,12 +9,12 @@ future branch rather than a V1 requirement.
 The roadmap uses implementation batches. A batch is complete only when its own
 acceptance checks pass; a label does not imply that later batches have begun.
 
-**Current public product status:** Music Vault v1.0.0 Release Candidate.
+**Current public product status:** Music Vault v1.0.0 Stable.
 
 ## Batch 1 — GitHub and Source-Control Safety Baseline
 
-**Objective:** Establish a safe, professional, source-only Git baseline for the
-v1.0.0 Release Candidate.
+**Objective:** Establish a safe, professional, source-only Git baseline for
+Music Vault v1.0.0.
 
 **Scope:** Harden ignore and text-handling rules, quarantine local-only hazards,
 add public project documentation, add a read-only publication scanner, add
@@ -124,14 +124,19 @@ later review.
 **Objective:** Publish a reproducible, empty-by-default V1 package after the V1
 trust and presentation gates pass.
 
-**Scope:** Build from a reviewed source commit, bootstrap empty runtime data,
-verify a clean-machine workflow, finalize version metadata and release notes,
-and publish approved source/release artifacts.
+**Scope:** Centralize stable version metadata, define an explicit portable-root
+marker, bootstrap empty private runtime data, add local-only first-run setup and
+bounded FFmpeg discovery, produce reproducible release/compliance artifacts,
+verify clean extracted startup, and publish the approved source and portable
+release.
 
 **Non-goals:** No personal database, key, media, artwork cache, reports, status
 file, or playlist data in the distribution.
 
-**Status:** Next; V1 Stable is gated here.
+**Status:** Complete. Music Vault v1.0.0 is the stable, blank-by-default Windows
+portable release. The repository's own source remains MIT; the combined
+portable distribution carries GPL-3.0-or-later and the preserved terms of its
+separately licensed third-party components.
 
 ## Batch 9 — Full-Screen Party Mode
 
@@ -143,7 +148,7 @@ keyboard escape behavior, and display-aware presentation.
 **Non-goals:** No radio scheduling, mobile mirroring, or change to queue
 semantics.
 
-**Status:** Planned post-V1.
+**Status:** Next.
 
 ## Batch 10 — Multiple Source Playlists
 

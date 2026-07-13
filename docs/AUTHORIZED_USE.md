@@ -18,4 +18,7 @@ FFmpeg, MusicBrainz, Cover Art Archive, Spotify, or ElevenLabs. Third-party
 names are used only to identify compatible services or tools.
 
 Public and unlisted playlists are Music Vault's intended source model. Support
-for private playlists through OAuth is not a project requirement.
+for private playlists through OAuth is not part of v1.0.0. The first-run guide
+requires acknowledgement of this authorized-use boundary before optional
+YouTube setup is enabled. No acknowledgement, API key, or online service is
+required to import and play music files already available locally.

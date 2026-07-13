@@ -50,9 +50,13 @@ from PySide6.QtWidgets import (
     QMenu,
     QSizePolicy,
     QButtonGroup,
+    QDialog,
 )
 
+from music_vault.version import APP_VERSION, DISPLAY_VERSION, RELEASE_CHANNEL
 from music_vault.core.db import MusicVaultDB
+from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
+from music_vault.core.ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
 from music_vault.core.app_status import write_app_status as export_app_status
 from music_vault.core.importer import (
     ImportSourceContext,
@@ -85,9 +89,14 @@ from music_vault.core.paths import (
     artist_images_dir,
     config_path,
     data_dir,
+    data_directory_source,
     database_path,
     default_downloads_dir,
     icon_path,
+    path_resolution_source,
+    portable_root,
+    project_root,
+    configure_data_dir,
     youtube_api_key_path,
     youtube_download_archive_path,
     youtube_failed_ids_path,
@@ -125,6 +134,13 @@ from music_vault.ui.media_grid import (
 )
 from music_vault.ui.metadata_editor import MetadataEditorDialog
 from music_vault.ui.metadata_remediation import MetadataRemediationDialog
+from music_vault.ui.onboarding import (
+    FirstRunWizard,
+    OnboardingResult,
+    inspect_runtime_evidence,
+    sanitized_onboarding_config,
+    should_show_first_run,
+)
 from music_vault.ui.review import schedule_ui_review
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
 from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
@@ -132,6 +148,16 @@ from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
 
 NOW_PLAYING_ROLE = int(Qt.UserRole) + 1
 VOLUME_SAVE_DEBOUNCE_MS = 500
+FFMPEG_SETUP_URL = "https://github.com/jcjohnson9/music-vault#requirements"
+
+
+def _config_supports_completion_inference(path: Path) -> bool:
+    if not path.exists():
+        return True
+    try:
+        return isinstance(json.loads(path.read_text(encoding="utf-8")), dict)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
 
 
 class YouTubeSyncWorker(QThread):
@@ -144,12 +170,14 @@ class YouTubeSyncWorker(QThread):
         output_dir: str,
         audio_quality: str = "320",
         existing_video_ids: frozenset[str] = frozenset(),
+        ffmpeg_location: str | None = None,
     ) -> None:
         super().__init__()
         self.playlist_url = playlist_url
         self.output_dir = output_dir
         self.audio_quality = audio_quality
         self.existing_video_ids = existing_video_ids
+        self.ffmpeg_location = ffmpeg_location
 
     def run(self) -> None:
         try:
@@ -161,6 +189,7 @@ class YouTubeSyncWorker(QThread):
                 audio_format="mp3",
                 audio_quality=self.audio_quality,
                 existing_video_ids=self.existing_video_ids,
+                ffmpeg_location=self.ffmpeg_location,
             )
             syncer = AuthorizedYouTubePlaylistSyncer(config, progress=self.progress.emit)
             result = syncer.sync()
@@ -173,7 +202,7 @@ class MusicVaultWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("Music Vault v1.0")
+        self.setWindowTitle(f"Music Vault {DISPLAY_VERSION}")
 
         app_icon_path = icon_path()
         if app_icon_path.exists():
@@ -181,7 +210,23 @@ class MusicVaultWindow(QMainWindow):
         self.resize(1380, 860)
         self.setMinimumSize(1100, 720)
 
+        runtime_evidence = inspect_runtime_evidence(
+            config_file=config_path(),
+            database_file=database_path(),
+            api_key_file=youtube_api_key_path(),
+            status_file=app_status_path(),
+        )
         self.config = self.load_config()
+        self._last_ffmpeg_discovery: FFmpegDiscoveryResult | None = None
+        if (
+            runtime_evidence.established
+            and self.config.get("onboarding_completed") is not True
+            and _config_supports_completion_inference(config_path())
+        ):
+            # Existing installations predate the guide. Infer completion rather
+            # than interrupting or resetting a working personal library.
+            self.config["onboarding_completed"] = True
+            self.save_config()
         self.volume_percent = normalize_volume_percent(
             self.config.get("volume_percent"),
             DEFAULT_VOLUME_PERCENT,
@@ -278,6 +323,7 @@ class MusicVaultWindow(QMainWindow):
             "audio_quality": "320",
             "volume_percent": DEFAULT_VOLUME_PERCENT,
             "artist_image_fetch_enabled": False,
+            "onboarding_completed": False,
         }
 
     def load_config(self) -> dict:
@@ -1028,6 +1074,32 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.setContentsMargins(20, 20, 20, 20)
         settings_layout.setSpacing(18)
 
+        release_title = QLabel("Release Readiness")
+        release_title.setObjectName("CardTitle")
+
+        self.release_status = QLabel()
+        self.release_status.setObjectName("StatusLine")
+        self.release_status.setWordWrap(True)
+
+        self.runtime_data_status = QLabel()
+        self.runtime_data_status.setObjectName("StatusLine")
+        self.runtime_data_status.setWordWrap(True)
+
+        release_actions = QHBoxLayout()
+        self.change_ffmpeg_btn = self.make_action_button(
+            "Change FFmpeg Location", "folder", self.choose_ffmpeg_location
+        )
+        self.shortcut_btn = self.make_action_button(
+            "Create or Update Shortcut", "settings", self.create_desktop_shortcut
+        )
+        self.reopen_guide_btn = self.make_action_button(
+            "Reopen First-Run Guide", "refresh", self.reopen_first_run_guide
+        )
+        release_actions.addWidget(self.change_ffmpeg_btn)
+        release_actions.addWidget(self.shortcut_btn)
+        release_actions.addWidget(self.reopen_guide_btn)
+        release_actions.addStretch(1)
+
         youtube_title = QLabel("YouTube Sync")
         youtube_title.setObjectName("CardTitle")
 
@@ -1077,6 +1149,18 @@ class MusicVaultWindow(QMainWindow):
             self.settings_quality.setCurrentText(quality)
         else:
             self.settings_quality.setCurrentText("320")
+
+        ffmpeg_location_label = QLabel("FFmpeg Location")
+        ffmpeg_location_label.setObjectName("MutedLabel")
+        self.settings_ffmpeg_location = QLineEdit()
+        self.settings_ffmpeg_location.setObjectName("SearchBox")
+        self.settings_ffmpeg_location.setAccessibleName("FFmpeg location")
+        self.settings_ffmpeg_location.setPlaceholderText(
+            "Optional folder containing ffmpeg.exe and ffprobe.exe"
+        )
+        self.settings_ffmpeg_location.setText(
+            str(self.config.get("ffmpeg_location") or "")
+        )
 
         save_btn = QPushButton("Save Settings")
         save_btn.setObjectName("PrimaryButton")
@@ -1140,7 +1224,7 @@ class MusicVaultWindow(QMainWindow):
         maintenance_row = QHBoxLayout()
 
         open_data_btn = self.make_action_button(
-            "Open Data Folder", "folder", self.open_data_folder
+            "Open Runtime Data Folder", "folder", self.open_data_folder
         )
         clear_failed_btn = self.make_action_button(
             "Clear Failure History", "remove", self.clear_failed_downloads,
@@ -1183,6 +1267,11 @@ class MusicVaultWindow(QMainWindow):
         self.app_status_line.setObjectName("StatusLine")
         self.app_status_line.setWordWrap(True)
 
+        settings_layout.addWidget(release_title)
+        settings_layout.addWidget(self.release_status)
+        settings_layout.addWidget(self.runtime_data_status)
+        settings_layout.addLayout(release_actions)
+        settings_layout.addSpacing(10)
         settings_layout.addWidget(youtube_title)
         settings_layout.addWidget(api_label)
         settings_layout.addWidget(self.settings_api_key)
@@ -1190,6 +1279,8 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addLayout(folder_row)
         settings_layout.addWidget(quality_label)
         settings_layout.addWidget(self.settings_quality)
+        settings_layout.addWidget(ffmpeg_location_label)
+        settings_layout.addWidget(self.settings_ffmpeg_location)
         settings_layout.addWidget(save_btn)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(artist_images_title)
@@ -2430,6 +2521,7 @@ class MusicVaultWindow(QMainWindow):
             self.config["download_folder"],
             self.config["audio_quality"],
             frozenset(self.db.existing_youtube_video_ids()),
+            str(self.config.get("ffmpeg_location") or "").strip() or None,
         )
 
         self.sync_worker.progress.connect(self.log_youtube)
@@ -3316,6 +3408,246 @@ class MusicVaultWindow(QMainWindow):
         if folder:
             self.settings_download_folder.setText(folder)
 
+    def discover_ffmpeg_readiness(
+        self, configured_location: str | None = None
+    ) -> FFmpegDiscoveryResult:
+        if configured_location is None and self._last_ffmpeg_discovery is not None:
+            return self._last_ffmpeg_discovery
+        location = (
+            configured_location
+            if configured_location is not None
+            else str(self.config.get("ffmpeg_location") or "").strip() or None
+        )
+        result = discover_ffmpeg(
+            configured_location=location,
+            portable_tools_location=(portable_root() / "tools" if portable_root() else None),
+            probe=True,
+            timeout=3.0,
+        )
+        if configured_location is None:
+            self._last_ffmpeg_discovery = result
+        return result
+
+    def invalidate_ffmpeg_discovery(self) -> None:
+        self._last_ffmpeg_discovery = None
+
+    @staticmethod
+    def onboarding_ffmpeg_validator(location: str | None) -> tuple[bool, str]:
+        result = discover_ffmpeg(
+            configured_location=location,
+            portable_tools_location=(portable_root() / "tools" if portable_root() else None),
+            probe=True,
+            timeout=3.0,
+        )
+        if result.ready:
+            return True, f"Detected via {result.source}."
+        return False, result.error or "Both ffmpeg.exe and ffprobe.exe are required."
+
+    def choose_ffmpeg_location(self, _checked: bool = False) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose ffmpeg.exe",
+            self.settings_ffmpeg_location.text().strip(),
+            "FFmpeg executable (ffmpeg.exe);;All files (*)",
+        )
+        if not selected:
+            return
+        self.settings_ffmpeg_location.setText(selected)
+        result = self.discover_ffmpeg_readiness(selected)
+        if result.ready:
+            self.ffmpeg_status.setText(
+                f"FFmpeg and ffprobe: Ready ({result.source})\n{result.bin_dir}"
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "FFmpeg not ready",
+                result.error or "The selected location must provide both ffmpeg.exe and ffprobe.exe.",
+            )
+            self.ffmpeg_status.setText(
+                "FFmpeg and ffprobe: Not ready\n"
+                + (result.error or "Both executables are required.")
+            )
+
+    def _shortcut_executable(self) -> Path | None:
+        if getattr(sys, "frozen", False):
+            executable = Path(sys.executable).resolve()
+            return executable if executable.is_file() else None
+        development_executable = project_root() / "dist" / "MusicVault" / "MusicVault.exe"
+        return development_executable.resolve() if development_executable.is_file() else None
+
+    def create_desktop_shortcut(
+        self,
+        _checked: bool = False,
+        *,
+        quiet: bool = False,
+    ) -> bool:
+        executable = self._shortcut_executable()
+        if executable is None:
+            if not quiet:
+                QMessageBox.information(
+                    self,
+                    "Shortcut unavailable",
+                    "Build MusicVault.exe before creating a desktop shortcut from source.",
+                )
+            return False
+
+        root = portable_root() or project_root()
+        result = create_or_update_desktop_shortcut(
+            executable_path=executable,
+            portable_root=root,
+            icon_path=icon_path() if icon_path().is_file() else None,
+            replace_existing_different_target=False,
+        )
+        status = str(result.status).casefold()
+        if "conflict" in status:
+            answer = QMessageBox.question(
+                self,
+                "Update existing shortcut?",
+                "The existing Music Vault shortcut points to another copy. Update it to this copy?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+            result = create_or_update_desktop_shortcut(
+                executable_path=executable,
+                portable_root=root,
+                icon_path=icon_path() if icon_path().is_file() else None,
+                replace_existing_different_target=True,
+            )
+            status = str(result.status).casefold()
+
+        succeeded = result.succeeded
+        if not quiet:
+            if succeeded:
+                QMessageBox.information(
+                    self,
+                    "Desktop shortcut ready",
+                    f"Music Vault shortcut: {result.shortcut_path}",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Shortcut not created",
+                    result.error or "Music Vault could not create the shortcut.",
+                )
+        return succeeded
+
+    def _new_onboarding_wizard(
+        self,
+        *,
+        allow_data_folder_change: bool,
+        create_shortcut_default: bool,
+    ) -> FirstRunWizard:
+        ffmpeg = self.discover_ffmpeg_readiness()
+        wizard = FirstRunWizard(
+            portable_folder=portable_root() or project_root(),
+            data_folder=data_dir(),
+            download_folder=Path(
+                self.config.get("download_folder", str(default_downloads_dir()))
+            ),
+            config=self.config,
+            ffmpeg_ready=ffmpeg.ready,
+            ffmpeg_location=str(self.config.get("ffmpeg_location") or "") or None,
+            ffmpeg_validator=self.onboarding_ffmpeg_validator,
+            setup_docs_url=FFMPEG_SETUP_URL,
+            allow_data_folder_change=allow_data_folder_change,
+            create_shortcut_default=create_shortcut_default,
+            parent=self,
+        )
+        if self.config.get("authorized_use_acknowledged") is True:
+            wizard.authorized_ack.setChecked(True)
+        return wizard
+
+    def reopen_first_run_guide(self, _checked: bool = False) -> None:
+        wizard = self._new_onboarding_wizard(
+            allow_data_folder_change=False,
+            create_shortcut_default=False,
+        )
+        if wizard.exec() == QDialog.Accepted:
+            self.apply_onboarding_result(wizard.result_values())
+
+    def apply_onboarding_result(self, result: OnboardingResult) -> None:
+        previous_ffmpeg_location = str(
+            self.config.get("ffmpeg_location") or ""
+        ).strip()
+        self.config = sanitized_onboarding_config(self.config, result)
+        if (
+            str(self.config.get("ffmpeg_location") or "").strip()
+            != previous_ffmpeg_location
+        ):
+            self.invalidate_ffmpeg_discovery()
+        self.save_config()
+        imported_count: int | None = None
+
+        if result.api_key:
+            self.api_key_path().parent.mkdir(parents=True, exist_ok=True)
+            self.api_key_path().write_text(result.api_key, encoding="utf-8")
+
+        if result.local_import_folder is not None:
+            try:
+                if not result.local_import_folder.is_dir():
+                    raise FileNotFoundError("The selected import folder is unavailable.")
+                count = import_folder(self.db, str(result.local_import_folder))
+                imported_count = count
+                if count:
+                    self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
+                    self.refresh_current_view()
+            except (OSError, RuntimeError, ValueError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "Local import not completed",
+                    sanitize_error_text(exc),
+                )
+
+        shortcut_ready = (
+            self.create_desktop_shortcut(quiet=True)
+            if result.create_shortcut
+            else None
+        )
+
+        if hasattr(self, "settings_download_folder"):
+            self.settings_download_folder.setText(str(result.download_folder))
+        if hasattr(self, "settings_quality"):
+            self.settings_quality.setCurrentText(result.audio_quality)
+        if hasattr(self, "settings_ffmpeg_location"):
+            self.settings_ffmpeg_location.setText(result.ffmpeg_location or "")
+        if hasattr(self, "youtube_output"):
+            self.youtube_output.setText(str(result.download_folder))
+
+        self.refresh_settings_status()
+        self.write_app_status()
+        setup_parts = [
+            (
+                f"Local import: {imported_count} file(s)"
+                if imported_count is not None
+                else "Local import: skipped"
+            ),
+            "YouTube API: ready"
+            if bool(self.read_saved_api_key())
+            else "YouTube API: not configured",
+            "FFmpeg: ready"
+            if bool(
+                getattr(self, "_last_ffmpeg_discovery", None)
+                and self._last_ffmpeg_discovery.ready
+            )
+            else "FFmpeg: not configured",
+            (
+                "Shortcut: ready"
+                if shortcut_ready is True
+                else "Shortcut: not created"
+                if shortcut_ready is False
+                else "Shortcut: skipped"
+            ),
+        ]
+        setup_bar = self.statusBar()
+        setup_bar.setStyleSheet(
+            f"background: {COLORS['elevated_surface']}; color: {COLORS['text_secondary']};"
+        )
+        setup_bar.showMessage("Setup complete — " + "; ".join(setup_parts), 15000)
+        QTimer.singleShot(15000, setup_bar.hide)
+
     def confirm_enable_artist_photos(self) -> None:
         if self.config.get("artist_image_fetch_enabled") is True:
             return
@@ -3452,6 +3784,16 @@ class MusicVaultWindow(QMainWindow):
 
         self.config["download_folder"] = str(Path(download_folder).resolve())
         self.config["audio_quality"] = self.settings_quality.currentText()
+        previous_ffmpeg_location = str(
+            self.config.get("ffmpeg_location") or ""
+        ).strip()
+        ffmpeg_location = self.settings_ffmpeg_location.text().strip()
+        if ffmpeg_location:
+            self.config["ffmpeg_location"] = ffmpeg_location
+        else:
+            self.config.pop("ffmpeg_location", None)
+        if ffmpeg_location != previous_ffmpeg_location:
+            self.invalidate_ffmpeg_discovery()
         self.config["artist_image_fetch_enabled"] = bool(
             self.settings_artist_images_enabled.isChecked()
             and self.config.get("artist_image_fetch_enabled") is True
@@ -3510,11 +3852,23 @@ class MusicVaultWindow(QMainWindow):
             self.api_status_card.value_label.setText("Missing")
 
         ffmpeg_bin = self.find_ffmpeg_bin()
+        ffmpeg = getattr(self, "_last_ffmpeg_discovery", None)
 
         if ffmpeg_bin:
-            self.ffmpeg_status.setText(f"FFmpeg: Found at {ffmpeg_bin}")
+            self.ffmpeg_status.setText(
+                "FFmpeg and ffprobe: Ready"
+                + (f" ({ffmpeg.source})" if ffmpeg is not None else "")
+                + f"\n{ffmpeg_bin}"
+            )
         else:
-            self.ffmpeg_status.setText("FFmpeg: Not found. Downloads may fail during MP3 conversion.")
+            self.ffmpeg_status.setText(
+                "FFmpeg and ffprobe: Not ready. Local playback/import remains available.\n"
+                + (
+                    ffmpeg.error
+                    if ffmpeg is not None and ffmpeg.error
+                    else "Configure both tools before using conversion features."
+                )
+            )
 
         download_folder = Path(
             self.config.get(
@@ -3547,6 +3901,20 @@ class MusicVaultWindow(QMainWindow):
                 f"App Status: {app_status_path()}"
             )
 
+        if hasattr(self, "release_status"):
+            self.release_status.setText(
+                f"Application: Music Vault {DISPLAY_VERSION}\n"
+                f"Release Channel: {RELEASE_CHANNEL}"
+            )
+
+        if hasattr(self, "runtime_data_status"):
+            self.runtime_data_status.setText(
+                f"Runtime Data: {data_dir().resolve()}\n"
+                f"Portable Application: {(portable_root() or project_root()).resolve()}\n"
+                f"Runtime Source: {data_directory_source()}\n"
+                f"Application Source: {path_resolution_source()}"
+            )
+
         if hasattr(self, "settings_download_folder"):
             self.settings_download_folder.setText(str(download_folder.resolve()))
 
@@ -3555,6 +3923,11 @@ class MusicVaultWindow(QMainWindow):
 
             if quality in ["192", "256", "320"]:
                 self.settings_quality.setCurrentText(quality)
+
+        if hasattr(self, "settings_ffmpeg_location"):
+            self.settings_ffmpeg_location.setText(
+                str(self.config.get("ffmpeg_location") or "")
+            )
 
         if hasattr(self, "settings_api_key") and not self.settings_api_key.text().strip():
             self.settings_api_key.setText(self.read_saved_api_key())
@@ -3586,19 +3959,112 @@ class MusicVaultWindow(QMainWindow):
         super().closeEvent(event)
 
     def find_ffmpeg_bin(self) -> str | None:
-        tools_root = Path.home() / "Documents" / "MusicVaultTools" / "ffmpeg"
+        result = self.discover_ffmpeg_readiness()
+        return result.yt_dlp_location if result.ready else None
 
-        if tools_root.exists():
-            for bin_dir in tools_root.glob("*/bin"):
-                if (bin_dir / "ffmpeg.exe").exists():
-                    return str(bin_dir)
 
-        return None
+def _load_first_run_config() -> dict:
+    path = config_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+
+
+def _first_run_ffmpeg_validator(location: str | None) -> tuple[bool, str]:
+    result = discover_ffmpeg(
+        configured_location=location,
+        portable_tools_location=(portable_root() / "tools" if portable_root() else None),
+        probe=True,
+        timeout=3.0,
+    )
+    if result.ready:
+        return True, f"Detected via {result.source}."
+    return False, result.error or "Both ffmpeg.exe and ffprobe.exe are required."
+
+
+def prepare_first_run(_app: QApplication) -> tuple[bool, OnboardingResult | None]:
+    """Collect blank-runtime choices before MusicVaultDB can create a database."""
+    config = _load_first_run_config()
+    evidence = inspect_runtime_evidence(
+        config_file=config_path(),
+        database_file=database_path(),
+        api_key_file=youtube_api_key_path(),
+        status_file=app_status_path(),
+    )
+    if not should_show_first_run(config, evidence):
+        return True, None
+
+    portable = portable_root()
+    ffmpeg = discover_ffmpeg(
+        configured_location=str(config.get("ffmpeg_location") or "").strip() or None,
+        portable_tools_location=(portable / "tools" if portable else None),
+        probe=True,
+        timeout=3.0,
+    )
+    wizard = FirstRunWizard(
+        portable_folder=portable or project_root(),
+        data_folder=data_dir(),
+        download_folder=Path(
+            config.get("download_folder", str(default_downloads_dir()))
+        ),
+        config=config,
+        ffmpeg_ready=ffmpeg.ready,
+        ffmpeg_location=str(config.get("ffmpeg_location") or "").strip() or None,
+        ffmpeg_validator=_first_run_ffmpeg_validator,
+        setup_docs_url=FFMPEG_SETUP_URL,
+        allow_data_folder_change=portable is not None,
+        create_shortcut_default=portable is not None,
+    )
+    if wizard.exec() != QDialog.Accepted:
+        return False, None
+
+    result = wizard.result_values()
+    configured = configure_data_dir(
+        result.data_folder,
+        persist=portable is not None,
+        create=True,
+    )
+    if not configured.configured or (portable is not None and not configured.persisted):
+        QMessageBox.critical(
+            None,
+            "Music Vault storage unavailable",
+            configured.error
+            or "The selected runtime data location could not be saved. Choose another location or exit.",
+        )
+        return False, None
+
+    try:
+        selected_config = sanitized_onboarding_config(config, result)
+        config_file = config_path()
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            json.dumps(config_for_persistence(selected_config), indent=2),
+            encoding="utf-8",
+        )
+        if result.api_key:
+            key_file = youtube_api_key_path()
+            key_file.parent.mkdir(parents=True, exist_ok=True)
+            key_file.write_text(result.api_key, encoding="utf-8")
+    except OSError:
+        QMessageBox.critical(
+            None,
+            "Music Vault setup unavailable",
+            "Music Vault could not save setup in the selected private data folder.",
+        )
+        return False, None
+    return True, result
 
 
 def main() -> None:
     app = QApplication(sys.argv)
+    proceed, onboarding_result = prepare_first_run(app)
+    if not proceed:
+        return
     window = MusicVaultWindow()
+    if onboarding_result is not None:
+        window.apply_onboarding_result(onboarding_result)
     window.show()
     schedule_ui_review(window, app)
     sys.exit(app.exec())

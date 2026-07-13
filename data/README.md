@@ -1,7 +1,10 @@
 # Local runtime data
 
-Music Vault creates and populates this directory locally at runtime. A public
-source checkout intentionally contains no user library or credentials.
+Music Vault creates and populates a private data directory locally at runtime.
+Source development uses this project directory. A default portable installation
+uses `data` beside `MusicVault.exe`, while first-run setup can select another
+writable location. A public source checkout and the v1.0.0 portable ZIP both
+contain no user library or credentials.
 
 Never commit user databases, API keys, configuration, status files, download
 archives, failed-item records, media, cover art, artist images, metadata reports,
@@ -11,6 +14,13 @@ Music Vault may create timestamped SQLite migration backups under `backups/`
 and a neutral external App Status document named `music_vault_status.json`.
 Both are private runtime data. The status document contains no API-key value and
 does not represent a Watchtower integration.
+
+The portable release contains the `music-vault.portable.json` root marker but
+does not contain a populated data folder. On first launch, Music Vault creates
+only the selected runtime directories and an empty schema-v4 database. Local
+import/playback works without an API key or FFmpeg. Optional YouTube setup keeps
+the key in `youtube_api_key.txt`; it is never stored in JSON configuration or
+bundled into a release. The command-line FFmpeg tools are installed separately.
 
 Schema version 4 keeps effective metadata, source observations, provenance,
 confidence, field locks, and grouped change history inside the private SQLite
@@ -38,4 +48,5 @@ disabled or cleared from the application. These images may belong to third
 parties; neither the files nor their manifest belongs in source control or a
 public build.
 
-Only this README and `.gitkeep` are intended to be tracked.
+Only this README and `.gitkeep` are intended to be tracked here. Never build a
+public portable package from an initialized personal data directory.

@@ -2,13 +2,15 @@
 
 Music Vault is a standalone, local-first Windows desktop application. PySide6
 provides the user interface, Qt Multimedia provides playback through
-`QMediaPlayer`, and SQLite stores the local library and playlists.
+`QMediaPlayer`, and SQLite stores the local library and playlists. Version
+`1.0.0` is the stable portable Windows release.
 
 ## Source layout
 
 | Path | Responsibility |
 | --- | --- |
 | `run.py` | Source entry point that creates and starts the application. |
+| `music_vault/version.py` | Authoritative application name, stable version, release channel, public user agent, and Windows resource values. |
 | `music_vault/app.py` | Main PySide6 window, view orchestration, playback, queue, settings, synchronization orchestration, and status updates. |
 | `music_vault/core/db.py` | Versioned additive SQLite migrations, source identity, failure history, and library/playlist persistence. |
 | `music_vault/core/importer.py` | Source-aware Mutagen metadata and embedded-artwork import. |
@@ -17,7 +19,9 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/safety.py` | Secret redaction, video-ID extraction, source-date normalization, and safe output paths. |
 | `music_vault/core/playback_state.py` | Pure volume normalization/config filtering and track-ID-to-table-row helpers. |
 | `music_vault/core/library_browser.py` | SQL-aggregated album/artist summaries, stable browser identities, exact track lookup, revision fingerprints, and summary-cache invalidation. |
-| `music_vault/core/paths.py` | Central project, runtime-data, asset, and frozen-application path resolution. |
+| `music_vault/core/paths.py` | Central source, portable-marker, selected runtime-data, asset, and frozen-application path resolution. |
+| `music_vault/core/ffmpeg.py` | Bounded discovery and validation of a complete external `ffmpeg.exe`/`ffprobe.exe` pair. |
+| `music_vault/core/desktop_shortcut.py` | Non-admin portable desktop-shortcut inspection, conflict handling, and creation. |
 | `music_vault/core/app_status.py` | Versioned, read-only-for-consumers neutral App Status JSON export. |
 | `music_vault/core/watchtower_status.py` | Temporary compatibility re-export for the former module name. |
 | `music_vault/ui/theme.py` | Central colors, spacing, radii, typography, shared QSS, and guarded native dark-title-bar integration. |
@@ -28,6 +32,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/thumbnail_cache.py` | Bounded memory LRU, coalesced background QImage decoding, high-DPI thumbnail keys, and stale-generation protection. |
 | `music_vault/ui/metadata_editor.py` | Trusted Metadata dialog for field actions, source inspection, candidate review, history, and undo. |
 | `music_vault/ui/metadata_tasks.py` | Cancellable, stale-result-safe background provider work for the metadata editor. |
+| `music_vault/ui/onboarding.py` | Blank-runtime detection helpers and the local-first, optional-sync first-run guide. |
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
@@ -40,6 +45,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/metadata/artwork.py` | Validated content-addressed local and Cover Art Archive artwork storage. |
 | `music_vault/metadata/cover_art.py` | Compatibility helper for existing Cover Art Archive behavior. |
 | `MusicVault.spec` | PyInstaller configuration for the packaged Windows application. |
+| `tools/release/` | Deterministic portable/source-compliance builders, release manifest and checksum generation, license inventory, and fail-closed verification. |
 | `tools/dev/profile_media_browsers.py` | Synthetic-only 300/1,000/5,000-track query, model, render, thumbnail, and revisit profiler. |
 | `tools/dev/remediate_library_metadata.py` | Aggregate-only status, analyze, resume, explicitly confirmed apply/writeback, verify, report, and rollback interface. |
 
@@ -78,29 +84,68 @@ library.
 
 Application modules, assets, documentation, development tools, dependency
 manifests, and the PyInstaller specification belong in source control. Source
-code must not contain credentials or private library content.
+code must not contain credentials or private library content. Music Vault's own
+source remains MIT licensed; that does not make the combined portable binary an
+MIT-only distribution.
 
 ### Runtime data
 
-The local `data/` directory contains user-specific state such as the SQLite
-database, configuration, API-key file, synchronization state, media, artwork,
-artist-image files and provenance under `data/artist_images/`, status export,
-remediation reports/candidate snapshots/cache state, and database/media backups
-under `data/backups/`. Runtime data is private and excluded from source control
-and public packages.
+In a default portable installation, the `data/` directory beside
+`MusicVault.exe` contains user-specific state such as the SQLite database,
+configuration, API-key file, synchronization state, media, artwork,
+artist-image files and provenance, App Status, remediation state/reports, and
+database/media backups. The first-run guide can select another writable data
+directory; a small per-executable locator under local application data retains
+that selection. Every runtime location is private and excluded from source
+control and public packages.
 
-### Build output
+### Build and release output
 
-PyInstaller generates `build/` intermediates and the packaged application under
-`dist/`. These are generated artifacts, not source, and are excluded from the
-repository.
+PyInstaller generates `build/` intermediates and the official one-folder
+application under `dist/`. The release builder copies only the allowed runtime
+payload and public notices into a fresh staging root, adds the portable marker,
+manifest, and checksums, then creates the portable and source-compliance ZIPs.
+Build, staging, and release artifacts are generated and excluded from source
+control. The blank portable package contains no populated `data` directory.
+
+The repository's source license is MIT. The combined v1.0.0 portable
+distribution is conveyed under GPL-3.0-or-later because it embeds GPL-covered
+Mutagen; PySide6/Qt, the Qt Multimedia FFmpeg shared libraries, and other
+components retain their separate terms. Required texts and source/relinking
+information ship in the release artifact set. The command-line
+`ffmpeg.exe`/`ffprobe.exe` tools are not bundled.
 
 ### External services and tools
 
 YouTube and the YouTube Data API provide source-playlist information. yt-dlp
-and FFmpeg handle authorized media processing. MusicBrainz and Cover Art
+and separately configured FFmpeg tools handle authorized media processing.
+MusicBrainz and Cover Art
 Archive can provide metadata and artwork. The application should continue to
 separate these integrations from local library ownership and persistence.
+
+## Portable release and first-run boundary
+
+`music-vault.portable.json` identifies an extracted portable root beside
+`MusicVault.exe`. Frozen path resolution first honors a valid explicit
+`MUSIC_VAULT_PROJECT_ROOT`, then the portable marker, source/development roots,
+and existing development-dist compatibility before using a logged fallback. It
+does not derive runtime data from an arbitrary shell working directory and does
+not create runtime data inside `_internal`.
+
+The marker's default data directory is `<portable-root>/data`. A user can choose
+a different writable folder before database construction; the portable package
+itself remains relocatable and needs neither the source repository nor a folder
+named `dist`. An unwritable location produces a visible choice to select another
+folder or exit, with no automatic elevation.
+
+First-run onboarding is shown only when there is no established config, secret,
+library, playlist, or prior runtime evidence. Established installations infer
+completion and continue without resetting settings or paths. A blank user can
+import a chosen local folder or start empty, and can skip YouTube and FFmpeg
+setup entirely. The API key remains in its secret file, never JSON config;
+authorized-use acknowledgement gates optional synchronization setup but not
+local import/playback. Desktop shortcuts are explicit, per-user, and retain the
+portable root as their working directory.
 
 ## Metadata authority boundary
 

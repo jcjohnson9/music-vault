@@ -34,3 +34,9 @@
 *.gz binary
 *.tgz binary
 *.rar binary
+
+# Preserve byte-for-byte notices copied from hash-pinned Qt source archives.
+licenses/qt-attrib/** -text
+# Upstream license text may intentionally contain trailing spaces or blank EOF
+# lines; preserve it verbatim while retaining whitespace checks everywhere else.
+licenses/** -whitespace

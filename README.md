@@ -2,185 +2,99 @@
   <img src="assets/icons/music_vault_icon.png" alt="Music Vault icon" width="128">
 </p>
 
-# Music Vault
+# Music Vault v1.0.0
 
-Music Vault is a standalone, local-first personal music system that transforms
-authorized public or unlisted YouTube playlists into a persistent local library
-with metadata, artwork, playlists, and playback.
+Music Vault is a standalone, local-first Windows music library and player. It
+imports music already on the computer and can optionally synchronize authorized
+public or unlisted YouTube playlists into a persistent local library.
 
-## Current status
+**Current status: v1.0.0 Stable.** Batches 1 through 8 are complete. Music
+Vault has no Watchtower relationship or runtime dependency.
+See the [v1.0.0 release notes](docs/releases/v1.0.0.md) for installation,
+first-run, licensing, and known-limit details.
 
-**v1.0.0 Release Candidate — not yet V1 Stable**
+## Install the portable release
 
-The core Windows application and premium desktop UI are established, while
-remaining release-candidate gates are tracked in the
-[project roadmap](docs/ROADMAP.md). Music Vault is designed for personal,
-local-first use; its source code is available under the [MIT License](LICENSE).
+1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
+   [GitHub Releases page](https://github.com/jcjohnson9/music-vault/releases).
+2. Verify the published SHA-256 checksum, then extract the complete folder to a
+   writable location. Do not run the application from inside the ZIP.
+3. Run `MusicVault.exe` and complete the first-run guide.
 
-## Core capabilities
+The portable package starts blank. It contains no personal library, database,
+playlist, configuration, API key, media, artwork, report, backup, or status
+file. Windows may show a SmartScreen warning because v1.0.0 is not code-signed.
 
-- Public and unlisted YouTube playlist synchronization through the YouTube Data API
-- Anonymous yt-dlp extraction with no silent browser-cookie access
-- Full API pagination for large playlists
-- Incremental acquisition reconciled from stable video IDs and real local files
-- Truthful complete, complete-with-issues, and failed synchronization outcomes
-- Structured failed-item history with retry on the next manual sync
-- Authorized media acquisition with yt-dlp and FFmpeg
-- Persistent local library backed by SQLite
-- Embedded artwork extraction and artwork display
-- Schema-v4 metadata authority with source observations, field-level
-  provenance/confidence, protected manual or confirmed values, and resumable
-  remediation jobs
-- Trusted Metadata editor for title, artist, album, album artist, canonical
-  release date, artwork, source inspection, grouped history, and library-level
-  undo
-- Explicit MusicBrainz candidate review with selected-field application and
-  optional validated Cover Art Archive artwork
-- Existing-library remediation with non-destructive analysis, strict confidence
-  classes, private reports, provider caching, pause/resume, manual review,
-  explicitly confirmed high-confidence apply, verification, and rollback
-- Audited MP3 tag writeback using exact full-file backups, temporary-copy
-  mutation, tag readback, and unchanged audio-payload checks; unsupported
-  formats remain truthful database-only updates
-- Fast SQL-backed Album and Artist model/view browsers with cached summaries,
-  visible-range high-DPI thumbnails, and exact same-title album separation
-- Album cards retain album artwork; Artist cards use a dedicated unknown-artist
-  placeholder or an optional credible cached artist photo, never an album-cover
-  fallback
-- Custom local playlists
-- Local playback with seek and persisted volume controls
-- Independent now-playing identity with active-row tracking across automatic,
-  queued, next, and previous playback
-- Autoplay, shuffle, and repeat modes
-- Temporary FIFO queue that resumes its original playback context
-- Windows default audio-output following
-- Local settings for the API key, download folder, and audio quality
-- PyInstaller-based Windows EXE workflow with a custom icon
-- Centralized premium dark UI system with original scalable icons, responsive
-  desktop layouts, accessible focus states, and native-title-bar integration
-- Source verification, build, launch, and publication-safety tooling
-- Versioned, neutral App Status JSON for optional local consumers
+Local import and playback need neither a YouTube API key nor FFmpeg. YouTube
+synchronization is optional and requires a locally stored YouTube Data API key,
+an authorized public or unlisted playlist, and separately installed
+`ffmpeg.exe` plus `ffprobe.exe`. FFmpeg command-line tools are not bundled or
+downloaded automatically.
 
-Music Vault does not currently provide private-playlist OAuth, multiple source
-playlists, Android support, Prime control, radio stations, AcoustID matching,
-general-web metadata scraping, automatic uncertain-match application, or tag
-writeback beyond the currently audited MP3 path.
+## Core V1 capabilities
 
-## Product boundaries
+- Local SQLite library, custom playlists, album and artist browsers, search,
+  cover art, and Qt Multimedia playback
+- Seek, persisted volume, default Windows audio output, autoplay, shuffle,
+  repeat, and a FIFO manual queue that resumes its original context
+- Optional authorized public/unlisted YouTube playlist synchronization with
+  full pagination, incremental video-ID reconciliation, structured failures,
+  retry, and truthful completion states
+- Local settings for downloads, conversion quality, API readiness, FFmpeg
+  readiness, data location, and a non-admin desktop shortcut
+- Trusted Metadata editing with provenance, protected manual/confirmed values,
+  grouped history, undo, explicit MusicBrainz candidate review, and validated
+  artwork
+- Resumable existing-library remediation with analysis before apply, strict
+  high-confidence automation, private reports, verified MP3 backups/writeback,
+  unchanged-audio checks, and conflict-aware rollback
+- Fast SQL-backed album/artist grids, optional privacy-aware artist photos, and
+  the premium scalable Windows desktop UI
+- Neutral, versioned local App Status JSON for optional local consumers
 
-Music Vault is a standalone application. It is not a Watchtower module, and
-Watchtower has no planned role in the product. The existing versioned status
-document is generic local infrastructure and does not create a Watchtower
-runtime dependency.
+Music Vault does not silently inspect browser cookies, start synchronization or
+metadata remediation on launch, auto-apply uncertain metadata matches, or scan
+the entire computer.
 
-Neutral interoperability with Prime is only a possible future option. A
-separate Android application and personal radio system are also future
-ambitions, not current features or requirements for this release candidate.
+## First launch and local data
 
-## Requirements
+The first-run guide appears only for a genuinely blank runtime. It validates a
+writable data location, offers an optional local-folder import, and lets the
+user continue without YouTube or FFmpeg. YouTube setup requires acknowledgement
+of the [Authorized Use](docs/AUTHORIZED_USE.md) notice; local-only use does not.
 
-- Windows
-- Python 3.11 for source development
-- FFmpeg for synchronized-media conversion
-- A YouTube Data API key for playlist synchronization
+By default, a portable copy stores private runtime data in `data` beside
+`MusicVault.exe`. A different writable location can be selected during first-run
+setup; Settings reports and opens the active location. That location can contain
+the database, API-key file, configuration, status, downloaded media, artwork,
+archives, remediation state, and backups.
+Back it up as private personal data and never add it to source control or a
+public release. See [Data and Privacy](docs/DATA_AND_PRIVACY.md).
 
-Install FFmpeg before using Sync Center and make it discoverable by FFmpeg-aware
-tools, normally through `PATH`.
+## Authorized synchronization and metadata
 
-## Source setup
+Use synchronization only for music that you own or are authorized to download.
+Public and unlisted playlists are supported; private-playlist OAuth is not.
+Failed items remain visible and are retried on a later manual sync.
 
-From the project root, create a project-local Python 3.11 virtual environment
-and install the runtime dependencies:
+YouTube upload dates remain source provenance rather than canonical release
+dates. Manual metadata work is local. Music Vault contacts MusicBrainz only for
+an explicit candidate search or library analysis; uncertain items remain
+unchanged. See the [Metadata Model](docs/METADATA_MODEL.md) and
+[Metadata Remediation](docs/METADATA_REMEDIATION.md).
+
+## Source development
+
+Music Vault source targets Python 3.11 on Windows:
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-For development and EXE build tooling, install the development requirements:
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-Launch the source application with:
-
-```powershell
-.\tools\dev\run_source.ps1
-```
-
-## Synchronizing an authorized playlist
-
-1. Open **Sync Center**.
-2. Enter a public or unlisted YouTube playlist URL.
-3. Choose a local download folder and audio-quality setting as needed.
-4. Confirm that you are authorized to download the playlist content.
-5. Select **Start Sync**.
-
-Music Vault enumerates the playlist through the YouTube Data API, compares
-stable video IDs with local state, acquires missing authorized items, and imports
-only the resulting new or newly discovered local files into the library. Public
-and unlisted playlists are supported; Music Vault does not silently inspect
-browser cookie stores. Failed items are reported and retried on the next manual
-sync rather than permanently suppressed.
-
-YouTube upload dates are stored as source provenance. They are not presented as
-canonical musical release years. Local imports may continue to use legitimate
-embedded release metadata. **Edit Metadata** exposes source observations,
-protected manual correction, and an explicit MusicBrainz candidate review.
-Approved changes are stored in the Music Vault library; Batch 6 does not rewrite
-the underlying audio-file tags. The separate Batch 7 workflow can analyze the
-existing library and, only after explicit confirmation, apply strict high-
-confidence database changes and optionally verified MP3 tags. See the
-[Metadata Model](docs/METADATA_MODEL.md) and
-[Metadata Remediation](docs/METADATA_REMEDIATION.md).
-
-See [Authorized Use](docs/AUTHORIZED_USE.md) before using synchronization.
-
-## Local configuration and privacy
-
-The YouTube Data API key, database, configuration, status, artwork, metadata
-history, archives, downloaded media, and pre-migration database backups are
-stored locally under the runtime data area. Database backups are written to
-`data/backups/` before a non-empty older schema is upgraded. Validated manual
-and candidate artwork is copied into managed runtime cover storage. These files
-are intentionally excluded from Git and are not part of a source checkout.
-
-Remediation jobs, provider-cache data, candidate snapshots, reports, apply and
-rollback manifests, generated artwork, and original-media backups are also
-private runtime data. Reports live under `data/metadata_reports/`; per-job media
-backups live under `data/backups/metadata_jobs/`. They can identify a personal
-library and must never be committed or attached publicly.
-
-Download-folder and audio-quality choices are local settings. Never paste API
-keys, private playlist details, database files, status files, or unsanitized
-local paths into an issue. See [Data and Privacy](docs/DATA_AND_PRIVACY.md) and
-[Security](SECURITY.md).
-
-Artist-photo lookup is a separate opt-in setting and is disabled by default.
-When enabled, visible artist names may be sent to public MusicBrainz,
-Wikidata/Wikipedia, and Wikimedia services; no API key is required. Photos and
-provenance are cached only under `data/artist_images/`, remain ignored by Git,
-and can be cleared from Music Vault. Disabling fetching prevents new requests
-while allowing an existing valid cache to remain visible.
-
-Manual metadata editing is offline. A MusicBrainz recording search happens only
-after the user clicks **Search MusicBrainz** and sends the entered title and
-artist to that public service. Candidate cover retrieval happens only after the
-user selects and confirms candidate artwork. Neither request uses the YouTube
-API key or browser cookies.
-
-Library remediation is also explicit and never starts at launch. Analysis may
-send current effective title, artist, and duration to MusicBrainz, but it does
-not change effective metadata or files. Apply requires a separate confirmation;
-media writeback and rollback require additional explicit choices. No remediation
-operation starts YouTube synchronization or uses the YouTube API key.
-
-## Developer workflow
-
-The PowerShell helpers resolve the project root and use the project-local
-virtual environment:
+Common engineering commands:
 
 ```powershell
 .\tools\dev\verify.ps1
@@ -188,76 +102,46 @@ virtual environment:
 .\tools\dev\run_source.ps1
 .\tools\dev\build_exe.ps1
 .\tools\dev\run_exe.ps1
-.\tools\dev\run_exe_from_temp.ps1
-.\tools\dev\check_status.ps1
-.\tools\dev\rebuild_and_run.ps1
-.\tools\dev\v1_sanity_check.ps1
 .\tools\dev\capture_ui_review.ps1
 .\tools\dev\profile_media_browsers.ps1
 .\tools\dev\remediate_library_metadata.ps1 status
-```
-
-Run the synthetic regression suite with:
-
-```powershell
 .\.venv\Scripts\python.exe -B -m pytest -q
 ```
 
-The UI review helper creates an isolated synthetic runtime and sanitized
-screenshots outside the repository by default. It never uses the personal
-database, API key, media, artwork cache, or network services. Screenshot output
-is for local review only and is not committed automatically.
-
-The media-browser profiler likewise creates temporary current-schema synthetic
-libraries at 300, 1,000, and 5,000 tracks. It reports SQL-summary, model,
-first-render, cached-revisit, widget, and thumbnail metrics without reading the
-personal library or using network services. Timing variance is informational;
-structural failures produce a nonzero result.
-
-Build the one-folder Windows application with:
+Release builds use the exact versions in `requirements-release.txt` and the
+checked-in `MusicVault.spec`:
 
 ```powershell
 .\tools\dev\build_exe.ps1
+.\tools\release\build_portable_release.ps1
+.\tools\release\verify_portable_release.ps1 `
+  .\release_artifacts\MusicVault-v1.0.0-Windows-x64-Portable.zip
 ```
 
-Source changes require rebuilding the EXE before a desktop shortcut reflects
-them. To create or update the non-admin desktop shortcut after a build, run:
-
-```powershell
-.\tools\dev\install_desktop_shortcut.ps1
-```
-
-For a direct PyInstaller invocation, use the project-local environment and the
-checked-in specification:
-
-```powershell
-.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean .\MusicVault.spec
-```
-
-See [Architecture](docs/ARCHITECTURE.md) for the current code and data flow, and
+Generated builds, screenshots, benchmarks, release staging, and all runtime
+data remain untracked. See [Architecture](docs/ARCHITECTURE.md) and
 [Contributing](CONTRIBUTING.md) before proposing a change.
 
-## Remaining release-candidate gates
+## Product boundaries and roadmap
 
-- Batch 6 metadata foundation and manual correction is complete.
-- Batch 7 existing-library remediation is complete only when its automated,
-  packaged-sandbox, controlled-live dry-run/apply, backup, verification,
-  publication, and merge gates are all recorded as passed.
-- Batch 8 clean blank distribution is next; a clean V1 package has not yet been
-  published.
+Music Vault is a standalone application. Neutral Prime interoperability is only
+a possible external future option. Android, multiple source playlists, Best
+Original quality, an installer/updater, an editable queue panel, and personal
+radio are not V1 requirements. Batch 9 Full-Screen Party Mode is next; see the
+[roadmap](docs/ROADMAP.md).
 
-Correction work and release ordering are tracked in
-[the roadmap](docs/ROADMAP.md).
+## Licensing
 
-## Screenshots
+Music Vault source written for this repository remains under the
+[MIT License](LICENSE). Third-party components retain their own licenses. The
+combined v1.0.0 portable Windows distribution is provided under
+GPL-3.0-or-later because it embeds GPL-covered Mutagen, while separately
+licensed components keep their terms; it is not an MIT-only binary.
 
-The developer review harness can generate sanitized synthetic screenshots for
-Library, Albums, Artists, Sync Center, Settings, and empty states at common
-desktop sizes. Personal-library and temporary review screenshots are
-intentionally not included in source control.
-
-## License
-
-Music Vault source code is licensed under the [MIT License](LICENSE). The source
-license does not grant rights to third-party music, artwork, metadata, APIs,
-websites, or services used with the application.
+Each binary release includes third-party notices and is accompanied by a source-
+compliance archive with the exact tagged source, build inputs, license texts,
+and source/relinking information. See
+[Third-Party Notices](THIRD_PARTY_NOTICES.md) and
+[Binary Distribution License](docs/BINARY_DISTRIBUTION_LICENSE.md). The project
+licenses do not grant rights to third-party music, artwork, metadata, APIs,
+websites, or services.

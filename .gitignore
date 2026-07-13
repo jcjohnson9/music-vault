@@ -25,6 +25,7 @@ music-vault-ui-review-*.png
 # Build and packaged output
 build/
 dist/
+release_artifacts/
 *.zip
 *.7z
 *.tar

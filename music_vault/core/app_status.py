@@ -5,6 +5,9 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from music_vault.version import APP_VERSION
+
+from .ffmpeg import discover_ffmpeg
 from .paths import (
     app_status_path,
     config_path,
@@ -19,7 +22,6 @@ from .safety import sanitize_error_text
 
 
 SCHEMA_VERSION = 1
-APP_VERSION = "1.0"
 LEGACY_SYNC_FIELDS = (
     "last_sync_at",
     "last_sync_status",
@@ -68,11 +70,16 @@ def _api_ready() -> bool:
         return False
 
 
-def _ffmpeg_ready() -> bool:
-    tools_root = Path.home() / "Documents" / "MusicVaultTools" / "ffmpeg"
-    return tools_root.exists() and any(
-        (bin_dir / "ffmpeg.exe").exists() for bin_dir in tools_root.glob("*/bin")
+def _ffmpeg_ready(config=None) -> bool:
+    configured = config.get("ffmpeg_location") if isinstance(config, dict) else None
+    portable_tools = (
+        config.get("portable_ffmpeg_location") if isinstance(config, dict) else None
     )
+    return discover_ffmpeg(
+        configured_location=configured,
+        portable_tools_location=portable_tools,
+        probe=False,
+    ).ready
 
 
 def _previous_sync(status_file: Path) -> dict:
@@ -120,7 +127,7 @@ def write_app_status(db, config, extra=None) -> Path:
         config.get("download_folder") if isinstance(config, dict) else None
     ) or default_downloads_dir()
     api_ready = _api_ready()
-    ffmpeg_ready = _ffmpeg_ready()
+    ffmpeg_ready = _ffmpeg_ready(config)
 
     payload = {
         "schema_version": SCHEMA_VERSION,

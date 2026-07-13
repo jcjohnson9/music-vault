@@ -1129,6 +1129,26 @@ def test_window_preserves_now_playing_selection_modes_queue_and_volume(
     assert paths.database_path().resolve().is_relative_to(fixture.root.resolve())
 
 
+def test_batch8_release_settings_are_visible_without_exposing_a_key(
+    isolated_ui_window,
+):
+    fixture = isolated_ui_window
+    window = fixture.window
+    window.pages.setCurrentWidget(window.settings_page)
+    window.refresh_settings_status()
+
+    assert window.windowTitle() == "Music Vault v1.0.0"
+    assert "Music Vault v1.0.0" in window.release_status.text()
+    assert "Release Channel: stable" in window.release_status.text()
+    assert "Runtime Data:" in window.runtime_data_status.text()
+    assert str(fixture.root.resolve()) in window.runtime_data_status.text()
+    assert window.change_ffmpeg_btn.accessibleName() == "Change FFmpeg Location"
+    assert window.shortcut_btn.accessibleName() == "Create or Update Shortcut"
+    assert window.reopen_guide_btn.accessibleName() == "Reopen First-Run Guide"
+    assert window.settings_api_key.echoMode() == fixture.app_module.QLineEdit.Password
+    assert window.settings_api_key.text() == ""
+
+
 def test_ui_review_hook_is_inert_without_explicit_environment(monkeypatch):
     monkeypatch.delenv("MUSIC_VAULT_UI_REVIEW", raising=False)
     monkeypatch.delenv("MUSIC_VAULT_UI_REVIEW_PLAN", raising=False)
