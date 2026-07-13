@@ -53,6 +53,19 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
     monkeypatch.setattr(builder, "build_source_compliance", compliance)
     monkeypatch.setattr(builder, "copy_release_documents", release_documents)
     monkeypatch.setattr(builder, "missing_embedded_artifact_mappings", lambda *args: [])
+    monkeypatch.setattr(
+        builder,
+        "_verified_build_environment",
+        lambda: {
+            "python": "3.11.9",
+            "python_implementation": "CPython",
+            "openssl": "OpenSSL 3.0.13 synthetic",
+            "sqlite": "3.45.1",
+            "pyinstaller": "6.21.0",
+            "dependencies": release_common.exact_requirements(),
+        },
+    )
+
     def git_value(*args: str) -> str:
         value = args[-1]
         if value.endswith("^{tree}"):
@@ -238,7 +251,8 @@ def test_native_scanner_distinguishes_qt_markers_from_real_private_data(
     assert release_common.scan_sensitive_bytes(qt_binary) == []
 
     local_binary = tmp_path / "local.dll"
-    local_binary.write_bytes(b"MZ" + str(release_common.PROJECT_ROOT).encode("utf-8"))
+    synthetic_personal_path = b"C:\\Users\\" + b"synthetic-owner\\Documents\\music-vault"
+    local_binary.write_bytes(b"MZ" + synthetic_personal_path)
     assert "personal absolute path" in release_common.scan_sensitive_bytes(local_binary)
 
     key_binary = tmp_path / "key.dll"
@@ -250,6 +264,22 @@ def test_native_scanner_distinguishes_qt_markers_from_real_private_data(
         + b"\n-----END PRIVATE KEY-----\n"
     )
     assert "private key" in release_common.scan_sensitive_bytes(key_binary)
+
+
+def test_real_release_environment_rejects_dependency_version_drift(monkeypatch) -> None:
+    expected = release_common.exact_requirements()
+
+    monkeypatch.setattr(
+        builder.importlib.metadata,
+        "version",
+        lambda name: "1.48.1" if name == "mutagen" else expected[name],
+    )
+
+    with pytest.raises(
+        release_common.ReleaseError,
+        match=r"version mismatch for mutagen: expected 1\.47\.0, found 1\.48\.1",
+    ):
+        builder._verified_build_environment()
 
 
 def test_base_library_archive_is_scanned_after_decompression(tmp_path: Path) -> None:

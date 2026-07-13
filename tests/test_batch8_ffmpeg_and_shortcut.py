@@ -253,13 +253,13 @@ def test_app_preview_probe_does_not_replace_cached_active_setting(monkeypatch):
 
 
 def test_shortcut_helper_uses_target_working_directory_icon_and_no_shell(tmp_path):
-    portable = tmp_path / "Portable App"
+    portable = tmp_path / "Portable Ω 音楽"
     portable.mkdir()
     executable = portable / "MusicVault.exe"
     executable.write_bytes(b"exe")
-    icon = portable / "music_vault.ico"
+    icon = portable / "music_vault Ω.ico"
     icon.write_bytes(b"ico")
-    desktop = tmp_path / "Redirected Desktop"
+    desktop = tmp_path / "Redirected Desktop Ω 音楽"
     calls = []
 
     def runner(arguments, **kwargs):
@@ -324,18 +324,21 @@ def test_unrelated_shortcut_conflict_is_not_reported_as_success(tmp_path):
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows shortcut integration")
 def test_shortcut_integration_uses_redirected_desktop_and_refuses_retarget(tmp_path):
-    portable = tmp_path / "Portable"
+    portable = tmp_path / "Portable Ω 音楽"
     portable.mkdir()
     first_executable = portable / "MusicVault.exe"
     second_executable = portable / "OtherMusicVault.exe"
     first_executable.write_bytes(b"first")
     second_executable.write_bytes(b"second")
-    desktop = tmp_path / "Synthetic Desktop"
+    icon = portable / "music_vault Ω.ico"
+    icon.write_bytes(b"icon")
+    desktop = tmp_path / "Synthetic Desktop Ω 音楽"
 
     first = create_or_update_desktop_shortcut(
         first_executable,
         portable,
         desktop_dir=desktop,
+        icon_path=icon,
     )
     assert first.status == "created"
     assert (desktop / "Music Vault.lnk").is_file()
@@ -344,6 +347,7 @@ def test_shortcut_integration_uses_redirected_desktop_and_refuses_retarget(tmp_p
         second_executable,
         portable,
         desktop_dir=desktop,
+        icon_path=icon,
     )
     assert conflict.status == "conflict"
 
@@ -351,5 +355,9 @@ def test_shortcut_integration_uses_redirected_desktop_and_refuses_retarget(tmp_p
         first_executable,
         portable,
         desktop_dir=desktop,
+        icon_path=icon,
     )
     assert unchanged.status == "unchanged"
+    assert unchanged.target_path == first_executable.resolve()
+    assert unchanged.working_directory == portable.resolve()
+    assert unchanged.icon_path == icon.resolve()

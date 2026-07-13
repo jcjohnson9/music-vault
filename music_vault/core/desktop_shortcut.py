@@ -15,6 +15,145 @@ from music_vault.version import APP_NAME, DISPLAY_VERSION
 
 _SHORTCUT_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace MusicVaultShortcut
+{
+    [ComImport]
+    [Guid("00021401-0000-0000-C000-000000000046")]
+    [ClassInterface(ClassInterfaceType.None)]
+    public class ShellLink { }
+
+    [ComImport]
+    [Guid("000214F9-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IShellLinkW
+    {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder file, int size, IntPtr findData, uint flags);
+        void GetIDList(out IntPtr itemIdList);
+        void SetIDList(IntPtr itemIdList);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder description, int size);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string description);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory, int size);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int size);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);
+        void GetHotkey(out short hotkey);
+        void SetHotkey(short hotkey);
+        void GetShowCmd(out int showCommand);
+        void SetShowCmd(int showCommand);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder iconPath, int size, out int iconIndex);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string iconPath, int iconIndex);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string relativePath, uint reserved);
+        void Resolve(IntPtr windowHandle, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string file);
+    }
+
+    [ComImport]
+    [Guid("0000010B-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPersistFile
+    {
+        [PreserveSig] int GetClassID(out Guid classId);
+        [PreserveSig] int IsDirty();
+        void Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, uint mode);
+        void Save([MarshalAs(UnmanagedType.LPWStr)] string fileName, bool remember);
+        void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+        void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string fileName);
+    }
+
+    public sealed class ShellLinkData
+    {
+        public string TargetPath { get; set; }
+        public string WorkingDirectory { get; set; }
+        public string Description { get; set; }
+        public string IconPath { get; set; }
+        public int IconIndex { get; set; }
+    }
+
+    public static class ShellLinkFactory
+    {
+        public static ShellLinkData Read(string path)
+        {
+            IShellLinkW link = (IShellLinkW)new ShellLink();
+            try
+            {
+                ((IPersistFile)link).Load(path, 0);
+                StringBuilder target = new StringBuilder(32768);
+                StringBuilder workingDirectory = new StringBuilder(32768);
+                StringBuilder description = new StringBuilder(1024);
+                StringBuilder icon = new StringBuilder(32768);
+                int iconIndex;
+                link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
+                link.GetWorkingDirectory(workingDirectory, workingDirectory.Capacity);
+                link.GetDescription(description, description.Capacity);
+                link.GetIconLocation(icon, icon.Capacity, out iconIndex);
+                return new ShellLinkData {
+                    TargetPath = target.ToString(),
+                    WorkingDirectory = workingDirectory.ToString(),
+                    Description = description.ToString(),
+                    IconPath = icon.ToString(),
+                    IconIndex = iconIndex
+                };
+            }
+            finally
+            {
+                Marshal.FinalReleaseComObject(link);
+            }
+        }
+
+        public static void Write(
+            string path,
+            string target,
+            string workingDirectory,
+            string description,
+            string icon
+        )
+        {
+            IShellLinkW link = (IShellLinkW)new ShellLink();
+            try
+            {
+                link.SetPath(target);
+                link.SetWorkingDirectory(workingDirectory);
+                link.SetDescription(description);
+                link.SetIconLocation(icon, 0);
+                link.SetShowCmd(1);
+                ((IPersistFile)link).Save(path, true);
+            }
+            finally
+            {
+                Marshal.FinalReleaseComObject(link);
+            }
+        }
+    }
+}
+'@
+
+function Read-MusicVaultShortcut([string]$Path) {
+    return [MusicVaultShortcut.ShellLinkFactory]::Read($Path)
+}
+
+function Write-MusicVaultShortcut(
+    [string]$Path,
+    [string]$Target,
+    [string]$WorkingDirectory,
+    [string]$Description,
+    [string]$Icon
+) {
+    [MusicVaultShortcut.ShellLinkFactory]::Write(
+        $Path,
+        $Target,
+        $WorkingDirectory,
+        $Description,
+        $Icon
+    )
+}
+
 $ExecutablePath = [string]$env:MUSIC_VAULT_SHORTCUT_EXECUTABLE
 $WorkingDirectory = [string]$env:MUSIC_VAULT_SHORTCUT_WORKING_DIRECTORY
 $DesktopDirectory = [string]$env:MUSIC_VAULT_SHORTCUT_DESKTOP
@@ -26,17 +165,16 @@ if ([string]::IsNullOrWhiteSpace($DesktopDirectory)) {
 }
 [System.IO.Directory]::CreateDirectory($DesktopDirectory) | Out-Null
 $shortcutPath = Join-Path $DesktopDirectory 'Music Vault.lnk'
-$shell = New-Object -ComObject WScript.Shell
 $existed = Test-Path -LiteralPath $shortcutPath -PathType Leaf
 $status = 'created'
 if ($existed) {
-    $current = $shell.CreateShortcut($shortcutPath)
+    $current = Read-MusicVaultShortcut $shortcutPath
     $currentTarget = [string]$current.TargetPath
     $sameTarget = -not [string]::IsNullOrWhiteSpace($currentTarget) -and [string]::Equals(
             [System.IO.Path]::GetFullPath($currentTarget),
             [System.IO.Path]::GetFullPath($ExecutablePath),
             [System.StringComparison]::OrdinalIgnoreCase
-        )
+    )
     if (-not $sameTarget -and $ReplaceDifferentTarget -ne 'true') {
         [pscustomobject]@{
             status = 'conflict'
@@ -48,27 +186,30 @@ if ($existed) {
         exit 0
     }
     $status = 'updated'
-    $expectedIcon = if ([string]::IsNullOrWhiteSpace($IconPath)) { "$ExecutablePath,0" } else { "$IconPath,0" }
+    $expectedIcon = if ([string]::IsNullOrWhiteSpace($IconPath)) { $ExecutablePath } else { $IconPath }
     if (
         $sameTarget -and
         [string]::Equals([string]$current.WorkingDirectory, $WorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase) -and
-        [string]::Equals([string]$current.IconLocation, $expectedIcon, [System.StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals([string]$current.IconPath, $expectedIcon, [System.StringComparison]::OrdinalIgnoreCase) -and
+        [int]$current.IconIndex -eq 0 -and
         [string]::Equals([string]$current.Description, $Description, [System.StringComparison]::Ordinal)
     ) {
         $status = 'unchanged'
     }
 }
 if ($status -ne 'unchanged') {
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $ExecutablePath
-    $shortcut.WorkingDirectory = $WorkingDirectory
-    $shortcut.Description = $Description
-    if ([string]::IsNullOrWhiteSpace($IconPath)) {
-        $shortcut.IconLocation = "$ExecutablePath,0"
-    } else {
-        $shortcut.IconLocation = "$IconPath,0"
+    $selectedIcon = if ([string]::IsNullOrWhiteSpace($IconPath)) { $ExecutablePath } else { $IconPath }
+    Write-MusicVaultShortcut $shortcutPath $ExecutablePath $WorkingDirectory $Description $selectedIcon
+    $written = Read-MusicVaultShortcut $shortcutPath
+    if (
+        -not [string]::Equals([string]$written.TargetPath, $ExecutablePath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string]$written.WorkingDirectory, $WorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([string]$written.IconPath, $selectedIcon, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [int]$written.IconIndex -ne 0 -or
+        -not [string]::Equals([string]$written.Description, $Description, [System.StringComparison]::Ordinal)
+    ) {
+        throw 'The desktop shortcut did not preserve its configured paths.'
     }
-    $shortcut.Save()
 }
 [pscustomobject]@{
     status = $status
