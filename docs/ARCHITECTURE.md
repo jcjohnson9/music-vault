@@ -3,14 +3,15 @@
 Music Vault is a standalone, local-first Windows desktop application. PySide6
 provides the user interface, Qt Multimedia provides playback through
 `QMediaPlayer`, and SQLite stores the local library and playlists. Version
-`1.0.0` is the stable portable Windows release.
+`1.0.0` remains the stable portable Windows release; current `main` is the
+`1.1.0` development line.
 
 ## Source layout
 
 | Path | Responsibility |
 | --- | --- |
 | `run.py` | Source entry point that creates and starts the application. |
-| `music_vault/version.py` | Authoritative application name, stable version, release channel, public user agent, and Windows resource values. |
+| `music_vault/version.py` | Authoritative application name, current-tree version, release channel, public user agent, and Windows resource values. |
 | `music_vault/app.py` | Main PySide6 window, view orchestration, playback, queue, settings, synchronization orchestration, and status updates. |
 | `music_vault/core/db.py` | Versioned additive SQLite migrations, source identity, failure history, and library/playlist persistence. |
 | `music_vault/core/importer.py` | Source-aware Mutagen metadata and embedded-artwork import. |
@@ -18,6 +19,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/sync_result.py` | Typed synchronization outcome shared by engine, UI, status, logging, and tests. |
 | `music_vault/core/safety.py` | Secret redaction, video-ID extraction, source-date normalization, and safe output paths. |
 | `music_vault/core/playback_state.py` | Pure volume normalization/config filtering and track-ID-to-table-row helpers. |
+| `music_vault/core/audio_analysis.py` | Bounded PCM conversion, spectral features, smoothing, beat detection, and latest-buffer analysis for Party Mode. |
 | `music_vault/core/library_browser.py` | SQL-aggregated album/artist summaries, stable browser identities, exact track lookup, revision fingerprints, and summary-cache invalidation. |
 | `music_vault/core/paths.py` | Central source, portable-marker, selected runtime-data, asset, and frozen-application path resolution. |
 | `music_vault/core/ffmpeg.py` | Bounded discovery and validation of a complete external `ffmpeg.exe`/`ffprobe.exe` pair. |
@@ -34,6 +36,9 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/metadata_tasks.py` | Cancellable, stale-result-safe background provider work for the metadata editor. |
 | `music_vault/ui/onboarding.py` | Blank-runtime detection helpers and the local-first, optional-sync first-run guide. |
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
+| `music_vault/ui/party_mode.py` | Full-screen Party Mode lifecycle, overlay, command routing, screen selection, and existing-player bridge. |
+| `music_vault/ui/party_visuals.py` | Shared PartyCanvas renderer, particle simulation, three visual presets, frame timing, and adaptive quality. |
+| `music_vault/ui/party_palette.py` | Deterministic artwork palette extraction, contrast handling, caching, and color interpolation. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
 | `music_vault/metadata/remediation_schema.py` | Additive schema-v4 remediation job, item, cache, constraint, and index definitions. |
@@ -47,6 +52,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `MusicVault.spec` | PyInstaller configuration for the packaged Windows application. |
 | `tools/release/` | Deterministic portable/source-compliance builders, release manifest and checksum generation, license inventory, and fail-closed verification. |
 | `tools/dev/profile_media_browsers.py` | Synthetic-only 300/1,000/5,000-track query, model, render, thumbnail, and revisit profiler. |
+| `tools/dev/run_party_mode_review.py` | Temporary synthetic-audio/artwork PartyCanvas/PartyModeWindow review matrix and bounded offscreen frame benchmark. |
 | `tools/dev/remediate_library_metadata.py` | Aggregate-only status, analyze, resume, explicitly confirmed apply/writeback, verify, report, and rollback interface. |
 
 Music Vault has no Watchtower runtime dependency or integration. Active code
@@ -273,6 +279,41 @@ packaged/source capture hook activates only when its explicit review environment
 variable and validated plan are present. Visible paths are neutralized before
 capture, the runtime is deleted afterward, and screenshot output remains an
 ignored local review artifact rather than product or personal data.
+
+## Party Mode boundary
+
+Party Mode is a presentation client of the existing `QMediaPlayer` and
+`QAudioOutput`. Its top-level window never owns a second player, never changes a
+source on entry or exit, and routes transport, queue, Auto, Shuffle, Repeat,
+seek, and volume commands through the established main-window behavior. The
+Party window can therefore appear or disappear without restarting a track or
+changing playback context.
+
+When supported by the active Qt backend, a `QAudioBufferOutput` attached to the
+same media player supplies decoded buffers to the bounded analysis pipeline.
+PCM is copied only into small transient analysis windows; stale work is
+replaced, not queued. Feature snapshots contain normalized aggregate energy,
+spectral-band, beat, and availability values—not samples. Decoded audio is
+never recorded, written to disk, placed in App Status, or sent over a network.
+Backends without buffer output use an explicitly non-audio-reactive ambient
+fallback derived from timing and playback state.
+
+`PartyCanvas` owns data-only particles and paints them in one widget. Its timer
+runs only while visible. Presets share artwork-derived palettes and bounded
+brightness/motion rules; reduced motion lowers movement and particle budgets.
+Auto quality uses measured frame history to reduce work with hysteresis rather
+than oscillating. Palette extraction is cached per artwork identity and performs
+no file mutation or provider request.
+
+`tools/dev/run_party_mode_review.py` is a separate development harness. It sets
+an isolated temporary project root, creates only synthetic WAV/artwork/metadata,
+blocks Python network access, drives the canvas offscreen, records aggregate
+frame metrics, and removes its runtime. Four full-profile states exercise the
+real `PartyModeWindow` against a synthetic host/player/DB contract, including
+overlay/help/queue stacking and single-player ownership. The two-state
+`scale-smoke` profile is used for non-default scale checks. Optional retained
+captures are allowed only in an ignored review directory or outside the
+repository and must be deleted after review.
 
 ## Known architectural debt
 

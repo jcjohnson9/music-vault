@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QPoint, QRect, QTimer, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, Qt
 
 
 REVIEW_ENV = "MUSIC_VAULT_UI_REVIEW"
@@ -21,6 +21,26 @@ REVIEW_SCHEMA_VERSION = 1
 REMEDIATION_RESTART_PHASE_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_PHASE"
 REMEDIATION_RESTART_REQUIRED_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_REQUIRED"
 _REMEDIATION_RESTART_CHECKPOINT = "synthetic_remediation_restart.json"
+_PARTY_REVIEW_FIXTURE = "synthetic_party_mode_review.json"
+_PARTY_REVIEW_FORBIDDEN_STATUS_FIELDS = frozenset(
+    {
+        "pcm",
+        "sample",
+        "samples",
+        "frequency",
+        "frequencies",
+        "rms",
+        "peak",
+        "bass",
+        "low_mid",
+        "mid",
+        "high",
+        "beat",
+        "beat_strength",
+    }
+)
+_REVIEW_NETWORK_EVENTS: list[str] = []
+_REVIEW_NETWORK_GUARD_INSTALLED = False
 
 DEFAULT_REVIEW_SCENES = (
     "library",
@@ -71,6 +91,8 @@ REMEDIATION_REVIEW_SCENES = (
     "remediation_long_values",
 )
 
+PARTY_REVIEW_SCENES = ("party_mode_smoke",)
+
 SCENE_LABELS = {
     "library": "Library",
     "albums": "Albums",
@@ -115,6 +137,7 @@ SCENE_LABELS = {
     "remediation_rollback_confirmation": "Remediation - Rollback Confirmation",
     "remediation_rolled_back": "Remediation - Rolled Back",
     "remediation_long_values": "Remediation - Long Values",
+    "party_mode_smoke": "Party Mode - Packaged Synthetic Smoke",
 }
 
 _DISPLAY_DATA_ROOT = r"<synthetic-runtime>\data"
@@ -316,6 +339,505 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         "artist_image_fetch_enabled_by_default": False,
         "api_key_present": False,
     }
+
+
+class ReviewNetworkAccessBlocked(RuntimeError):
+    """Raised before explicitly reviewed Python code can access the network."""
+
+
+def _install_review_network_guard() -> None:
+    global _REVIEW_NETWORK_GUARD_INSTALLED
+
+    if _REVIEW_NETWORK_GUARD_INSTALLED:
+        return
+    if os.environ.get("MUSIC_VAULT_DISABLE_NETWORK", "").strip() != "1":
+        raise ReviewPlanError("Party Mode review requires the no-network guard.")
+
+    guarded_events = {
+        "socket.connect",
+        "socket.connect_ex",
+        "socket.getaddrinfo",
+        "socket.gethostbyaddr",
+        "socket.gethostbyname",
+        "socket.gethostbyname_ex",
+        "socket.getnameinfo",
+        "socket.sendto",
+    }
+
+    def audit(event: str, _arguments: tuple[object, ...]) -> None:
+        if event in guarded_events:
+            _REVIEW_NETWORK_EVENTS.append(event)
+            raise ReviewNetworkAccessBlocked(
+                f"Synthetic Party Mode review blocked network event: {event}"
+            )
+
+    sys.addaudithook(audit)
+    _REVIEW_NETWORK_GUARD_INSTALLED = True
+
+
+def _party_review_fixture(window: object, plan: ReviewPlan) -> dict[str, object]:
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() != "1":
+        raise ReviewPlanError("Party Mode review must disable secret access.")
+    fixture_path = plan.runtime_root / "data" / _PARTY_REVIEW_FIXTURE
+    _ensure_under_runtime(fixture_path, plan.runtime_root, "Party Mode fixture")
+    try:
+        if fixture_path.stat().st_size > 16 * 1024:
+            raise ReviewPlanError("Synthetic Party Mode fixture is unexpectedly large.")
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Synthetic Party Mode fixture is unavailable.") from exc
+    if not isinstance(payload, dict) or not (
+        payload.get("schema_version") == 1
+        and payload.get("synthetic_only") is True
+    ):
+        raise ReviewPlanError("Synthetic Party Mode fixture is invalid.")
+
+    track_ids = payload.get("track_ids")
+    queue_track_id = payload.get("queue_track_id")
+    if (
+        not isinstance(track_ids, list)
+        or len(track_ids) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in track_ids)
+        or len(set(track_ids)) != 2
+        or isinstance(queue_track_id, bool)
+        or not isinstance(queue_track_id, int)
+        or queue_track_id in track_ids
+    ):
+        raise ReviewPlanError("Synthetic Party Mode track identities are invalid.")
+
+    tracks = []
+    for track_id in track_ids:
+        track = window.db.get_track(track_id)
+        if track is None:
+            raise ReviewPlanError("Synthetic Party Mode track is missing.")
+        media_path = Path(str(track["path"])).resolve()
+        _ensure_under_runtime(media_path, plan.runtime_root, "Party Mode media")
+        if (
+            media_path.suffix.casefold() != ".wav"
+            or not media_path.is_file()
+            or not 44 < media_path.stat().st_size <= 5 * 1024 * 1024
+        ):
+            raise ReviewPlanError("Synthetic Party Mode WAV is invalid.")
+        cover_path = str(track["cover_path"] or "").strip()
+        if cover_path:
+            resolved_cover = Path(cover_path).resolve()
+            _ensure_under_runtime(resolved_cover, plan.runtime_root, "Party Mode artwork")
+            if not resolved_cover.is_file():
+                raise ReviewPlanError("Synthetic Party Mode artwork is missing.")
+        tracks.append(track)
+
+    if window.db.get_track(queue_track_id) is None:
+        raise ReviewPlanError("Synthetic Party Mode queue track is missing.")
+    return {
+        "track_ids": tuple(track_ids),
+        "queue_track_id": queue_track_id,
+        "tracks": tuple(tracks),
+    }
+
+
+def _wait_for_review_state(
+    app: object,
+    predicate,
+    *,
+    timeout: float,
+    label: str,
+    required: bool = True,
+) -> bool:
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    while time.monotonic() < deadline:
+        app.processEvents()
+        try:
+            if predicate():
+                return True
+        except RuntimeError:
+            break
+        time.sleep(0.01)
+    app.processEvents()
+    try:
+        matched = bool(predicate())
+    except RuntimeError:
+        matched = False
+    if not matched and required:
+        raise ReviewPlanError(f"Synthetic Party Mode did not reach {label}.")
+    return matched
+
+
+def _send_review_key(
+    target: object,
+    key: Qt.Key,
+    *,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+    text: str = "",
+) -> None:
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    for event_type in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+        event = QKeyEvent(event_type, key, modifiers, text)
+        QApplication.sendEvent(target, event)
+    QApplication.processEvents()
+
+
+def _party_playback_snapshot(window: object) -> dict[str, object]:
+    return {
+        "source": str(window.player.source().toLocalFile()),
+        "position": int(window.player.position()),
+        "playback_state": window.player.playbackState(),
+        "volume": int(window.volume_percent),
+        "queue": tuple(window.manual_queue),
+        "base_context": copy.deepcopy(window.base_playback_context),
+    }
+
+
+def _assert_party_snapshot_preserved(
+    window: object,
+    snapshot: dict[str, object],
+    *,
+    label: str,
+) -> None:
+    current = _party_playback_snapshot(window)
+    if current["source"] != snapshot["source"]:
+        raise ReviewPlanError(f"Party Mode changed playback source while {label}.")
+    if int(current["position"]) + 500 < int(snapshot["position"]):
+        raise ReviewPlanError(f"Party Mode reset playback position while {label}.")
+    for field in ("playback_state", "volume", "queue", "base_context"):
+        if current[field] != snapshot[field]:
+            raise ReviewPlanError(f"Party Mode changed {field} while {label}.")
+
+
+def _status_field_names(value: object) -> set[str]:
+    if isinstance(value, dict):
+        result = {str(key).casefold() for key in value}
+        for item in value.values():
+            result.update(_status_field_names(item))
+        return result
+    if isinstance(value, list):
+        result: set[str] = set()
+        for item in value:
+            result.update(_status_field_names(item))
+        return result
+    return set()
+
+
+def _validate_party_status(plan: ReviewPlan, *, expected_track_id: int) -> bool:
+    from music_vault.core.paths import app_status_path
+
+    status_path = app_status_path().resolve()
+    _ensure_under_runtime(status_path, plan.runtime_root, "Party Mode App Status")
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Party Mode App Status is unavailable.") from exc
+    if not isinstance(payload, dict):
+        raise ReviewPlanError("Party Mode App Status is invalid.")
+    if payload.get("party_mode_active") is not True:
+        raise ReviewPlanError("Party Mode App Status did not record the active surface.")
+    if payload.get("party_mode_preset") != "aurora":
+        raise ReviewPlanError("Party Mode App Status did not record the active preset.")
+    playback = payload.get("playback")
+    if not isinstance(playback, dict) or not (
+        playback.get("currently_playing") == expected_track_id
+        and playback.get("queue_count") == 1
+    ):
+        raise ReviewPlanError("Party Mode App Status playback state is inaccurate.")
+    if _PARTY_REVIEW_FORBIDDEN_STATUS_FIELDS.intersection(_status_field_names(payload)):
+        raise ReviewPlanError("Party Mode App Status exposed audio-analysis data.")
+    paths = payload.get("paths")
+    if not isinstance(paths, dict):
+        raise ReviewPlanError("Party Mode App Status paths are unavailable.")
+    for value in paths.values():
+        if isinstance(value, str) and ("\\" in value or "/" in value):
+            _ensure_under_runtime(Path(value), plan.runtime_root, "App Status path")
+    return True
+
+
+def validate_party_review_behaviors(
+    window: object,
+    plan: ReviewPlan,
+    app: object,
+) -> dict[str, object]:
+    """Exercise real Party Mode only inside the explicit synthetic runtime."""
+
+    from PySide6.QtMultimedia import QMediaPlayer
+    from PySide6.QtWidgets import QApplication
+
+    fixture = _party_review_fixture(window, plan)
+    track_ids = tuple(fixture["track_ids"])
+    tracks = tuple(fixture["tracks"])
+    queue_track_id = int(fixture["queue_track_id"])
+    player = window.player
+    audio_output = window.audio_output
+    original_muted = bool(audio_output.isMuted())
+    setattr(window, "_review_party_original_muted", original_muted)
+    audio_output.setMuted(True)
+
+    window.current_view_kind = "library"
+    window.current_playlist_id = None
+    window.current_playlist_name = "Library"
+    window.load_library(
+        list(tracks),
+        "Synthetic Party Mode",
+        "Two local review signals; no network or personal data.",
+    )
+    window.manual_queue = [queue_track_id]
+    window.update_queue_label()
+    if not window.play_track_by_id(track_ids[0]):
+        raise ReviewPlanError("Synthetic Party Mode WAV could not start.")
+    _wait_for_review_state(
+        app,
+        lambda: player.playbackState() == QMediaPlayer.PlaybackState.PlayingState,
+        timeout=5.0,
+        label="playing state",
+    )
+    _wait_for_review_state(
+        app,
+        lambda: Path(player.source().toLocalFile()).resolve()
+        == Path(str(tracks[0]["path"])).resolve(),
+        timeout=2.0,
+        label="first synthetic source",
+    )
+    position_advanced = _wait_for_review_state(
+        app,
+        lambda: player.position() >= 100,
+        timeout=3.0,
+        label="advancing playback position",
+        required=False,
+    )
+
+    main_players = window.findChildren(QMediaPlayer)
+    if len(main_players) != 1 or main_players[0] is not player:
+        raise ReviewPlanError("Music Vault does not own exactly one media player.")
+    if player.audioOutput() is not audio_output:
+        raise ReviewPlanError("Party Mode replaced the existing audio output.")
+    audio_buffer_getter = getattr(player, "audioBufferOutput", None)
+    if not callable(audio_buffer_getter) or audio_buffer_getter() is not window.audio_buffer_output:
+        raise ReviewPlanError("Party Mode audio-buffer output is not attached to the player.")
+    if not (
+        window.party_mode_btn.isVisible()
+        and window.party_mode_btn.toolTip() == "Party Mode (F11)"
+        and window.party_mode_btn.accessibleName() == "Open Party Mode"
+    ):
+        raise ReviewPlanError("The Party Mode player-bar entry control is unavailable.")
+
+    opening_snapshot = _party_playback_snapshot(window)
+    expected_base_tracks = tuple(track_ids)
+    base = opening_snapshot["base_context"] or {}
+    if tuple(base.get("track_ids", ())) != expected_base_tracks:
+        raise ReviewPlanError("Synthetic Party Mode base context is incomplete.")
+
+    _send_review_key(window, Qt.Key.Key_F11)
+    _wait_for_review_state(
+        app,
+        lambda: bool(
+            window.party_mode_active
+            and window.party_mode_window is not None
+            and window.party_mode_window.isVisible()
+        ),
+        timeout=3.0,
+        label="F11 full-screen entry",
+    )
+    party = window.party_mode_window
+    if party is None or not party.isFullScreen():
+        raise ReviewPlanError("Party Mode did not become full-screen.")
+    if party.findChildren(QMediaPlayer):
+        raise ReviewPlanError("Party Mode created a second media player.")
+    main_screen = QApplication.screenAt(window.frameGeometry().center()) or window.screen()
+    handle = party.windowHandle()
+    if handle is None or handle.screen() is not main_screen:
+        raise ReviewPlanError("Party Mode opened on the wrong screen.")
+    _assert_party_snapshot_preserved(window, opening_snapshot, label="opening")
+
+    audio_features_observed = _wait_for_review_state(
+        app,
+        lambda: bool(window.party_audio_reactivity_available),
+        timeout=3.0,
+        label="decoded audio features",
+        required=False,
+    )
+    if party.current_preset != "pulse":
+        raise ReviewPlanError("Party Mode did not begin with the Pulse preset.")
+    _send_review_key(party, Qt.Key.Key_V, text="v")
+    if party.current_preset != "starfield":
+        raise ReviewPlanError("Party Mode did not switch to Starfield.")
+    _send_review_key(party, Qt.Key.Key_V, text="v")
+    if party.current_preset != "aurora":
+        raise ReviewPlanError("Party Mode did not switch to Aurora.")
+
+    _send_review_key(party, Qt.Key.Key_Question, text="?")
+    if not party._help_visible or not party.help_panel.isVisible():
+        raise ReviewPlanError("Party Mode shortcut help did not open.")
+    _send_review_key(party, Qt.Key.Key_Question, text="?")
+    _send_review_key(party, Qt.Key.Key_H, text="h")
+    if party.overlay_visible:
+        raise ReviewPlanError("Party Mode overlay did not hide.")
+    _send_review_key(party, Qt.Key.Key_H, text="h")
+    if not party.overlay_visible:
+        raise ReviewPlanError("Party Mode overlay did not return.")
+
+    volume_before = int(window.volume_percent)
+    _send_review_key(party, Qt.Key.Key_Up)
+    _send_review_key(party, Qt.Key.Key_Down)
+    if int(window.volume_percent) != volume_before:
+        raise ReviewPlanError("Party Mode volume controls did not round-trip safely.")
+
+    _send_review_key(party, Qt.Key.Key_Space, text=" ")
+    _wait_for_review_state(
+        app,
+        lambda: player.playbackState() == QMediaPlayer.PlaybackState.PausedState,
+        timeout=2.0,
+        label="paused state",
+    )
+    _wait_for_review_state(
+        app,
+        lambda: not party.audio_reactivity_available,
+        timeout=3.0,
+        label="ambient fallback",
+    )
+    if not party.rendering_active:
+        raise ReviewPlanError("Party Mode stopped rendering during ambient fallback.")
+    _send_review_key(party, Qt.Key.Key_Space, text=" ")
+    _wait_for_review_state(
+        app,
+        lambda: player.playbackState() == QMediaPlayer.PlaybackState.PlayingState,
+        timeout=2.0,
+        label="resumed state",
+    )
+    if audio_features_observed:
+        _wait_for_review_state(
+            app,
+            lambda: party.audio_reactivity_available,
+            timeout=3.0,
+            label="resumed decoded audio features",
+        )
+
+    if tuple(window.manual_queue) != opening_snapshot["queue"]:
+        raise ReviewPlanError("Party Mode controls changed the manual queue.")
+    if window.base_playback_context != opening_snapshot["base_context"]:
+        raise ReviewPlanError("Party Mode controls changed the base context.")
+    if not window.play_next_from_base_context():
+        raise ReviewPlanError("Synthetic Party Mode track transition failed.")
+    _wait_for_review_state(
+        app,
+        lambda: window.current_track_id == track_ids[1]
+        and Path(player.source().toLocalFile()).resolve()
+        == Path(str(tracks[1]["path"])).resolve(),
+        timeout=4.0,
+        label="second synthetic track",
+    )
+    _wait_for_review_state(
+        app,
+        lambda: party._current_track_id == track_ids[1],
+        timeout=2.0,
+        label="Party Mode track transition",
+    )
+    if tuple(window.manual_queue) != opening_snapshot["queue"]:
+        raise ReviewPlanError("Track transition changed the manual queue.")
+    transitioned_base = window.base_playback_context or {}
+    if not (
+        tuple(transitioned_base.get("track_ids", ())) == expected_base_tracks
+        and transitioned_base.get("current_track_id") == track_ids[1]
+    ):
+        raise ReviewPlanError("Track transition lost the base playback context.")
+
+    escape_snapshot = _party_playback_snapshot(window)
+    _send_review_key(party, Qt.Key.Key_Escape)
+    _wait_for_review_state(
+        app,
+        lambda: not window.party_mode_active and not party.isVisible(),
+        timeout=3.0,
+        label="Escape exit",
+    )
+    _assert_party_snapshot_preserved(window, escape_snapshot, label="Escape exit")
+    if any(
+        (
+            party.rendering_active,
+            party.state_timer.isActive(),
+            party.fallback_timer.isActive(),
+            party.palette_timer.isActive(),
+            party.overlay_timer.isActive(),
+            window.party_audio_thread is not None,
+        )
+    ):
+        raise ReviewPlanError("Party Mode retained render or analysis work after Escape.")
+
+    _send_review_key(window, Qt.Key.Key_F11)
+    _wait_for_review_state(
+        app,
+        lambda: window.party_mode_active and party.isVisible(),
+        timeout=3.0,
+        label="second F11 entry",
+    )
+    second_open_snapshot = _party_playback_snapshot(window)
+    _send_review_key(party, Qt.Key.Key_F11)
+    _wait_for_review_state(
+        app,
+        lambda: not window.party_mode_active and not party.isVisible(),
+        timeout=3.0,
+        label="F11 exit",
+    )
+    _assert_party_snapshot_preserved(window, second_open_snapshot, label="F11 exit")
+
+    _send_review_key(window, Qt.Key.Key_F11)
+    _wait_for_review_state(
+        app,
+        lambda: window.party_mode_active and party.isVisible() and party.isFullScreen(),
+        timeout=3.0,
+        label="final Party Mode capture state",
+    )
+    if party.current_preset != "aurora" or not party.rendering_active:
+        raise ReviewPlanError("Party Mode did not restore its persisted visual state.")
+    if audio_features_observed:
+        _wait_for_review_state(
+            app,
+            lambda: party.audio_reactivity_available,
+            timeout=3.0,
+            label="final audio-reactive state",
+        )
+    window.write_app_status()
+    status_safe = _validate_party_status(plan, expected_track_id=track_ids[1])
+    if _REVIEW_NETWORK_EVENTS:
+        raise ReviewPlanError("Party Mode review attempted network access.")
+
+    evidence: dict[str, object] = {
+        "packaged_process": bool(getattr(sys, "frozen", False)),
+        "synthetic_fixture_validated": True,
+        "network_guard_active": _REVIEW_NETWORK_GUARD_INSTALLED,
+        "network_attempt_count": 0,
+        "party_button_present": True,
+        "f11_opened": True,
+        "f11_closed": True,
+        "escape_closed": True,
+        "full_screen": True,
+        "screen_matches_main": True,
+        "same_media_player": True,
+        "same_audio_output": True,
+        "audio_buffer_output_attached": True,
+        "no_second_player": True,
+        "open_close_source_preserved": True,
+        "open_close_position_not_reset": True,
+        "playback_state_preserved": True,
+        "playback_position_advanced": position_advanced,
+        "volume_preserved": True,
+        "queue_preserved": True,
+        "base_context_preserved": True,
+        "audio_features_observed": audio_features_observed,
+        "audio_backend_outcome": (
+            "reactive" if audio_features_observed else "ambient_only"
+        ),
+        "ambient_fallback_verified": True,
+        "pulse_verified": True,
+        "starfield_verified": True,
+        "aurora_verified": True,
+        "overlay_controls_verified": True,
+        "track_transition_verified": True,
+        "render_timer_stopped_on_exit": True,
+        "analysis_worker_stopped_on_exit": True,
+        "status_safe": status_safe,
+        "no_pcm_status_fields": True,
+        "temporary_output_muted": True,
+    }
+    setattr(window, "_review_party_metrics", evidence)
+    return evidence
 
 
 def validate_metadata_review_behaviors(window: object, plan: ReviewPlan) -> dict[str, bool]:
@@ -1712,6 +2234,11 @@ def prepare_review_scene(window: object, scene: str) -> None:
             search.setText("no-synthetic-track-matches-this-query")
         else:
             window.filter_library("no-synthetic-track-matches-this-query")
+    elif scene in PARTY_REVIEW_SCENES:
+        _set_page(window, "library_page")
+        search = getattr(window, "search_box", None)
+        if search is not None:
+            search.clear()
     else:
         raise ReviewPlanError("The requested review scene is unsupported.")
 
@@ -1733,6 +2260,9 @@ def _review_browser_kind(scene: str) -> str | None:
 
 def review_scene_ready(window: object, scene: str) -> bool:
     """Return whether asynchronous browser content is safe to capture."""
+
+    if scene in PARTY_REVIEW_SCENES:
+        return True
 
     if scene in METADATA_REVIEW_SCENES:
         dialog = getattr(window, "_review_metadata_dialog", None)
@@ -2064,6 +2594,15 @@ def remediation_review_metrics(window: object, scene: str) -> dict[str, Any] | N
     }
 
 
+def party_review_metrics(window: object, scene: str) -> dict[str, object] | None:
+    if scene not in PARTY_REVIEW_SCENES:
+        return None
+    metrics = getattr(window, "_review_party_metrics", None)
+    if not isinstance(metrics, dict):
+        raise ReviewPlanError("Synthetic Party Mode metrics are unavailable.")
+    return dict(metrics)
+
+
 def _grab_review_window(window: object):
     from PySide6.QtGui import QColor, QPainter
     from PySide6.QtWidgets import QApplication
@@ -2143,6 +2682,8 @@ class UIReviewController(QObject):
     def start(self) -> None:
         try:
             self.plan.output_dir.mkdir(parents=True, exist_ok=True)
+            if any(scene in PARTY_REVIEW_SCENES for scene in self.plan.scenes):
+                _install_review_network_guard()
             self.runtime_checks = validate_review_runtime(self.plan)
             if any(scene in METADATA_REVIEW_SCENES for scene in self.plan.scenes):
                 self.runtime_checks["metadata_behaviors"] = validate_metadata_review_behaviors(
@@ -2213,6 +2754,14 @@ class UIReviewController(QObject):
         try:
             if review_scene_ready(self.window, scene):
                 finalize_review_scene(self.window, scene)
+                if scene in PARTY_REVIEW_SCENES:
+                    self.runtime_checks["party_mode_behaviors"] = (
+                        validate_party_review_behaviors(
+                            self.window,
+                            self.plan,
+                            self.app,
+                        )
+                    )
                 self.window.repaint()
                 self.app.processEvents()
                 QTimer.singleShot(self.plan.settle_ms, self._prime_current_render)
@@ -2234,9 +2783,15 @@ class UIReviewController(QObject):
         try:
             from PySide6.QtGui import QColor, QPixmap
 
-            warmup = QPixmap(self.window.size())
+            _size, scene = self.jobs[self.job_index]
+            capture_window = self.window
+            if scene in PARTY_REVIEW_SCENES:
+                capture_window = getattr(self.window, "party_mode_window", None)
+                if capture_window is None or not capture_window.isVisible():
+                    raise ReviewPlanError("Party Mode capture surface is unavailable.")
+            warmup = QPixmap(capture_window.size())
             warmup.fill(QColor("#06090E"))
-            self.window.render(warmup)
+            capture_window.render(warmup)
             review_dialog = getattr(self.window, "_review_metadata_dialog", None) or getattr(
                 self.window, "_review_remediation_dialog", None
             )
@@ -2253,7 +2808,7 @@ class UIReviewController(QObject):
                     confirmation_warmup.fill(QColor("#06090E"))
                     confirmation.render(confirmation_warmup)
                     confirmation.repaint()
-            self.window.repaint()
+            capture_window.repaint()
             self.app.processEvents()
         except Exception as exc:
             self._fail(exc)
@@ -2272,7 +2827,12 @@ class UIReviewController(QObject):
             # QWidget.grab() captures the fully composed hierarchy and remains
             # reliable when asynchronous thumbnail updates and fractional
             # device scaling invalidate Qt's backing store.
-            pixmap = _grab_review_window(self.window)
+            capture_window = self.window
+            if scene in PARTY_REVIEW_SCENES:
+                capture_window = getattr(self.window, "party_mode_window", None)
+                if capture_window is None or not capture_window.isVisible():
+                    raise ReviewPlanError("Party Mode capture surface is unavailable.")
+            pixmap = _grab_review_window(capture_window)
             if pixmap.isNull():
                 raise ReviewPlanError("Qt returned an empty screenshot.")
 
@@ -2300,6 +2860,9 @@ class UIReviewController(QObject):
             remediation_metrics = remediation_review_metrics(self.window, scene)
             if remediation_metrics is not None:
                 capture["remediation_metrics"] = remediation_metrics
+            party_metrics = party_review_metrics(self.window, scene)
+            if party_metrics is not None:
+                capture["party_metrics"] = party_metrics
             self.captures.append(capture)
         except Exception as exc:
             self._fail(exc)
@@ -2345,11 +2908,14 @@ class UIReviewController(QObject):
         try:
             metadata_behaviors = self.runtime_checks.get("metadata_behaviors")
             remediation_behaviors = self.runtime_checks.get("remediation_behaviors")
+            party_mode_behaviors = self.runtime_checks.get("party_mode_behaviors")
             self.runtime_checks = validate_review_runtime(self.plan)
             if metadata_behaviors is not None:
                 self.runtime_checks["metadata_behaviors"] = metadata_behaviors
             if remediation_behaviors is not None:
                 self.runtime_checks["remediation_behaviors"] = remediation_behaviors
+            if party_mode_behaviors is not None:
+                self.runtime_checks["party_mode_behaviors"] = party_mode_behaviors
             if len(self.captures) != self.plan.capture_count:
                 raise ReviewPlanError("The review capture matrix is incomplete.")
             self._write_manifest(self._manifest("complete"))
@@ -2368,6 +2934,11 @@ class UIReviewController(QObject):
 
     def _close(self, exit_code: int) -> None:
         try:
+            original_muted = getattr(self.window, "_review_party_original_muted", None)
+            if isinstance(original_muted, bool):
+                audio_output = getattr(self.window, "audio_output", None)
+                if audio_output is not None:
+                    audio_output.setMuted(original_muted)
             self.window.close()
         finally:
             self.app.exit(exit_code)

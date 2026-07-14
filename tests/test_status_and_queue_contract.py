@@ -22,13 +22,27 @@ def test_app_status_schema_and_compatibility_alias(tmp_path, monkeypatch):
     path = app_status.write_app_status(
         db,
         {"download_folder": str(tmp_path / "downloads")},
-        {"sync": {"last_sync_status": "complete_with_issues", "last_sync_failed_count": 2}},
+        {
+            "sync": {
+                "last_sync_status": "complete_with_issues",
+                "last_sync_failed_count": 2,
+            },
+            "party_mode_active": True,
+            "party_mode_preset": "aurora",
+            "audio_reactivity_available": True,
+        },
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
+    assert payload["app_version"] == "1.1.0"
+    assert payload["release_channel"] == "development"
     assert payload["sync"]["last_sync_status"] == "complete_with_issues"
     assert payload["sync"]["last_sync_failed_count"] == 2
+    assert payload["party_mode_active"] is True
+    assert payload["party_mode_preset"] == "aurora"
+    assert payload["audio_reactivity_available"] is True
     assert "api_key" not in json.dumps(payload).lower()
+    assert not {"pcm", "frequency", "samples", "monitor"} & payload.keys()
     assert write_watchtower_status is app_status.write_app_status
     db.close()
 

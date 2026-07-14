@@ -49,9 +49,9 @@ def _reset_path_state():
 
 
 def test_release_version_is_authoritative_across_active_consumers():
-    assert version.APP_VERSION == "1.0.0"
-    assert version.RELEASE_CHANNEL == "stable"
-    assert version.WINDOWS_VERSION == (1, 0, 0, 0)
+    assert version.APP_VERSION == "1.1.0"
+    assert version.RELEASE_CHANNEL == "development"
+    assert version.WINDOWS_VERSION == (1, 1, 0, 0)
     assert app_status.APP_VERSION == version.APP_VERSION
     assert MUSICBRAINZ_USER_AGENT == version.user_agent()
     assert MUSIC_VAULT_USER_AGENT == version.user_agent()

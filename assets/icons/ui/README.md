@@ -8,3 +8,17 @@ The icons use a consistent 24 by 24 view box, rounded strokes, and no embedded
 text, fonts, scripts, raster images, personal data, or external resources. The
 application renders and tints them at runtime for normal, active, and disabled
 states.
+
+Party Mode adds four assets in the same original geometric system:
+
+- `party-mode.svg` combines full-screen corners with a restrained central
+  pulse;
+- `exit-fullscreen.svg` uses inward full-screen corners for an unambiguous
+  escape control;
+- `visual-preset.svg` represents the shared visualizer engine with two bounded
+  waveform paths; and
+- `overlay-help.svg` represents the keyboard-help overlay without an embedded
+  font or text element.
+
+All four use the existing 24 by 24 view box, 1.8-unit rounded stroke, tintable
+single-color geometry, and no third-party artwork or external resources.

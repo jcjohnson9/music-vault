@@ -181,6 +181,26 @@ class ReleaseError(RuntimeError):
     pass
 
 
+def validate_release_version(version: str) -> str:
+    """Return a canonical numeric release version or fail closed."""
+    value = str(version).strip()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
+        raise ReleaseError("Release version must use numeric major.minor.patch form.")
+    return value
+
+
+def package_directory_for(version: str) -> str:
+    return f"MusicVault-v{validate_release_version(version)}-Windows-x64-Portable"
+
+
+def package_filename_for(version: str) -> str:
+    return f"{package_directory_for(version)}.zip"
+
+
+def compliance_filename_for(version: str) -> str:
+    return f"MusicVault-v{validate_release_version(version)}-Source-Compliance.zip"
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

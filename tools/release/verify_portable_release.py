@@ -15,13 +15,12 @@ from pathlib import Path, PurePosixPath
 try:
     from .release_common import (
         APP_VERSION,
-        COMPLIANCE_FILENAME,
-        PACKAGE_DIRECTORY,
         PORTABLE_MARKER,
         PROJECT_ROOT,
         RELEASE_LICENSE_INVENTORY_PATH,
         ReleaseError,
         canonical_payload_hash,
+        compliance_filename_for,
         exact_requirements,
         git_tree_entries_at,
         git_value,
@@ -29,22 +28,23 @@ try:
         load_license_inventory,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
+        package_directory_for,
         safe_files,
         scan_sensitive_bytes,
         sha256_file,
         validate_zip_name,
+        validate_release_version,
         violation_for_path,
     )
 except ImportError:  # Direct script execution.
     from release_common import (
         APP_VERSION,
-        COMPLIANCE_FILENAME,
-        PACKAGE_DIRECTORY,
         PORTABLE_MARKER,
         PROJECT_ROOT,
         RELEASE_LICENSE_INVENTORY_PATH,
         ReleaseError,
         canonical_payload_hash,
+        compliance_filename_for,
         exact_requirements,
         git_tree_entries_at,
         git_value,
@@ -52,10 +52,12 @@ except ImportError:  # Direct script execution.
         load_license_inventory,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
+        package_directory_for,
         safe_files,
         scan_sensitive_bytes,
         sha256_file,
         validate_zip_name,
+        validate_release_version,
         violation_for_path,
     )
 
@@ -96,12 +98,13 @@ PROVENANCE_KEYS = (
 
 
 def verify_provenance_fields(
-    manifest: dict[str, object], path: str
+    manifest: dict[str, object], path: str, release_version: str = APP_VERSION
 ) -> list[Finding]:
+    release_version = validate_release_version(release_version)
     findings: list[Finding] = []
     if manifest.get("manifest_schema_version") != 2:
         findings.append(Finding(path, "dual-provenance manifest schema mismatch", "provenance"))
-    if manifest.get("source_tag") != f"v{APP_VERSION}":
+    if manifest.get("source_tag") != f"v{release_version}":
         findings.append(Finding(path, "source tag does not match product version", "provenance"))
     for key in PROVENANCE_KEYS[1:]:
         if not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get(key) or "")):
@@ -505,7 +508,8 @@ def verify_license_inventory(root: Path) -> list[Finding]:
     return findings
 
 
-def verify_directory(root: Path) -> list[Finding]:
+def verify_directory(root: Path, release_version: str = APP_VERSION) -> list[Finding]:
+    release_version = validate_release_version(release_version)
     root = root.resolve()
     findings: list[Finding] = []
     existing = {path.relative_to(root).as_posix() for path in safe_files(root)}
@@ -534,13 +538,15 @@ def verify_directory(root: Path) -> list[Finding]:
         return findings
 
     marker = json.loads((root / PORTABLE_MARKER).read_text(encoding="utf-8"))
-    if marker.get("version") != APP_VERSION or marker.get("schema_version") != 1:
+    if marker.get("version") != release_version or marker.get("schema_version") != 1:
         findings.append(Finding(PORTABLE_MARKER, "portable marker version mismatch", "version"))
 
     manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("version") != APP_VERSION:
+    if manifest.get("version") != release_version:
         findings.append(Finding("release-manifest.json", "product version mismatch", "version"))
-    findings.extend(verify_provenance_fields(manifest, "release-manifest.json"))
+    findings.extend(
+        verify_provenance_fields(manifest, "release-manifest.json", release_version)
+    )
     findings.extend(verify_release_inventory_anchor(
         manifest,
         root / "licenses/third_party_licenses.json",
@@ -619,7 +625,8 @@ def verify_directory(root: Path) -> list[Finding]:
 
     executable = root / "MusicVault.exe"
     fixed_file, fixed_product, strings = _pe_version(executable)
-    if fixed_file != "1.0.0.0" or fixed_product != "1.0.0.0":
+    expected_windows_version = f"{release_version}.0"
+    if fixed_file != expected_windows_version or fixed_product != expected_windows_version:
         findings.append(Finding("MusicVault.exe", "Windows version resource mismatch", "version"))
     expected_strings = {
         "ProductName": "Music Vault",
@@ -629,7 +636,7 @@ def verify_directory(root: Path) -> list[Finding]:
     for key, expected in expected_strings.items():
         if strings.get(key) != expected:
             findings.append(Finding("MusicVault.exe", f"missing/incorrect {key} version resource", "version"))
-    if strings.get("FileVersion") not in {"1.0.0.0", "1.0.0"}:
+    if strings.get("FileVersion") not in {expected_windows_version, release_version}:
         findings.append(Finding("MusicVault.exe", "string FileVersion mismatch", "version"))
 
     assignments = native_artifact_owners(
@@ -664,12 +671,15 @@ def verify_external_zip_checksum(path: Path) -> None:
         raise ReleaseError("Portable ZIP checksum mismatch.")
 
 
-def verify_external_release_manifest(path: Path) -> dict[str, object]:
+def verify_external_release_manifest(
+    path: Path, release_version: str = APP_VERSION
+) -> dict[str, object]:
+    release_version = validate_release_version(release_version)
     manifest_path = path.parent / "release-manifest.json"
     if not manifest_path.is_file():
         raise ReleaseError("External release-manifest.json is missing.")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("version") != APP_VERSION:
+    if manifest.get("version") != release_version:
         raise ReleaseError("External release manifest version mismatch.")
     if manifest.get("package_filename") != path.name:
         raise ReleaseError("External release manifest package name mismatch.")
@@ -681,8 +691,12 @@ def verify_external_release_manifest(path: Path) -> dict[str, object]:
 
 
 def verify_source_compliance(
-    path: Path, *, expected_release_manifest: dict[str, object] | None = None
+    path: Path,
+    *,
+    expected_release_manifest: dict[str, object] | None = None,
+    release_version: str = APP_VERSION,
 ) -> list[Finding]:
+    release_version = validate_release_version(release_version)
     checksum = path.with_name(path.name + ".sha256")
     if not checksum.is_file():
         raise ReleaseError("Source-compliance checksum file is missing.")
@@ -699,7 +713,7 @@ def verify_source_compliance(
     findings: list[Finding] = []
     with tempfile.TemporaryDirectory(prefix="MusicVault_Compliance_Verify_") as temp:
         root = safe_extract(path, Path(temp))
-        expected_root = f"MusicVault-v{APP_VERSION}-Source-Compliance"
+        expected_root = f"MusicVault-v{release_version}-Source-Compliance"
         if root.name != expected_root:
             return [Finding(root.name, "source-compliance top-level name mismatch", "compliance")]
         existing = {item.relative_to(root).as_posix() for item in safe_files(root)}
@@ -733,8 +747,16 @@ def verify_source_compliance(
         if manifest_path.is_file() and snapshot_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            if manifest.get("version") != release_version:
+                findings.append(Finding(
+                    "source-compliance-manifest.json",
+                    "product version mismatch",
+                    "version",
+                ))
             findings.extend(
-                verify_provenance_fields(manifest, "source-compliance-manifest.json")
+                verify_provenance_fields(
+                    manifest, "source-compliance-manifest.json", release_version
+                )
             )
             if snapshot.get("schema_version") != 2:
                 findings.append(Finding(
@@ -843,17 +865,18 @@ def verify_source_compliance(
     return findings
 
 
-def verify(path: Path) -> list[Finding]:
+def verify(path: Path, release_version: str = APP_VERSION) -> list[Finding]:
+    release_version = validate_release_version(release_version)
     if path.is_file():
         if path.suffix.casefold() != ".zip":
             raise ReleaseError("Verifier input must be a portable ZIP or extracted directory.")
         verify_external_zip_checksum(path)
-        external_manifest = verify_external_release_manifest(path)
+        external_manifest = verify_external_release_manifest(path, release_version)
         with tempfile.TemporaryDirectory(prefix="MusicVault_Release_Verify_") as temp:
             root = safe_extract(path, Path(temp))
-            if root.name != PACKAGE_DIRECTORY:
+            if root.name != package_directory_for(release_version):
                 return [Finding(root.name, "top-level package version/name mismatch", "layout")]
-            findings = verify_directory(root)
+            findings = verify_directory(root, release_version)
             internal_manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
             expected_external = dict(internal_manifest)
             expected_external.update({
@@ -863,13 +886,16 @@ def verify(path: Path) -> list[Finding]:
             })
             if external_manifest != expected_external:
                 findings.append(Finding("release-manifest.json", "external manifest does not reconcile with package manifest", "provenance"))
-        compliance = path.with_name(COMPLIANCE_FILENAME)
+        compliance_filename = compliance_filename_for(release_version)
+        compliance = path.with_name(compliance_filename)
         if not compliance.is_file():
-            findings.append(Finding(COMPLIANCE_FILENAME, "source-compliance artifact is missing", "licensing"))
+            findings.append(Finding(compliance_filename, "source-compliance artifact is missing", "licensing"))
         else:
             findings.extend(
                 verify_source_compliance(
-                    compliance, expected_release_manifest=internal_manifest
+                    compliance,
+                    expected_release_manifest=internal_manifest,
+                    release_version=release_version,
                 )
             )
         return findings
@@ -880,20 +906,22 @@ def verify(path: Path) -> list[Finding]:
             if len(candidates) != 1 or len(list(root.iterdir())) != 1:
                 raise ReleaseError("Extracted directory does not contain exactly one portable root.")
             root = candidates[0]
-        return verify_directory(root)
+        return verify_directory(root, release_version)
     raise ReleaseError(f"Verifier input does not exist: {path}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify a Music Vault portable release.")
     parser.add_argument("path", type=Path)
+    parser.add_argument("--release-version", default=APP_VERSION)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
-        findings = verify(args.path.expanduser().resolve())
+        release_version = validate_release_version(args.release_version)
+        findings = verify(args.path.expanduser().resolve(), release_version)
     except (OSError, ValueError, json.JSONDecodeError, zipfile.BadZipFile, ReleaseError) as exc:
         print(f"Portable release verification failed: {exc}", file=sys.stderr)
         return 1
@@ -902,7 +930,7 @@ def main() -> int:
             print(finding.render(), file=sys.stderr)
         print(f"Portable release verification failed with {len(findings)} finding(s).", file=sys.stderr)
         return 1
-    print(f"Music Vault v{APP_VERSION} portable release verification passed.")
+    print(f"Music Vault v{release_version} portable release verification passed.")
     return 0
 
 

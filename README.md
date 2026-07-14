@@ -2,16 +2,20 @@
   <img src="assets/icons/music_vault_icon.png" alt="Music Vault icon" width="128">
 </p>
 
-# Music Vault v1.0.0
+# Music Vault
 
 Music Vault is a standalone, local-first Windows music library and player. It
 imports music already on the computer and can optionally synchronize authorized
 public or unlisted YouTube playlists into a persistent local library.
 
-**Current status: v1.0.0 Stable.** Batches 1 through 8 are complete. Music
-Vault has no Watchtower relationship or runtime dependency.
-See the [v1.0.0 release notes](docs/releases/v1.0.0.md) for installation,
-first-run, licensing, and known-limit details.
+**Latest public release: v1.0.0 Stable.** See the
+[v1.0.0 release notes](docs/releases/v1.0.0.md) for installation, first-run,
+licensing, and known-limit details.
+
+**Current main development line: v1.1.0 Development.** Batch 9 adds
+full-screen audio-reactive Party Mode to the source tree. No v1.1.0 tag or
+public v1.1.0 release has been created. Music Vault has no Watchtower
+relationship or runtime dependency.
 
 ## Install the portable release
 
@@ -55,6 +59,16 @@ downloaded automatically.
 Music Vault does not silently inspect browser cookies, start synchronization or
 metadata remediation on launch, auto-apply uncertain metadata matches, or scan
 the entire computer.
+
+## v1.1.0 development preview
+
+Current `main` includes Party Mode, an optional full-screen now-playing
+experience with Pulse, Starfield, and Aurora presets. It reuses the existing
+player, output, queue, playback context, volume, and transport behavior. Decoded
+audio features drive the visuals when the Qt backend provides them; otherwise a
+clearly bounded ambient fallback keeps the display useful without interrupting
+playback. Party Mode performs no networking, records no audio, and stores no PCM
+samples. See [Party Mode](docs/PARTY_MODE.md).
 
 ## First launch and local data
 
@@ -104,6 +118,7 @@ Common engineering commands:
 .\tools\dev\build_exe.ps1
 .\tools\dev\run_exe.ps1
 .\tools\dev\capture_ui_review.ps1
+.\tools\dev\run_party_mode_review.ps1
 .\tools\dev\profile_media_browsers.ps1
 .\tools\dev\remediate_library_metadata.ps1 status
 .\.venv\Scripts\python.exe -B -m pytest -q
@@ -116,7 +131,8 @@ checked-in `MusicVault.spec`:
 .\tools\dev\build_exe.ps1
 .\tools\release\build_portable_release.ps1
 .\tools\release\verify_portable_release.ps1 `
-  .\release_artifacts\MusicVault-v1.0.0-Windows-x64-Portable.zip
+  .\release_artifacts\MusicVault-v1.0.0-Windows-x64-Portable.zip `
+  --release-version 1.0.0
 ```
 
 The ordinary commands above build the checked-out tree. Corrective publication
@@ -133,15 +149,17 @@ That path does not move or recreate the tag. Its release manifests identify the
 tagged application commit and later release-tooling commit separately.
 
 Generated builds, screenshots, benchmarks, release staging, and all runtime
-data remain untracked. See [Architecture](docs/ARCHITECTURE.md) and
-[Contributing](CONTRIBUTING.md) before proposing a change.
+data remain untracked. See [Developer tools](tools/dev/README.md),
+[Architecture](docs/ARCHITECTURE.md), and [Contributing](CONTRIBUTING.md) before
+proposing a change.
 
 ## Product boundaries and roadmap
 
 Music Vault is a standalone application. Neutral Prime interoperability is only
 a possible external future option. Android, multiple source playlists, Best
 Original quality, an installer/updater, an editable queue panel, and personal
-radio are not V1 requirements. Batch 9 Full-Screen Party Mode is next; see the
+radio are not V1 requirements. Batch 9 Party Mode is complete on the v1.1.0
+development line; Batch 10 Multiple Source Playlists is next. See the
 [roadmap](docs/ROADMAP.md).
 
 ## Licensing

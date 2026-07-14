@@ -1137,9 +1137,9 @@ def test_batch8_release_settings_are_visible_without_exposing_a_key(
     window.pages.setCurrentWidget(window.settings_page)
     window.refresh_settings_status()
 
-    assert window.windowTitle() == "Music Vault v1.0.0"
-    assert "Music Vault v1.0.0" in window.release_status.text()
-    assert "Release Channel: stable" in window.release_status.text()
+    assert window.windowTitle() == "Music Vault v1.1.0 Development"
+    assert "Music Vault v1.1.0 Development" in window.release_status.text()
+    assert "Release Channel: development" in window.release_status.text()
     assert "Runtime Data:" in window.runtime_data_status.text()
     assert str(fixture.root.resolve()) in window.runtime_data_status.text()
     assert window.change_ffmpeg_btn.accessibleName() == "Change FFmpeg Location"

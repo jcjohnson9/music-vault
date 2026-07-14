@@ -32,6 +32,19 @@ Run source verification before submitting:
 .\tools\dev\verify.ps1
 ```
 
+For Party Mode changes, run the bounded synthetic review harness as well:
+
+```powershell
+.\tools\dev\run_party_mode_review.ps1
+```
+
+It uses an offscreen Qt platform, temporary synthetic WAV/artwork/metadata, and
+no network or personal library. Add `--output .\.ui-review\party-mode` only
+when captures are needed for a focused local review, then delete them after the
+findings are recorded. Never commit captures, generated audio, benchmark JSON,
+or temporary runtime data. See [Developer tools](tools/dev/README.md) and
+[Party Mode](docs/PARTY_MODE.md).
+
 Run the read-only public-candidate safety scanner as well:
 
 ```powershell
