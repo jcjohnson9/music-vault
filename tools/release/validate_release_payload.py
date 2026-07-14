@@ -9,33 +9,43 @@ from pathlib import Path
 try:
     from .release_common import (
         APP_VERSION,
-        COMPLIANCE_FILENAME,
-        PACKAGE_FILENAME,
         PRODUCT_NAME,
         ReleaseError,
+        compliance_filename_for,
+        package_filename_for,
         sha256_file,
+        validate_release_version,
         write_json,
     )
 except ImportError:  # Direct script execution.
     from release_common import (
         APP_VERSION,
-        COMPLIANCE_FILENAME,
-        PACKAGE_FILENAME,
         PRODUCT_NAME,
         ReleaseError,
+        compliance_filename_for,
+        package_filename_for,
         sha256_file,
+        validate_release_version,
         write_json,
     )
 
 
 INDEX_FILENAME = "release-payload-index.json"
-PAYLOAD_FILENAMES = (
-    PACKAGE_FILENAME,
-    f"{PACKAGE_FILENAME}.sha256",
-    COMPLIANCE_FILENAME,
-    f"{COMPLIANCE_FILENAME}.sha256",
-    "release-manifest.json",
-)
+
+
+def payload_filenames_for(release_version: str) -> tuple[str, ...]:
+    package_filename = package_filename_for(release_version)
+    compliance_filename = compliance_filename_for(release_version)
+    return (
+        package_filename,
+        f"{package_filename}.sha256",
+        compliance_filename,
+        f"{compliance_filename}.sha256",
+        "release-manifest.json",
+    )
+
+
+PAYLOAD_FILENAMES = payload_filenames_for(APP_VERSION)
 PROVENANCE_KEYS = (
     "source_tag",
     "source_tag_object",
@@ -64,8 +74,12 @@ def _validate_provenance(
     expected_source_tag: str | None = None,
     expected_source_commit: str | None = None,
     expected_tooling_commit: str | None = None,
+    expected_release_version: str = APP_VERSION,
 ) -> None:
-    if value.get("source_tag") != (expected_source_tag or f"v{APP_VERSION}"):
+    release_version = validate_release_version(expected_release_version)
+    if value.get("version") != release_version:
+        raise ReleaseError("Release payload version mismatch.")
+    if value.get("source_tag") != (expected_source_tag or f"v{release_version}"):
         raise ReleaseError("Release payload source tag mismatch.")
     for key in PROVENANCE_KEYS[1:]:
         if not re.fullmatch(r"[0-9a-f]{40}", str(value.get(key) or "")):
@@ -80,8 +94,13 @@ def _validate_provenance(
         raise ReleaseError("Release payload tooling commit mismatch.")
 
 
-def _require_exact_files(directory: Path, *, include_index: bool) -> None:
-    expected = set(PAYLOAD_FILENAMES)
+def _require_exact_files(
+    directory: Path,
+    *,
+    include_index: bool,
+    payload_filenames: tuple[str, ...] = PAYLOAD_FILENAMES,
+) -> None:
+    expected = set(payload_filenames)
     if include_index:
         expected.add(INDEX_FILENAME)
     entries = list(directory.iterdir())
@@ -104,15 +123,21 @@ def write_payload_index(
     expected_source_tag: str | None = None,
     expected_source_commit: str | None = None,
     expected_tooling_commit: str | None = None,
+    expected_release_version: str = APP_VERSION,
 ) -> Path:
     directory = directory.expanduser().resolve()
-    _require_exact_files(directory, include_index=False)
+    release_version = validate_release_version(expected_release_version)
+    payload_filenames = payload_filenames_for(release_version)
+    _require_exact_files(
+        directory, include_index=False, payload_filenames=payload_filenames
+    )
     manifest = _load_manifest(directory)
     _validate_provenance(
         manifest,
         expected_source_tag=expected_source_tag,
         expected_source_commit=expected_source_commit,
         expected_tooling_commit=expected_tooling_commit,
+        expected_release_version=release_version,
     )
     files = [
         {
@@ -120,12 +145,12 @@ def write_payload_index(
             "size": (directory / name).stat().st_size,
             "sha256": sha256_file(directory / name),
         }
-        for name in PAYLOAD_FILENAMES
+        for name in payload_filenames
     ]
     value = {
         "schema_version": 1,
         "product": PRODUCT_NAME,
-        "version": APP_VERSION,
+        "version": release_version,
         **{key: manifest[key] for key in ATTESTATION_KEYS},
         "files": files,
     }
@@ -140,34 +165,47 @@ def verify_payload_index(
     expected_source_tag: str | None = None,
     expected_source_commit: str | None = None,
     expected_tooling_commit: str | None = None,
+    expected_release_version: str = APP_VERSION,
 ) -> dict[str, object]:
     directory = directory.expanduser().resolve()
-    _require_exact_files(directory, include_index=True)
+    release_version = validate_release_version(expected_release_version)
+    payload_filenames = payload_filenames_for(release_version)
+    _require_exact_files(
+        directory, include_index=True, payload_filenames=payload_filenames
+    )
     try:
         index = json.loads((directory / INDEX_FILENAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ReleaseError("Release payload index is unavailable or invalid.") from exc
     if not isinstance(index, dict) or index.get("schema_version") != 1:
         raise ReleaseError("Release payload index schema is invalid.")
-    if index.get("product") != PRODUCT_NAME or index.get("version") != APP_VERSION:
+    if index.get("product") != PRODUCT_NAME or index.get("version") != release_version:
         raise ReleaseError("Release payload index identity mismatch.")
     _validate_provenance(
         index,
         expected_source_tag=expected_source_tag,
         expected_source_commit=expected_source_commit,
         expected_tooling_commit=expected_tooling_commit,
+        expected_release_version=release_version,
     )
     manifest = _load_manifest(directory)
+    _validate_provenance(
+        manifest,
+        expected_source_tag=expected_source_tag,
+        expected_source_commit=expected_source_commit,
+        expected_tooling_commit=expected_tooling_commit,
+        expected_release_version=release_version,
+    )
     for key in ATTESTATION_KEYS:
         if index.get(key) != manifest.get(key):
             raise ReleaseError(f"Release payload {key} disagrees with its manifest.")
     records = index.get("files")
-    if not isinstance(records, list) or len(records) != len(PAYLOAD_FILENAMES):
+    if not isinstance(records, list) or len(records) != len(payload_filenames):
         raise ReleaseError("Release payload index inventory is invalid.")
     by_name = {str(row.get("name") or ""): row for row in records if isinstance(row, dict)}
-    if set(by_name) != set(PAYLOAD_FILENAMES):
+    if set(by_name) != set(payload_filenames):
         raise ReleaseError("Release payload index file names are invalid.")
-    for name in PAYLOAD_FILENAMES:
+    for name in payload_filenames:
         path = directory / name
         row = by_name[name]
         if row.get("size") != path.stat().st_size or row.get("sha256") != sha256_file(path):
@@ -182,6 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-source-tag")
     parser.add_argument("--expected-source-commit")
     parser.add_argument("--expected-tooling-commit")
+    parser.add_argument("--expected-release-version", default=APP_VERSION)
     return parser.parse_args()
 
 
@@ -191,6 +230,7 @@ def main() -> int:
         "expected_source_tag": args.expected_source_tag,
         "expected_source_commit": args.expected_source_commit,
         "expected_tooling_commit": args.expected_tooling_commit,
+        "expected_release_version": args.expected_release_version,
     }
     try:
         if args.mode == "write":

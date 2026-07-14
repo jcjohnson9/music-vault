@@ -107,7 +107,7 @@ jobs:
         working-directory: tooling
         run: |
           $batchTests = @(Get-ChildItem -LiteralPath tests -Filter 'test_batch8_1_*.py' | ForEach-Object FullName)
-          python -B -m pytest -q tests/test_release_pipeline.py @batchTests
+          python -B -m pytest -q tests/test_release_pipeline.py tests/test_batch9_release_version_compat.py @batchTests
           if ($LASTEXITCODE -ne 0) { throw 'Corrected release-tool tests failed.' }
 
       - name: Scan complete current publication history
@@ -153,6 +153,7 @@ jobs:
           --application-root application
           --dist-dir application/dist/MusicVault
           --output-dir release_artifacts
+          --release-version "${{ steps.meta.outputs.release_version }}"
           --source-tag "${{ steps.meta.outputs.source_tag }}"
           --source-commit "${{ steps.meta.outputs.source_commit }}"
           --release-tooling-commit "${{ steps.meta.outputs.release_tooling_commit }}"
@@ -163,11 +164,11 @@ jobs:
       - name: Verify release and seal transfer payload
         shell: pwsh
         run: |
-          python -B tooling/tools/release/verify_portable_release.py "release_artifacts/${{ steps.meta.outputs.portable_filename }}"
+          python -B tooling/tools/release/verify_portable_release.py "release_artifacts/${{ steps.meta.outputs.portable_filename }}" --release-version "${{ steps.meta.outputs.release_version }}"
           if ($LASTEXITCODE -ne 0) { throw 'Portable/compliance verification failed.' }
-          python -B tooling/tools/release/validate_release_payload.py write release_artifacts --expected-source-tag "${{ steps.meta.outputs.source_tag }}" --expected-source-commit "${{ steps.meta.outputs.source_commit }}" --expected-tooling-commit "${{ steps.meta.outputs.release_tooling_commit }}"
+          python -B tooling/tools/release/validate_release_payload.py write release_artifacts --expected-release-version "${{ steps.meta.outputs.release_version }}" --expected-source-tag "${{ steps.meta.outputs.source_tag }}" --expected-source-commit "${{ steps.meta.outputs.source_commit }}" --expected-tooling-commit "${{ steps.meta.outputs.release_tooling_commit }}"
           if ($LASTEXITCODE -ne 0) { throw 'Release transfer sealing failed.' }
-          python -B tooling/tools/release/validate_release_payload.py verify release_artifacts --expected-source-tag "${{ steps.meta.outputs.source_tag }}" --expected-source-commit "${{ steps.meta.outputs.source_commit }}" --expected-tooling-commit "${{ steps.meta.outputs.release_tooling_commit }}"
+          python -B tooling/tools/release/validate_release_payload.py verify release_artifacts --expected-release-version "${{ steps.meta.outputs.release_version }}" --expected-source-tag "${{ steps.meta.outputs.source_tag }}" --expected-source-commit "${{ steps.meta.outputs.source_commit }}" --expected-tooling-commit "${{ steps.meta.outputs.release_tooling_commit }}"
           if ($LASTEXITCODE -ne 0) { throw 'Release transfer verification failed.' }
 
       - name: Retain exact verified release payload
@@ -226,9 +227,9 @@ jobs:
       - name: Revalidate transferred bytes and provenance
         shell: pwsh
         run: |
-          python -B tooling/tools/release/validate_release_payload.py verify release_artifacts --expected-source-tag "${{ needs.build-and-verify.outputs.source_tag }}" --expected-source-commit "${{ needs.build-and-verify.outputs.source_commit }}" --expected-tooling-commit "${{ needs.build-and-verify.outputs.release_tooling_commit }}"
+          python -B tooling/tools/release/validate_release_payload.py verify release_artifacts --expected-release-version "${{ needs.build-and-verify.outputs.release_version }}" --expected-source-tag "${{ needs.build-and-verify.outputs.source_tag }}" --expected-source-commit "${{ needs.build-and-verify.outputs.source_commit }}" --expected-tooling-commit "${{ needs.build-and-verify.outputs.release_tooling_commit }}"
           if ($LASTEXITCODE -ne 0) { throw 'Downloaded release payload validation failed.' }
-          python -B tooling/tools/release/verify_portable_release.py "release_artifacts/${{ needs.build-and-verify.outputs.portable_filename }}"
+          python -B tooling/tools/release/verify_portable_release.py "release_artifacts/${{ needs.build-and-verify.outputs.portable_filename }}" --release-version "${{ needs.build-and-verify.outputs.release_version }}"
           if ($LASTEXITCODE -ne 0) { throw 'Downloaded portable/compliance verification failed.' }
 
       - name: Refuse an existing or conflicting public release

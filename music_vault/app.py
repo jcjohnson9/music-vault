@@ -5,6 +5,7 @@ import random
 import json
 import math
 import os
+import time
 from functools import partial
 from pathlib import Path
 
@@ -17,8 +18,16 @@ from PySide6.QtGui import (
     QIcon,
     QPainter,
     QPainterPath,
+    QKeySequence,
+    QShortcut,
 )
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QMediaDevices
+from PySide6.QtMultimedia import (
+    QAudioBuffer,
+    QAudioBufferOutput,
+    QAudioOutput,
+    QMediaDevices,
+    QMediaPlayer,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -51,9 +60,10 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QButtonGroup,
     QDialog,
+    QSpinBox,
 )
 
-from music_vault.version import APP_VERSION, DISPLAY_VERSION, RELEASE_CHANNEL
+from music_vault.version import DISPLAY_VERSION, RELEASE_CHANNEL
 from music_vault.core.db import MusicVaultDB
 from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
 from music_vault.core.ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
@@ -140,6 +150,14 @@ from music_vault.ui.onboarding import (
     inspect_runtime_evidence,
     sanitized_onboarding_config,
     should_show_first_run,
+)
+from music_vault.ui.party_mode import (
+    PARTY_MODE_DEFAULTS,
+    PARTY_PRESETS,
+    PARTY_QUALITIES,
+    PartyAudioAnalysisThread,
+    PartyModeWindow,
+    normalize_party_mode_settings,
 )
 from music_vault.ui.review import schedule_ui_review
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
@@ -282,10 +300,19 @@ class MusicVaultWindow(QMainWindow):
         self._active_browser_kind: str | None = None
 
         self.app_sync_status: dict | None = None
+        self.party_mode_window: PartyModeWindow | None = None
+        self.party_audio_thread: PartyAudioAnalysisThread | None = None
+        self.party_mode_active = False
+        self.party_audio_reactivity_available = False
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
+        self.audio_buffer_output = QAudioBufferOutput(self)
+        self.player.setAudioBufferOutput(self.audio_buffer_output)
+        self.audio_buffer_output.audioBufferReceived.connect(
+            self.on_party_audio_buffer_received
+        )
         self.audio_output.setVolume(self.volume_percent / 100.0)
 
         self.volume_save_timer = QTimer(self)
@@ -306,6 +333,10 @@ class MusicVaultWindow(QMainWindow):
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.errorOccurred.connect(self.on_media_error)
 
+        self.party_mode_shortcut = QShortcut(QKeySequence(Qt.Key_F11), self)
+        self.party_mode_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.party_mode_shortcut.activated.connect(self.toggle_party_mode)
+
         self.build_ui()
         self.update_playback_mode_buttons()
         self.load_library()
@@ -324,6 +355,7 @@ class MusicVaultWindow(QMainWindow):
             "volume_percent": DEFAULT_VOLUME_PERCENT,
             "artist_image_fetch_enabled": False,
             "onboarding_completed": False,
+            **PARTY_MODE_DEFAULTS,
         }
 
     def load_config(self) -> dict:
@@ -348,6 +380,7 @@ class MusicVaultWindow(QMainWindow):
         config["artist_image_fetch_enabled"] = (
             config.get("artist_image_fetch_enabled") is True
         )
+        config.update(normalize_party_mode_settings(config))
         return config
 
     def save_config(self) -> None:
@@ -443,6 +476,13 @@ class MusicVaultWindow(QMainWindow):
                     "repeat_mode": self.repeat_mode,
                     "queue_count": len(self.manual_queue),
                 },
+                "party_mode_active": self.party_mode_active,
+                "party_mode_preset": str(
+                    self.config.get("party_mode_preset", "pulse")
+                ),
+                "audio_reactivity_available": (
+                    self.party_audio_reactivity_available
+                ),
             }
 
             if self.app_sync_status is not None:
@@ -455,10 +495,137 @@ class MusicVaultWindow(QMainWindow):
                         status_extra[section].update(values)
                     elif isinstance(values, dict):
                         status_extra[section] = values
+                for field in (
+                    "party_mode_active",
+                    "party_mode_preset",
+                    "audio_reactivity_available",
+                ):
+                    if field in extra:
+                        status_extra[field] = extra[field]
 
             export_app_status(self.db, self.config, status_extra)
         except Exception:
             pass
+
+    def _ensure_party_audio_thread(self) -> PartyAudioAnalysisThread:
+        thread = self.party_audio_thread
+        if thread is None or thread.isFinished():
+            thread = PartyAudioAnalysisThread(self)
+            thread.features_ready.connect(self.on_party_audio_features)
+            self.party_audio_thread = thread
+            thread.start()
+        return thread
+
+    def _shutdown_party_audio_thread(self) -> None:
+        thread = self.party_audio_thread
+        self.party_audio_thread = None
+        if thread is None:
+            return
+        try:
+            thread.features_ready.disconnect(self.on_party_audio_features)
+        except (RuntimeError, TypeError):
+            pass
+        stopped = thread.shutdown()
+        if stopped:
+            thread.deleteLater()
+        else:
+            thread.finished.connect(thread.deleteLater)
+
+    def on_party_audio_buffer_received(self, buffer: QAudioBuffer) -> None:
+        """Copy one bounded decoded buffer only while Party Mode is active."""
+
+        thread = self.party_audio_thread
+        if (
+            not self.party_mode_active
+            or thread is None
+            or not thread.isRunning()
+            or not buffer.isValid()
+            or buffer.byteCount() <= 0
+        ):
+            return
+
+        try:
+            audio_format = buffer.format()
+            channels = int(audio_format.channelCount())
+            sample_rate = int(audio_format.sampleRate())
+            if channels <= 0 or sample_rate <= 0:
+                return
+
+            view = buffer.constData()
+            byte_count = min(len(view), 1_048_576)
+            pcm = bytes(view[len(view) - byte_count :])
+            timestamp_ms = time.monotonic_ns() // 1_000_000
+            thread.submit(
+                pcm,
+                audio_format.sampleFormat(),
+                channels,
+                sample_rate,
+                timestamp_ms,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Decoded-audio availability varies by backend. Visual fallback is
+            # intentionally sufficient and playback must never be interrupted.
+            return
+
+    def on_party_audio_features(self, features: object) -> None:
+        window = self.party_mode_window
+        if self.party_mode_active and window is not None and window.isVisible():
+            window.on_audio_features(features)
+
+    def toggle_party_mode(self) -> None:
+        window = self.party_mode_window
+        if self.party_mode_active and window is not None and window.isVisible():
+            window.close()
+            return
+        self.open_party_mode()
+
+    def open_party_mode(self) -> None:
+        window = self.party_mode_window
+        if window is None:
+            window = PartyModeWindow(self)
+            window.party_closed.connect(self.on_party_mode_closed)
+            window.preset_changed.connect(self.on_party_mode_preset_changed)
+            window.audio_reactivity_changed.connect(
+                self.on_party_audio_reactivity_changed
+            )
+            self.party_mode_window = window
+
+        window.apply_settings(self.config)
+        self._ensure_party_audio_thread()
+        self.party_mode_active = True
+        self.party_audio_reactivity_available = False
+
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = self.screen() or QApplication.primaryScreen()
+        window.show_on_screen(screen)
+        self.write_app_status()
+
+    def on_party_mode_closed(self) -> None:
+        self.party_mode_active = False
+        self.party_audio_reactivity_available = False
+        self._shutdown_party_audio_thread()
+        self.write_app_status()
+
+    def on_party_mode_preset_changed(self, preset: str) -> None:
+        normalized = normalize_party_mode_settings(
+            {**self.config, "party_mode_preset": preset}
+        )
+        self.config.update(normalized)
+        if hasattr(self, "settings_party_preset"):
+            previous = self.settings_party_preset.blockSignals(True)
+            try:
+                self.settings_party_preset.setCurrentText(preset.title())
+            finally:
+                self.settings_party_preset.blockSignals(previous)
+        self.write_app_status()
+
+    def on_party_audio_reactivity_changed(self, available: bool) -> None:
+        normalized = bool(available)
+        if normalized == self.party_audio_reactivity_available:
+            return
+        self.party_audio_reactivity_available = normalized
+        self.write_app_status()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -1162,6 +1329,90 @@ class MusicVaultWindow(QMainWindow):
             str(self.config.get("ffmpeg_location") or "")
         )
 
+        party_mode_title = QLabel("Party Mode")
+        party_mode_title.setObjectName("CardTitle")
+        party_mode_description = QLabel(
+            "Choose the full-screen visual preset, performance limits, and "
+            "overlay behavior. Press F11 anywhere in Music Vault to enter."
+        )
+        party_mode_description.setObjectName("MutedLabel")
+        party_mode_description.setWordWrap(True)
+
+        party_controls = QGridLayout()
+        party_controls.setHorizontalSpacing(16)
+        party_controls.setVerticalSpacing(10)
+
+        party_preset_label = QLabel("Visual Preset")
+        party_preset_label.setObjectName("MutedLabel")
+        self.settings_party_preset = QComboBox()
+        self.settings_party_preset.setObjectName("QualityCombo")
+        self.settings_party_preset.setAccessibleName("Party Mode visual preset")
+        self.settings_party_preset.addItems(
+            [preset.title() for preset in PARTY_PRESETS]
+        )
+
+        party_quality_label = QLabel("Visual Quality")
+        party_quality_label.setObjectName("MutedLabel")
+        self.settings_party_quality = QComboBox()
+        self.settings_party_quality.setObjectName("QualityCombo")
+        self.settings_party_quality.setAccessibleName("Party Mode visual quality")
+        self.settings_party_quality.addItems(
+            [quality.title() for quality in PARTY_QUALITIES]
+        )
+
+        party_frame_rate_label = QLabel("Frame Rate")
+        party_frame_rate_label.setObjectName("MutedLabel")
+        self.settings_party_frame_rate = QComboBox()
+        self.settings_party_frame_rate.setObjectName("QualityCombo")
+        self.settings_party_frame_rate.setAccessibleName("Party Mode frame rate")
+        self.settings_party_frame_rate.addItems(
+            ["Auto", "30 FPS", "60 FPS"]
+        )
+
+        party_timeout_label = QLabel("Overlay Timeout")
+        party_timeout_label.setObjectName("MutedLabel")
+        self.settings_party_overlay_timeout = QSpinBox()
+        self.settings_party_overlay_timeout.setObjectName("QualityCombo")
+        self.settings_party_overlay_timeout.setAccessibleName(
+            "Party Mode overlay timeout in seconds"
+        )
+        self.settings_party_overlay_timeout.setRange(1, 10)
+        self.settings_party_overlay_timeout.setSuffix(" seconds")
+
+        party_controls.addWidget(party_preset_label, 0, 0)
+        party_controls.addWidget(self.settings_party_preset, 1, 0)
+        party_controls.addWidget(party_quality_label, 0, 1)
+        party_controls.addWidget(self.settings_party_quality, 1, 1)
+        party_controls.addWidget(party_frame_rate_label, 2, 0)
+        party_controls.addWidget(self.settings_party_frame_rate, 3, 0)
+        party_controls.addWidget(party_timeout_label, 2, 1)
+        party_controls.addWidget(self.settings_party_overlay_timeout, 3, 1)
+
+        self.settings_party_reduced_motion = QCheckBox(
+            "Use reduced motion"
+        )
+        self.settings_party_reduced_motion.setAccessibleName(
+            "Use reduced motion in Party Mode"
+        )
+        self.settings_party_show_artwork = QCheckBox(
+            "Show current artwork"
+        )
+        self.settings_party_show_artwork.setAccessibleName(
+            "Show current artwork in Party Mode"
+        )
+        self.settings_party_auto_hide = QCheckBox(
+            "Automatically hide controls"
+        )
+        self.settings_party_auto_hide.setAccessibleName(
+            "Automatically hide Party Mode controls"
+        )
+
+        party_options_row = QHBoxLayout()
+        party_options_row.addWidget(self.settings_party_reduced_motion)
+        party_options_row.addWidget(self.settings_party_show_artwork)
+        party_options_row.addWidget(self.settings_party_auto_hide)
+        party_options_row.addStretch(1)
+
         save_btn = QPushButton("Save Settings")
         save_btn.setObjectName("PrimaryButton")
         save_btn.setIcon(
@@ -1281,6 +1532,11 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(self.settings_quality)
         settings_layout.addWidget(ffmpeg_location_label)
         settings_layout.addWidget(self.settings_ffmpeg_location)
+        settings_layout.addSpacing(10)
+        settings_layout.addWidget(party_mode_title)
+        settings_layout.addWidget(party_mode_description)
+        settings_layout.addLayout(party_controls)
+        settings_layout.addLayout(party_options_row)
         settings_layout.addWidget(save_btn)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(artist_images_title)
@@ -1461,10 +1717,22 @@ class MusicVaultWindow(QMainWindow):
         self.queue_label.setAlignment(Qt.AlignCenter)
         self.queue_label.setToolTip("Songs queued to play next")
 
+        self.party_mode_btn = IconButton(
+            "party-mode",
+            "Party Mode (F11)",
+            "Open Party Mode",
+            size=18,
+            variant="circle",
+            parent=bar,
+        )
+        self.party_mode_btn.setObjectName("CircleButton")
+        self.party_mode_btn.clicked.connect(self.toggle_party_mode)
+
         mode_row.addWidget(self.autoplay_btn)
         mode_row.addWidget(self.shuffle_btn)
         mode_row.addWidget(self.repeat_btn)
         mode_row.addWidget(self.queue_label)
+        mode_row.addWidget(self.party_mode_btn)
 
         volume_row = QHBoxLayout()
         volume_row.setSpacing(8)
@@ -2721,6 +2989,11 @@ class MusicVaultWindow(QMainWindow):
                 self.now_title.setText(track["title"] or Path(track["path"]).stem)
                 self.now_artist.setText(track["artist"] or "Unknown Artist")
                 self.set_cover_art(track["cover_path"])
+                party_window = getattr(self, "party_mode_window", None)
+                if party_window is not None and getattr(
+                    self, "party_mode_active", False
+                ):
+                    party_window.refresh_from_host(force=True)
 
         if self.current_view_kind in {"albums", "artists"}:
             if self.current_view_kind == "albums":
@@ -2815,6 +3088,9 @@ class MusicVaultWindow(QMainWindow):
         self.now_artist.setText(artist)
 
         self.set_cover_art(track["cover_path"])
+        party_window = getattr(self, "party_mode_window", None)
+        if party_window is not None and getattr(self, "party_mode_active", False):
+            party_window.refresh_from_host(force=True)
         self.write_app_status()
         return True
 
@@ -2962,6 +3238,9 @@ class MusicVaultWindow(QMainWindow):
     def update_queue_label(self) -> None:
         if hasattr(self, "queue_label"):
             self.queue_label.setText(f"Q: {len(self.manual_queue)}")
+        party_window = getattr(self, "party_mode_window", None)
+        if party_window is not None and getattr(self, "party_mode_active", False):
+            party_window.refresh_from_host()
 
     def queue_selected_next(self) -> None:
         track_id = self.selected_track_id()
@@ -3161,6 +3440,9 @@ class MusicVaultWindow(QMainWindow):
         for btn in [self.autoplay_btn, self.shuffle_btn, self.repeat_btn]:
             repolish(btn)
 
+        party_window = getattr(self, "party_mode_window", None)
+        if party_window is not None and getattr(self, "party_mode_active", False):
+            party_window.refresh_from_host()
         self.write_app_status()
 
     def on_playback_state_changed(self, state) -> None:
@@ -3265,6 +3547,11 @@ class MusicVaultWindow(QMainWindow):
                 self.now_title.setText(track["title"] or Path(track["path"]).stem)
                 self.now_artist.setText(track["artist"] or "Unknown Artist")
                 self.set_cover_art(track["cover_path"])
+                party_window = getattr(self, "party_mode_window", None)
+                if party_window is not None and getattr(
+                    self, "party_mode_active", False
+                ):
+                    party_window.refresh_from_host(force=True)
 
         if self.current_view_kind in {"albums", "artists"}:
             if self.current_view_kind == "albums":
@@ -3798,7 +4085,32 @@ class MusicVaultWindow(QMainWindow):
             self.settings_artist_images_enabled.isChecked()
             and self.config.get("artist_image_fetch_enabled") is True
         )
+        party_settings = normalize_party_mode_settings(
+            {
+                "party_mode_preset": self.settings_party_preset.currentText().lower(),
+                "party_mode_quality": self.settings_party_quality.currentText().lower(),
+                "party_mode_frame_rate": (
+                    self.settings_party_frame_rate.currentText().split()[0].lower()
+                ),
+                "party_mode_reduced_motion": (
+                    self.settings_party_reduced_motion.isChecked()
+                ),
+                "party_mode_show_artwork": (
+                    self.settings_party_show_artwork.isChecked()
+                ),
+                "party_mode_auto_hide_overlay": (
+                    self.settings_party_auto_hide.isChecked()
+                ),
+                "party_mode_overlay_timeout_seconds": (
+                    self.settings_party_overlay_timeout.value()
+                ),
+            }
+        )
+        self.config.update(party_settings)
         self.save_config()
+
+        if self.party_mode_window is not None:
+            self.party_mode_window.apply_settings(party_settings)
 
         if hasattr(self, "youtube_output"):
             self.youtube_output.setText(self.config["download_folder"])
@@ -3940,6 +4252,65 @@ class MusicVaultWindow(QMainWindow):
                 )
             finally:
                 self.settings_artist_images_enabled.blockSignals(previous)
+        party_settings = normalize_party_mode_settings(self.config)
+        party_controls = (
+            (
+                "settings_party_preset",
+                party_settings["party_mode_preset"].title(),
+            ),
+            (
+                "settings_party_quality",
+                party_settings["party_mode_quality"].title(),
+            ),
+            (
+                "settings_party_frame_rate",
+                (
+                    "Auto"
+                    if party_settings["party_mode_frame_rate"] == "auto"
+                    else f"{party_settings['party_mode_frame_rate']} FPS"
+                ),
+            ),
+        )
+        for attribute, value in party_controls:
+            widget = getattr(self, attribute, None)
+            if widget is None:
+                continue
+            previous = widget.blockSignals(True)
+            try:
+                widget.setCurrentText(str(value))
+            finally:
+                widget.blockSignals(previous)
+        party_checks = (
+            (
+                "settings_party_reduced_motion",
+                party_settings["party_mode_reduced_motion"],
+            ),
+            (
+                "settings_party_show_artwork",
+                party_settings["party_mode_show_artwork"],
+            ),
+            (
+                "settings_party_auto_hide",
+                party_settings["party_mode_auto_hide_overlay"],
+            ),
+        )
+        for attribute, value in party_checks:
+            widget = getattr(self, attribute, None)
+            if widget is None:
+                continue
+            previous = widget.blockSignals(True)
+            try:
+                widget.setChecked(bool(value))
+            finally:
+                widget.blockSignals(previous)
+        if hasattr(self, "settings_party_overlay_timeout"):
+            previous = self.settings_party_overlay_timeout.blockSignals(True)
+            try:
+                self.settings_party_overlay_timeout.setValue(
+                    int(party_settings["party_mode_overlay_timeout_seconds"])
+                )
+            finally:
+                self.settings_party_overlay_timeout.blockSignals(previous)
         self.refresh_artist_cache_status()
 
     def resizeEvent(self, event) -> None:
@@ -3952,6 +4323,12 @@ class MusicVaultWindow(QMainWindow):
             self._dark_title_bar_applied = apply_dark_title_bar(self)
 
     def closeEvent(self, event) -> None:
+        if self.party_mode_window is not None:
+            try:
+                self.party_mode_window.close()
+            except RuntimeError:
+                pass
+        self._shutdown_party_audio_thread()
         self.flush_pending_volume_save()
         self.browser_summary_loader.close()
         self.thumbnail_cache.close()

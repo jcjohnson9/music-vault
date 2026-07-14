@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from music_vault.version import APP_VERSION
+from music_vault.version import APP_VERSION, RELEASE_CHANNEL
 
 from .ffmpeg import discover_ffmpeg
 from .paths import (
@@ -133,6 +133,7 @@ def write_app_status(db, config, extra=None) -> Path:
         "schema_version": SCHEMA_VERSION,
         "app": "Music Vault",
         "app_version": APP_VERSION,
+        "release_channel": RELEASE_CHANNEL,
         "updated_at": _utc_now(),
         "health": {
             "ok": api_ready and ffmpeg_ready,
@@ -162,6 +163,9 @@ def write_app_status(db, config, extra=None) -> Path:
             "queue_count": 0,
         },
         "sync": _previous_sync(status_file),
+        "party_mode_active": False,
+        "party_mode_preset": "pulse",
+        "audio_reactivity_available": False,
         "paths": {
             "project_root": str(root),
             "data_dir": str(resolved_data_dir),
@@ -175,6 +179,13 @@ def write_app_status(db, config, extra=None) -> Path:
     if isinstance(extra, dict):
         for section in ("health", "playback", "sync"):
             _merge_section(payload, section, extra.get(section))
+        for field in (
+            "party_mode_active",
+            "party_mode_preset",
+            "audio_reactivity_available",
+        ):
+            if field in extra:
+                payload[field] = extra[field]
 
     resolved_data_dir.mkdir(parents=True, exist_ok=True)
     temporary = status_file.with_name(f"{status_file.name}.tmp")

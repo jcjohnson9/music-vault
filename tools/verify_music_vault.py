@@ -20,6 +20,7 @@ REQUIRED_FILES = (
     "music_vault/core/ffmpeg.py",
     "music_vault/core/desktop_shortcut.py",
     "music_vault/core/library_browser.py",
+    "music_vault/core/audio_analysis.py",
     "music_vault/metadata/schema.py",
     "music_vault/metadata/service.py",
     "music_vault/metadata/artwork.py",
@@ -40,9 +41,18 @@ REQUIRED_FILES = (
     "music_vault/ui/components.py",
     "music_vault/ui/review.py",
     "music_vault/ui/onboarding.py",
+    "music_vault/ui/party_mode.py",
+    "music_vault/ui/party_palette.py",
+    "music_vault/ui/party_visuals.py",
     "assets/icons/music_vault.ico",
     "assets/icons/ui/README.md",
     "assets/icons/ui/artist-unknown.svg",
+    "assets/icons/ui/party-mode.svg",
+    "assets/icons/ui/exit-fullscreen.svg",
+    "assets/icons/ui/visual-preset.svg",
+    "assets/icons/ui/overlay-help.svg",
+    "tools/dev/run_party_mode_review.py",
+    "tools/dev/run_party_mode_review.ps1",
     "tools/dev/remediate_library_metadata.py",
     "tools/dev/remediate_library_metadata.ps1",
     "requirements-release.txt",
@@ -57,6 +67,7 @@ REQUIRED_FILES = (
     "licenses/qt-attrib/INDEX.md",
     "licenses/qt-attrib/SOURCE_ARCHIVES.json",
     "docs/BINARY_DISTRIBUTION_LICENSE.md",
+    "docs/PARTY_MODE.md",
     ".github/workflows/release.yml",
 )
 
@@ -86,6 +97,7 @@ def main() -> int:
     from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
     from music_vault.core.ffmpeg import discover_ffmpeg
     from music_vault.core.library_browser import load_album_summaries, load_artist_summaries
+    from music_vault.core.audio_analysis import AudioAnalyzer
     from music_vault.core.app_status import write_app_status
     from music_vault.core.watchtower_status import write_watchtower_status
     from music_vault.ui.components import EmptyState, IconButton, SearchField
@@ -105,6 +117,9 @@ def main() -> int:
     from music_vault.ui.review import schedule_ui_review
     from music_vault.ui.theme import application_stylesheet
     from music_vault.ui.onboarding import FirstRunWizard, inspect_runtime_evidence
+    from music_vault.ui.party_mode import PartyModeWindow, normalize_party_mode_settings
+    from music_vault.ui.party_palette import PaletteExtractor
+    from music_vault.ui.party_visuals import PartyCanvas
     from music_vault.version import APP_VERSION, RELEASE_CHANNEL
     import music_vault.app as app
 
@@ -112,8 +127,8 @@ def main() -> int:
         print("App status exporter or compatibility alias is invalid.")
         return 1
 
-    if APP_VERSION != "1.0.0" or RELEASE_CHANNEL != "stable":
-        print("Central release version metadata is invalid.")
+    if APP_VERSION != "1.1.0" or RELEASE_CHANNEL != "development":
+        print("Central development version metadata is invalid.")
         return 1
 
     if not all(
@@ -139,6 +154,19 @@ def main() -> int:
 
     if not all(callable(value) for value in (EmptyState, IconButton, SearchField, schedule_ui_review)):
         print("Music Vault UI components or review hook are unavailable.")
+        return 1
+
+    if not all(
+        callable(value)
+        for value in (
+            AudioAnalyzer,
+            PartyModeWindow,
+            normalize_party_mode_settings,
+            PaletteExtractor,
+            PartyCanvas,
+        )
+    ):
+        print("Music Vault Party Mode components are unavailable.")
         return 1
 
     if not all(

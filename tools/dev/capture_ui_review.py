@@ -5,13 +5,16 @@ import base64
 import ctypes
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 
 
@@ -62,11 +65,15 @@ REMEDIATION_SCENES = (
     "remediation_rolled_back",
     "remediation_long_values",
 )
+PARTY_SCENES = ("party_mode_smoke",)
 RUNTIME_PREFIX = "MusicVault_Batch7_UI_Runtime_"
 OUTPUT_PREFIX = "MusicVault_UI_Review_Output_"
 REMEDIATION_RESTART_PHASE_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_PHASE"
 REMEDIATION_RESTART_REQUIRED_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_REQUIRED"
 REMEDIATION_RESTART_CHECKPOINT = "synthetic_remediation_restart.json"
+PARTY_REVIEW_FIXTURE = "synthetic_party_mode_review.json"
+PARTY_REVIEW_SAMPLE_RATE = 48_000
+PARTY_REVIEW_DURATION_SECONDS = 20
 
 _SYNTHETIC_MP3_BASE64 = (
     "//sQxAADwAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
@@ -133,6 +140,7 @@ def parse_args() -> argparse.Namespace:
             "no_results",
             *METADATA_SCENES,
             *REMEDIATION_SCENES,
+            *PARTY_SCENES,
         ),
         help="Repeatable review scene. Defaults to the standard application matrix.",
     )
@@ -183,6 +191,9 @@ def create_runtime_root(project_root: Path) -> Path:
     (runtime / "music_vault").mkdir()
     (runtime / "data").mkdir()
     (runtime / "profile").mkdir()
+    (runtime / "profile" / "LocalAppData").mkdir()
+    (runtime / "profile" / "RoamingAppData").mkdir()
+    (runtime / "temp").mkdir()
     return runtime
 
 
@@ -233,7 +244,48 @@ def generated_artwork(destination: Path, index: int) -> None:
         raise RuntimeError("Could not generate synthetic review artwork.")
 
 
-def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
+def write_synthetic_party_wav(destination: Path, *, variant: int) -> None:
+    """Write a bounded, original test signal using only the standard library."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    frequencies = (
+        (86.0, 410.0, 2_900.0),
+        (132.0, 880.0, 4_600.0),
+    )[variant % 2]
+    frame_count = PARTY_REVIEW_SAMPLE_RATE * PARTY_REVIEW_DURATION_SECONDS
+    frames = bytearray()
+    for index in range(frame_count):
+        moment = index / PARTY_REVIEW_SAMPLE_RATE
+        section = int(moment / 0.75) % len(frequencies)
+        frequency = frequencies[section]
+        envelope = 0.14
+        if int(moment * 4.0) != int(max(0.0, moment - 0.025) * 4.0):
+            envelope = 0.24
+        sample = math.sin(math.tau * frequency * moment) * envelope
+        frames.extend(struct.pack("<h", round(sample * 32_767)))
+
+    with wave.open(str(destination), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(PARTY_REVIEW_SAMPLE_RATE)
+        target.writeframes(frames)
+
+    with wave.open(str(destination), "rb") as source:
+        if (
+            source.getnchannels() != 1
+            or source.getsampwidth() != 2
+            or source.getframerate() != PARTY_REVIEW_SAMPLE_RATE
+            or source.getnframes() != frame_count
+        ):
+            raise RuntimeError("Synthetic Party Mode WAV failed validation.")
+
+
+def seed_synthetic_runtime(
+    project_root: Path,
+    runtime: Path,
+    *,
+    include_party: bool = False,
+) -> dict[str, int]:
     data = runtime / "data"
     downloads = data / "youtube_downloads"
     covers = data / "synthetic_artwork"
@@ -246,6 +298,13 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         "audio_quality": "320",
         "volume_percent": 23,
         "artist_image_fetch_enabled": False,
+        "party_mode_preset": "pulse",
+        "party_mode_quality": "medium",
+        "party_mode_frame_rate": "30",
+        "party_mode_reduced_motion": False,
+        "party_mode_show_artwork": True,
+        "party_mode_auto_hide_overlay": True,
+        "party_mode_overlay_timeout_seconds": 3,
     }
     (data / "music_vault_config.json").write_text(
         json.dumps(config, indent=2) + "\n", encoding="utf-8"
@@ -253,6 +312,17 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
 
     for index in range(18):
         generated_artwork(covers / f"synthetic_cover_{index + 1}.png", index)
+
+    party_wavs: tuple[Path, ...] = ()
+    if include_party:
+        party_media = data / "synthetic_party_mode"
+        party_media.mkdir()
+        party_wavs = (
+            party_media / "synthetic_party_signal_a.wav",
+            party_media / "synthetic_party_signal_b.wav",
+        )
+        for variant, wav_path in enumerate(party_wavs):
+            write_synthetic_party_wav(wav_path, variant=variant)
 
     previous_environment = {
         name: os.environ.get(name)
@@ -307,6 +377,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         )
 
         track_ids: list[int] = []
+        party_track_ids: list[int] = []
         for index in range(300):
             track_title = f"{titles[index % len(titles)]} {index + 1:04d}"
             duration_seconds = 150 + index * 3
@@ -323,6 +394,11 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                 tags.add(TPE1(encoding=3, text=[str(artists[index])]))
                 tags.save(sentinel, v2_version=3)
                 duration_seconds = inspect_mp3(sentinel).duration_seconds
+            elif include_party and index >= 298:
+                party_index = index - 298
+                sentinel = party_wavs[party_index]
+                track_title = f"Synthetic Party Signal {party_index + 1}"
+                duration_seconds = PARTY_REVIEW_DURATION_SECONDS
             else:
                 sentinel = media / f"track_{index + 1:04d}.synthetic-audio"
                 sentinel.write_bytes(b"synthetic-review-sentinel\n")
@@ -341,6 +417,11 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                 )
                 album_artist = "Cinder Ambiguous Artist"
                 canonical_year = "1999"
+            elif include_party and index >= 298:
+                party_index = index - 298
+                album = "Synthetic Party Mode"
+                album_artist = "Music Vault Review"
+                canonical_year = None
             else:
                 album_index = (index - 3) % 97
                 album = f"Synthetic Album {album_index:03d}"
@@ -348,24 +429,34 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
                 canonical_year = (
                     str(1980 + album_index % 44) if album_index % 4 else None
                 )
-            track_id = db.upsert_track(
-                sentinel,
-                title=track_title,
-                artist=artists[index % len(artists)],
-                album=album,
-                album_artist=album_artist,
-                year=canonical_year,
-                cover_path=(
+            if include_party and index >= 298:
+                artist = "Music Vault Review"
+                cover_path = str(
+                    (covers / f"synthetic_cover_{16 + (index - 298)}.png").resolve()
+                )
+            else:
+                artist = artists[index % len(artists)]
+                cover_path = (
                     str((covers / f"synthetic_cover_{index % 18 + 1}.png").resolve())
                     if index % 11 != 0
                     else None
-                ),
+                )
+            track_id = db.upsert_track(
+                sentinel,
+                title=track_title,
+                artist=artist,
+                album=album,
+                album_artist=album_artist,
+                year=canonical_year,
+                cover_path=cover_path,
                 duration_seconds=duration_seconds,
                 source_kind="youtube" if index == 0 else "local",
                 source_video_id="abcdefghijk" if index == 0 else None,
                 source_upload_date="2024-03-02" if index == 0 else None,
             )
             track_ids.append(track_id)
+            if include_party and index >= 298:
+                party_track_ids.append(track_id)
 
         playlist_specs = (
             ("Synthetic Focus Mix", track_ids[:10]),
@@ -386,6 +477,21 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         db.close()
         if schema != 4 or integrity != "ok":
             raise RuntimeError("Synthetic database validation failed.")
+
+        if include_party:
+            (data / PARTY_REVIEW_FIXTURE).write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "synthetic_only": True,
+                        "track_ids": party_track_ids,
+                        "queue_track_id": track_ids[2],
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
     finally:
         try:
             paths._resolved_project_root.cache_clear()  # type: ignore[name-defined]
@@ -406,6 +512,7 @@ def seed_synthetic_runtime(project_root: Path, runtime: Path) -> dict[str, int]:
         "synthetic_artist_target": 200,
         "artist_image_fetch_enabled_by_default": False,
         "synthetic_mp3_count": 1,
+        "synthetic_party_wav_count": len(party_wavs),
     }
 
 
@@ -581,6 +688,48 @@ def validate_output(
             for name in required_behaviors
         ):
             raise RuntimeError("Synthetic packaged remediation validation failed.")
+    if captured_scenes.intersection(PARTY_SCENES):
+        runtime_checks = payload.get("runtime_checks") or {}
+        party_behaviors = runtime_checks.get("party_mode_behaviors") or {}
+        required_behaviors = {
+            "synthetic_fixture_validated",
+            "network_guard_active",
+            "party_button_present",
+            "f11_opened",
+            "f11_closed",
+            "escape_closed",
+            "full_screen",
+            "screen_matches_main",
+            "same_media_player",
+            "same_audio_output",
+            "audio_buffer_output_attached",
+            "no_second_player",
+            "open_close_source_preserved",
+            "open_close_position_not_reset",
+            "playback_state_preserved",
+            "volume_preserved",
+            "queue_preserved",
+            "base_context_preserved",
+            "ambient_fallback_verified",
+            "pulse_verified",
+            "starfield_verified",
+            "aurora_verified",
+            "overlay_controls_verified",
+            "track_transition_verified",
+            "render_timer_stopped_on_exit",
+            "analysis_worker_stopped_on_exit",
+            "status_safe",
+            "no_pcm_status_fields",
+        }
+        if any(party_behaviors.get(name) is not True for name in required_behaviors):
+            raise RuntimeError("Synthetic packaged Party Mode validation failed.")
+        if party_behaviors.get("audio_backend_outcome") not in {
+            "reactive",
+            "ambient_only",
+        }:
+            raise RuntimeError("Synthetic Party Mode audio outcome is invalid.")
+        if int(party_behaviors.get("network_attempt_count", -1)) != 0:
+            raise RuntimeError("Synthetic Party Mode attempted network access.")
 
     from PySide6.QtGui import QImage
 
@@ -637,12 +786,14 @@ def validate_output(
         # wider at desktop review sizes. Scale the density threshold so a valid
         # 1920-wide player is not rejected merely for having more empty bar space.
         player_threshold = 0.025 * min(1.0, 1440 / requested_width)
-        if brand_signal < 0.04 or player_signal < player_threshold:
+        scene = capture.get("scene")
+        if scene not in PARTY_SCENES and (
+            brand_signal < 0.04 or player_signal < player_threshold
+        ):
             raise RuntimeError(
                 f"Synthetic screenshot is missing shared application chrome: {filename}"
             )
 
-        scene = capture.get("scene")
         if scene in {
             "albums",
             "artists",
@@ -766,6 +917,17 @@ def validate_output(
                     raise RuntimeError(
                         "Synthetic artwork comparison was preapproved unexpectedly."
                     )
+        if scene in PARTY_SCENES:
+            metrics = capture.get("party_metrics")
+            if not isinstance(metrics, dict):
+                raise RuntimeError("Synthetic Party Mode capture lacks aggregate metrics.")
+            if metrics.get("audio_backend_outcome") not in {
+                "reactive",
+                "ambient_only",
+            }:
+                raise RuntimeError("Synthetic Party Mode capture lacks an audio outcome.")
+            if metrics.get("ambient_fallback_verified") is not True:
+                raise RuntimeError("Synthetic Party Mode fallback was not verified.")
 
     database = runtime / "data" / "music_vault.sqlite3"
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
@@ -778,11 +940,61 @@ def validate_output(
         raise RuntimeError("Synthetic database failed final validation.")
     if (runtime / "data" / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
+    party_wavs = sorted((runtime / "data").rglob("*.wav"))
+    if captured_scenes.intersection(PARTY_SCENES):
+        expected_party_wavs = sorted(
+            (runtime / "data" / "synthetic_party_mode").glob("*.wav")
+        )
+        if party_wavs != expected_party_wavs or len(party_wavs) != 2:
+            raise RuntimeError("Synthetic Party Mode WAV inventory is invalid.")
+    elif party_wavs:
+        raise RuntimeError("Non-Party UI review unexpectedly generated WAV files.")
+    if any((runtime / "data").rglob("*.pcm")) or any(
+        (runtime / "data").rglob("*.raw")
+    ):
+        raise RuntimeError("Synthetic Party Mode persisted decoded audio data.")
     config = json.loads(
         (runtime / "data" / "music_vault_config.json").read_text(encoding="utf-8")
     )
     if config.get("artist_image_fetch_enabled") is not False:
         raise RuntimeError("Synthetic runtime persisted artist-photo fetching as enabled.")
+    if captured_scenes.intersection(PARTY_SCENES):
+        status = json.loads(
+            (runtime / "data" / "music_vault_status.json").read_text(encoding="utf-8")
+        )
+        if status.get("party_mode_active") is not False:
+            raise RuntimeError("Party Mode remained active after packaged review shutdown.")
+        forbidden = {
+            "pcm",
+            "sample",
+            "samples",
+            "frequency",
+            "frequencies",
+            "rms",
+            "peak",
+            "bass",
+            "low_mid",
+            "mid",
+            "high",
+            "beat",
+            "beat_strength",
+        }
+
+        def field_names(value: object) -> set[str]:
+            if isinstance(value, dict):
+                result = {str(key).casefold() for key in value}
+                for item in value.values():
+                    result.update(field_names(item))
+                return result
+            if isinstance(value, list):
+                result: set[str] = set()
+                for item in value:
+                    result.update(field_names(item))
+                return result
+            return set()
+
+        if forbidden.intersection(field_names(status)):
+            raise RuntimeError("Party Mode App Status contains audio-analysis data.")
     return payload
 
 
@@ -856,9 +1068,13 @@ def main() -> int:
 
     try:
         copy_public_assets(project_root, runtime)
-        dataset = seed_synthetic_runtime(project_root, runtime)
         sizes = tuple(args.size or DEFAULT_SIZES)
         scenes = tuple(args.page or DEFAULT_SCENES)
+        dataset = seed_synthetic_runtime(
+            project_root,
+            runtime,
+            include_party=bool(set(scenes).intersection(PARTY_SCENES)),
+        )
         if not 50 <= args.settle_ms <= 5000:
             raise ValueError("--settle-ms must be between 50 and 5000.")
         environment_base = os.environ.copy()
@@ -867,7 +1083,12 @@ def main() -> int:
                 "MUSIC_VAULT_PROJECT_ROOT": str(runtime),
                 "HOME": str(runtime / "profile"),
                 "USERPROFILE": str(runtime / "profile"),
+                "LOCALAPPDATA": str(runtime / "profile" / "LocalAppData"),
+                "APPDATA": str(runtime / "profile" / "RoamingAppData"),
+                "TEMP": str(runtime / "temp"),
+                "TMP": str(runtime / "temp"),
                 "MUSIC_VAULT_ACCEPTANCE_NO_SECRETS": "1",
+                "MUSIC_VAULT_DISABLE_NETWORK": "1",
                 # The provider factory accepts this only alongside the explicit
                 # isolated review plan/root. It guarantees review cannot reach
                 # public artist metadata or image services.
@@ -998,6 +1219,14 @@ def main() -> int:
             raise RuntimeError(
                 "Synthetic artist provider was never exercised by enabled review scenes."
             )
+        if args.exe is not None and set(scenes).intersection(PARTY_SCENES):
+            party_behaviors = (
+                (manifest.get("runtime_checks") or {}).get(
+                    "party_mode_behaviors", {}
+                )
+            )
+            if party_behaviors.get("packaged_process") is not True:
+                raise RuntimeError("Party Mode smoke did not run inside the packaged EXE.")
         wrong_data = project_root / "dist" / "MusicVault" / "data"
         if wrong_data.exists():
             raise RuntimeError("dist/MusicVault/data was created during UI review.")

@@ -5,6 +5,22 @@ Notable changes to Music Vault are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- Added full-screen Party Mode with artwork-led Pulse, Starfield, and Aurora
+  presets, a readable auto-hiding control overlay, keyboard controls, reduced
+  motion, and adaptive quality.
+- Added bounded transient PCM analysis for audio-reactive energy, spectral
+  bands, and beats when supported by the active Qt backend, with a calm ambient
+  fallback when decoded buffers are unavailable.
+- Added original Party Mode icons and a synthetic, offscreen, network-disabled
+  review and frame-benchmark tool.
+
+### Changed
+
+- Advanced the current source tree to `1.1.0` on the `development` channel.
+  The latest public stable release and immutable release tag remain `v1.0.0`.
+
 ### Fixed
 
 - Added a corrective publication path for the existing immutable `v1.0.0`

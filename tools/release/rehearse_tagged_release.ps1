@@ -86,7 +86,10 @@ try {
     Push-Location $projectRoot
     try {
         $batchTests = @(Get-ChildItem -LiteralPath .\tests -Filter "test_batch8_1_*.py" | ForEach-Object FullName)
-        & $python -B -m pytest -q .\tests\test_release_pipeline.py @batchTests
+        & $python -B -m pytest -q `
+            .\tests\test_release_pipeline.py `
+            .\tests\test_batch9_release_version_compat.py `
+            @batchTests
         if ($LASTEXITCODE -ne 0) { throw "Corrected release-tool tests failed." }
         & $python -B .\tools\security\pre_public_history_check.py --repo $projectRoot
         if ($LASTEXITCODE -ne 0) { throw "Complete publication-history scan failed." }
@@ -116,6 +119,7 @@ try {
             --application-root $applicationRoot `
             --dist-dir (Join-Path $applicationRoot "dist\MusicVault") `
             --output-dir $output `
+            --release-version "1.0.0" `
             --source-tag $ReleaseTag `
             --source-commit $sourceCommit `
             --release-tooling-commit $toolingCommit `
@@ -125,9 +129,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Corrected tagged release build failed." }
 
         $portable = Join-Path $output "MusicVault-v1.0.0-Windows-x64-Portable.zip"
-        & $python -B .\tools\release\verify_portable_release.py $portable
+        & $python -B .\tools\release\verify_portable_release.py $portable `
+            --release-version "1.0.0"
         if ($LASTEXITCODE -ne 0) { throw "Corrected release verification failed." }
         & $python -B .\tools\release\validate_release_payload.py write $output `
+            --expected-release-version "1.0.0" `
             --expected-source-tag $ReleaseTag `
             --expected-source-commit $sourceCommit `
             --expected-tooling-commit $toolingCommit
@@ -145,12 +151,14 @@ try {
             Copy-Item -LiteralPath (Join-Path $output $name) -Destination $transferRoot
         }
         & $python -B .\tools\release\validate_release_payload.py verify $transferRoot `
+            --expected-release-version "1.0.0" `
             --expected-source-tag $ReleaseTag `
             --expected-source-commit $sourceCommit `
             --expected-tooling-commit $toolingCommit
         if ($LASTEXITCODE -ne 0) { throw "Transferred release payload verification failed." }
         & $python -B .\tools\release\verify_portable_release.py `
-            (Join-Path $transferRoot "MusicVault-v1.0.0-Windows-x64-Portable.zip")
+            (Join-Path $transferRoot "MusicVault-v1.0.0-Windows-x64-Portable.zip") `
+            --release-version "1.0.0"
         if ($LASTEXITCODE -ne 0) { throw "Transferred portable verification failed." }
 
         $smokeExtract = Join-Path $tempRoot "smoke-extract"

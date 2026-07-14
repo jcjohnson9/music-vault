@@ -97,13 +97,13 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
         verifier,
         "_pe_version",
         lambda path: (
-            "1.0.0.0",
-            "1.0.0.0",
+            f"{APP_VERSION}.0",
+            f"{APP_VERSION}.0",
             {
                 "ProductName": "Music Vault",
                 "FileDescription": "Music Vault",
                 "OriginalFilename": "MusicVault.exe",
-                "FileVersion": "1.0.0.0",
+                "FileVersion": f"{APP_VERSION}.0",
             },
         ),
     )
@@ -123,8 +123,8 @@ def synthetic_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[s
 
 
 def test_central_release_version_and_lock_are_exact() -> None:
-    assert APP_VERSION == "1.0.0"
-    assert RELEASE_CHANNEL == "stable"
+    assert APP_VERSION == "1.1.0"
+    assert RELEASE_CHANNEL == "development"
     requirements = release_common.exact_requirements()
     assert {
         "PySide6": "6.11.1",

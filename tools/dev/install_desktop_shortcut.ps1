@@ -37,7 +37,7 @@ if ($existing) {
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $exe
 $shortcut.WorkingDirectory = $projectRoot
-$shortcut.Description = "Music Vault v1.0.0"
+$shortcut.Description = "Music Vault v1.1.0 Development"
 
 if (Test-Path -LiteralPath $icon -PathType Leaf) {
     $shortcut.IconLocation = "$icon,0"

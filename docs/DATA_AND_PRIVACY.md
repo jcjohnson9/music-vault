@@ -32,8 +32,11 @@ Vault uses SQLite's backup API to create a timestamped copy under
 
 The generic `data/music_vault_status.json` App Status file contains operational
 counts, paths, playback state, and the latest sanitized synchronization result.
-It does not contain the YouTube API key. Music Vault has no Watchtower
-relationship or integration.
+Its additive Party Mode fields report only whether Party Mode is active, the
+selected preset, and whether decoded-buffer reactivity is currently available.
+App Status never contains PCM, audio samples, spectra, or other decoded-audio
+content, and it does not contain the YouTube API key. Music Vault has no
+Watchtower relationship or integration.
 
 Synchronization supports public and unlisted playlists and performs anonymous
 media extraction. It does not silently read Firefox, Chrome, Edge, or other

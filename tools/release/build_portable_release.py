@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.metadata
 import json
 import os
@@ -19,9 +20,6 @@ from pathlib import Path
 try:
     from .release_common import (
         APP_VERSION,
-        COMPLIANCE_FILENAME,
-        PACKAGE_DIRECTORY,
-        PACKAGE_FILENAME,
         PORTABLE_MARKER,
         PORTABLE_MARKER_VERSION,
         PRODUCT_NAME,
@@ -31,6 +29,7 @@ try:
         ReleaseError,
         canonical_file_records,
         canonical_payload_hash,
+        compliance_filename_for,
         deterministic_zip,
         exact_requirements,
         git_value,
@@ -38,19 +37,19 @@ try:
         is_reparse_or_link,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
+        package_directory_for,
+        package_filename_for,
         safe_files,
         scan_sensitive_bytes,
         sha256_file,
         validate_zip_name,
+        validate_release_version,
         violation_for_path,
         write_json,
     )
 except ImportError:  # Direct script execution.
     from release_common import (
         APP_VERSION,
-        COMPLIANCE_FILENAME,
-        PACKAGE_DIRECTORY,
-        PACKAGE_FILENAME,
         PORTABLE_MARKER,
         PORTABLE_MARKER_VERSION,
         PRODUCT_NAME,
@@ -60,6 +59,7 @@ except ImportError:  # Direct script execution.
         ReleaseError,
         canonical_file_records,
         canonical_payload_hash,
+        compliance_filename_for,
         deterministic_zip,
         exact_requirements,
         git_value,
@@ -67,10 +67,13 @@ except ImportError:  # Direct script execution.
         is_reparse_or_link,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
+        package_directory_for,
+        package_filename_for,
         safe_files,
         scan_sensitive_bytes,
         sha256_file,
         validate_zip_name,
+        validate_release_version,
         violation_for_path,
         write_json,
     )
@@ -92,6 +95,34 @@ def _inside(candidate: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _application_release_identity(application_root: Path) -> tuple[str, str]:
+    """Read immutable product identity without importing the application checkout."""
+    version_file = application_root / "music_vault" / "version.py"
+    try:
+        tree = ast.parse(version_file.read_text(encoding="utf-8"), filename=str(version_file))
+    except (OSError, SyntaxError) as exc:
+        raise ReleaseError("The tagged application version metadata is unavailable.") from exc
+    values: dict[str, str] = {}
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        value = statement.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in {"APP_VERSION", "RELEASE_CHANNEL"}:
+                values[target.id] = value.value
+    try:
+        version = validate_release_version(values["APP_VERSION"])
+        channel = values["RELEASE_CHANNEL"].strip()
+    except KeyError as exc:
+        raise ReleaseError("The tagged application release identity is incomplete.") from exc
+    if channel not in {"stable", "development"}:
+        raise ReleaseError("The tagged application release channel is invalid.")
+    return version, channel
 
 
 def _git(repository_root: Path, *args: str) -> str:
@@ -284,8 +315,10 @@ def _resolve_tagged_source(
     source_commit: str | None,
     *,
     require_clean: bool,
+    release_version: str = APP_VERSION,
 ) -> tuple[str, str, str]:
-    if source_tag != f"v{APP_VERSION}" or source_tag != Path(source_tag).name:
+    version = validate_release_version(release_version)
+    if source_tag != f"v{version}" or source_tag != Path(source_tag).name:
         raise ReleaseError("The public source tag is invalid.")
     tag_ref = f"refs/tags/{source_tag}"
     if _git(application_root, "cat-file", "-t", tag_ref) != "tag":
@@ -317,6 +350,8 @@ def build_manifest(
     release_license_inventory_sha256: str,
     build_timestamp: str,
     build_environment: dict[str, object],
+    release_version: str = APP_VERSION,
+    release_channel: str = RELEASE_CHANNEL,
 ) -> dict[str, object]:
     records = canonical_file_records(
         portable_root,
@@ -326,8 +361,8 @@ def build_manifest(
     return {
         "manifest_schema_version": 2,
         "product_name": PRODUCT_NAME,
-        "version": APP_VERSION,
-        "release_channel": RELEASE_CHANNEL,
+        "version": validate_release_version(release_version),
+        "release_channel": release_channel,
         "platform": "Windows",
         "architecture": "x64",
         "python_version": build_environment["python"],
@@ -439,9 +474,10 @@ def _write_source_availability(
     release_license_inventory_git_blob: str,
     release_license_inventory_sha256: str,
     archives: list[dict[str, object]],
+    release_version: str = APP_VERSION,
 ) -> None:
     lines = [
-        f"# Music Vault v{APP_VERSION} source compliance",
+        f"# Music Vault v{validate_release_version(release_version)} source compliance",
         "",
         f"Music Vault source tag: `{source_tag}`",
         f"Music Vault tag object: `{source_tag_object}`",
@@ -496,7 +532,9 @@ def build_source_compliance(
     release_license_inventory_git_blob: str,
     release_license_inventory_sha256: str,
     source_cache: Path | None = None,
+    release_version: str = APP_VERSION,
 ) -> tuple[Path, Path]:
+    release_version = validate_release_version(release_version)
     staging = staging_owner / "source-compliance"
     if staging.exists():
         raise ReleaseError("Unique source-compliance staging unexpectedly exists.")
@@ -549,12 +587,13 @@ def build_source_compliance(
         release_license_inventory_git_blob,
         inventory_sha256,
         archive_rows,
+        release_version,
     )
     records = canonical_file_records(staging, excluded={"source-compliance-manifest.json"})
     write_json(staging / "source-compliance-manifest.json", {
         "manifest_schema_version": 2,
         "product": PRODUCT_NAME,
-        "version": APP_VERSION,
+        "version": release_version,
         "source_tag": source_tag,
         "source_tag_object": source_tag_object,
         "source_commit": source_commit,
@@ -568,9 +607,14 @@ def build_source_compliance(
         "corresponding_source_archives": archive_rows,
         "files": records,
     })
-    destination = output_dir / COMPLIANCE_FILENAME
-    deterministic_zip(staging, destination, prefix=f"MusicVault-v{APP_VERSION}-Source-Compliance")
-    checksum = output_dir / f"{COMPLIANCE_FILENAME}.sha256"
+    compliance_filename = compliance_filename_for(release_version)
+    destination = output_dir / compliance_filename
+    deterministic_zip(
+        staging,
+        destination,
+        prefix=f"MusicVault-v{release_version}-Source-Compliance",
+    )
+    checksum = output_dir / f"{compliance_filename}.sha256"
     checksum.write_text(f"{sha256_file(destination)}  {destination.name}\n", encoding="ascii")
     return destination, checksum
 
@@ -586,6 +630,7 @@ def build_release(
     license_inventory: Path | None = None,
     require_clean_source: bool = True,
     source_cache: Path | None = None,
+    release_version: str | None = None,
 ) -> dict[str, object]:
     if platform.machine().casefold() not in {"amd64", "x86_64"}:
         raise ReleaseError("The Windows x64 portable release requires a 64-bit x86 build host.")
@@ -598,14 +643,19 @@ def build_release(
     requirements_path = application_root / "requirements-release.txt"
     if not requirements_path.is_file():
         raise ReleaseError("The tagged application release lock is missing.")
+    application_version, application_channel = _application_release_identity(application_root)
+    if release_version is not None and validate_release_version(release_version) != application_version:
+        raise ReleaseError("The requested release version does not match the tagged application.")
+    release_version = application_version
     output_dir = validate_output(output_dir, dist_dir, application_root)
     output_dir.mkdir(parents=True, exist_ok=True)
-    resolved_tag = source_tag or f"v{APP_VERSION}"
+    resolved_tag = source_tag or f"v{release_version}"
     tag_object, commit, tree_hash = _resolve_tagged_source(
         application_root,
         resolved_tag,
         source_commit,
         require_clean=require_clean_source,
+        release_version=release_version,
     )
     tooling_commit, tooling_tree_hash = _resolve_source(
         release_tooling_commit or _git(PROJECT_ROOT, "rev-parse", "HEAD"),
@@ -618,7 +668,9 @@ def build_release(
     build_environment = _verified_build_environment(requirements_path)
     staging_owner = Path(tempfile.mkdtemp(prefix=".staging-", dir=output_dir))
     try:
-        portable_root = staging_owner / PACKAGE_DIRECTORY
+        package_directory = package_directory_for(release_version)
+        package_filename = package_filename_for(release_version)
+        portable_root = staging_owner / package_directory
         portable_root.mkdir()
 
         copy_distribution(
@@ -631,7 +683,7 @@ def build_release(
         write_json(portable_root / PORTABLE_MARKER, {
             "schema_version": PORTABLE_MARKER_VERSION,
             "product": PRODUCT_NAME,
-            "version": APP_VERSION,
+            "version": release_version,
             "portable": True,
             "data_directory": "data",
         })
@@ -648,6 +700,8 @@ def build_release(
             release_license_inventory_sha256=inventory_sha256,
             build_timestamp=timestamp,
             build_environment=build_environment,
+            release_version=release_version,
+            release_channel=application_channel,
         )
         write_json(portable_root / "release-manifest.json", internal_manifest)
         write_package_checksums(portable_root)
@@ -660,10 +714,10 @@ def build_release(
             for issue in scan_sensitive_bytes(path):
                 raise ReleaseError(f"Portable package failed the {issue} scan: {relative}")
 
-        package_path = output_dir / PACKAGE_FILENAME
-        deterministic_zip(portable_root, package_path, prefix=PACKAGE_DIRECTORY)
+        package_path = output_dir / package_filename
+        deterministic_zip(portable_root, package_path, prefix=package_directory)
         actual_package_hash = sha256_file(package_path)
-        package_checksum = output_dir / f"{PACKAGE_FILENAME}.sha256"
+        package_checksum = output_dir / f"{package_filename}.sha256"
         package_checksum.write_text(
             f"{actual_package_hash}  {package_path.name}\n", encoding="ascii"
         )
@@ -687,6 +741,7 @@ def build_release(
             release_license_inventory_git_blob=inventory_blob_id,
             release_license_inventory_sha256=inventory_sha256,
             source_cache=source_cache,
+            release_version=release_version,
         )
         return {
             "portable_zip": str(package_path),
@@ -709,7 +764,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "release_artifacts")
     parser.add_argument("--dist-dir", type=Path, default=PROJECT_ROOT / "dist" / "MusicVault")
     parser.add_argument("--application-root", type=Path, default=PROJECT_ROOT)
-    parser.add_argument("--source-tag", default=f"v{APP_VERSION}")
+    parser.add_argument("--source-tag")
+    parser.add_argument("--release-version")
     parser.add_argument("--source-commit")
     parser.add_argument("--release-tooling-commit")
     parser.add_argument(
@@ -737,6 +793,7 @@ def main() -> int:
             license_inventory=args.license_inventory,
             require_clean_source=args.require_clean_source,
             source_cache=args.source_cache,
+            release_version=args.release_version,
         )
     except (OSError, ReleaseError, ValueError, json.JSONDecodeError) as exc:
         print(f"Release build failed: {exc}", file=sys.stderr)

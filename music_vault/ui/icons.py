@@ -45,6 +45,10 @@ REQUIRED_ICONS: Final[tuple[str, ...]] = (
     "folder",
     "warning",
     "error",
+    "party-mode",
+    "exit-fullscreen",
+    "visual-preset",
+    "overlay-help",
 )
 
 OPTIONAL_ICONS: Final[tuple[str, ...]] = (

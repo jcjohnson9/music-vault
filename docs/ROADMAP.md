@@ -9,7 +9,10 @@ future branch rather than a V1 requirement.
 The roadmap uses implementation batches. A batch is complete only when its own
 acceptance checks pass; a label does not imply that later batches have begun.
 
-**Current public product status:** Music Vault v1.0.0 Stable.
+**Latest public product status:** Music Vault v1.0.0 Stable.
+
+**Current main development target:** Music Vault v1.1.0 Development. No public
+v1.1.0 release has been created.
 
 ## Batch 1 — GitHub and Source-Control Safety Baseline
 
@@ -144,15 +147,19 @@ and complete-history publication scanning.
 
 ## Batch 9 — Full-Screen Party Mode
 
-**Objective:** Add an optional, readable full-screen playback experience.
+**Objective:** Add an optional, premium full-screen audio-reactive playback
+experience without creating a second playback pipeline.
 
-**Scope:** Large now-playing artwork and metadata, simple transport visibility,
-keyboard escape behavior, and display-aware presentation.
+**Scope:** Artwork-led Pulse, Starfield, and Aurora visuals; transient bounded
+decoded-audio analysis with an ambient fallback; readable now-playing and
+transport controls; keyboard operation; multi-monitor presentation; reduced
+motion; adaptive quality; and synthetic visual/performance review tooling.
 
 **Non-goals:** No radio scheduling, mobile mirroring, or change to queue
 semantics.
 
-**Status:** Next.
+**Status:** Complete on the v1.1.0 development line. The public stable release
+remains v1.0.0.
 
 ## Batch 10 — Multiple Source Playlists
 
@@ -165,7 +172,7 @@ state and errors, cross-source video identity, and deterministic local mapping.
 **Non-goals:** No private-playlist OAuth requirement and no conversion of Music
 Vault into a hosted service.
 
-**Status:** Planned post-V1.
+**Status:** Next.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original
 
