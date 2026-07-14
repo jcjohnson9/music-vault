@@ -30,6 +30,45 @@ PYSIDE_SIZE = 17_963_432
 PYSIDE_TEST_LICENSE = (
     b"GNU LESSER GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n"
 )
+QT_SUBMODULE_ORIGIN = (
+    "https://download.qt.io/official_releases/qt/6.11/6.11.1/submodules/"
+)
+QT_SUBMODULE_MIRROR = (
+    "https://qt.mirror.constant.com/archive/qt/6.11/6.11.1/submodules/"
+)
+QT_TEST_LICENSES = {
+    "GPL-2.0-only.txt": b"GNU GENERAL PUBLIC LICENSE\nVersion 2, June 1991\n",
+    "GPL-3.0-only.txt": b"GNU GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n",
+    "LGPL-3.0-only.txt": (
+        b"GNU LESSER GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n"
+    ),
+}
+QT_SUBMODULE_CASES = (
+    {
+        "filename": "qtbase-everywhere-src-6.11.1.tar.xz",
+        "project": "QtBase",
+        "sha256": "d9594a31228aa23ad6b531719a29b45f0f3989fe6c136d45767ea179f233c1ac",
+        "size_bytes": 50_648_500,
+    },
+    {
+        "filename": "qtmultimedia-everywhere-src-6.11.1.tar.xz",
+        "project": "QtMultimedia",
+        "sha256": "390f8e52ddee3aca5c4de7eead900c84c4fa61ff6d1f0ebea9c7543365c09b0a",
+        "size_bytes": 10_243_896,
+    },
+    {
+        "filename": "qtsvg-everywhere-src-6.11.1.tar.xz",
+        "project": "QtSvg",
+        "sha256": "7f3cf02f4824bf03c2c5859ea6db173bf1482a1daf24e6cdf7bc78cfa26a8a94",
+        "size_bytes": 2_336_944,
+    },
+    {
+        "filename": "qtimageformats-everywhere-src-6.11.1.tar.xz",
+        "project": "QtImageFormats",
+        "sha256": "b2bf6c6845ac175ed7f819145483ba4676f617aaa6a5012c8efee63c8bbac413",
+        "size_bytes": 2_032_792,
+    },
+)
 REAL_DNS_VALIDATOR = sources._validate_public_dns
 
 
@@ -209,6 +248,110 @@ def write_pyside_inventory(path: Path, body: bytes, **overrides) -> Path:
                     "Version 3, 29 June 2007",
                 ],
             }
+        ],
+    }
+    row.update(overrides)
+    path.write_text(
+        json.dumps({"corresponding_source_archives": [row]}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def qt_submodule_archive_bytes(
+    case: dict[str, object],
+    *,
+    version: str = "6.11.1",
+    omit_license: str | None = None,
+    unsafe_member: str | None = None,
+) -> bytes:
+    filename = str(case["filename"])
+    root = filename.removesuffix(".tar.xz")
+    project = str(case["project"])
+    files = {
+        f"{root}/.cmake.conf": f'set(QT_REPO_MODULE_VERSION "{version}")\n'.encode(),
+        f"{root}/CMakeLists.txt": (
+            f"project({project}\n"
+            '    VERSION "${QT_REPO_MODULE_VERSION}"\n'
+            ")\n"
+        ).encode(),
+        **{
+            f"{root}/LICENSES/{name}": content
+            for name, content in QT_TEST_LICENSES.items()
+            if name != omit_license
+        },
+    }
+    if unsafe_member:
+        files[unsafe_member] = b"unsafe\n"
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:xz") as archive:
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return stream.getvalue()
+
+
+def write_qt_submodule_inventory(
+    path: Path,
+    case: dict[str, object],
+    body: bytes,
+    **overrides,
+) -> Path:
+    filename = str(case["filename"])
+    root = filename.removesuffix(".tar.xz")
+    project = str(case["project"])
+    license_paths = {
+        name: f"{root}/LICENSES/{name}" for name in QT_TEST_LICENSES
+    }
+    row = {
+        "component": f"Synthetic {project} source",
+        "filename": filename,
+        "url": QT_SUBMODULE_ORIGIN + filename,
+        "fallback_urls": [QT_SUBMODULE_MIRROR + filename],
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "size_bytes": len(body),
+        "maximum_size_bytes": sources.MAX_SOURCE_ARCHIVE_BYTES,
+        "archive_format": "tar.xz",
+        "allowed_hosts": ["download.qt.io", "qt.mirror.constant.com"],
+        "content_types": ["application/x-xz", "application/octet-stream"],
+        "timeout_seconds": 7,
+        "max_redirects": 3,
+        "primary_attempts": 1,
+        "fallback_attempts": 1,
+        "top_level": root,
+        "required_paths": [
+            f"{root}/.cmake.conf",
+            f"{root}/CMakeLists.txt",
+            *license_paths.values(),
+        ],
+        "version_checks": [
+            {
+                "path": f"{root}/.cmake.conf",
+                "contains": ['set(QT_REPO_MODULE_VERSION "6.11.1")'],
+            },
+            {
+                "path": f"{root}/CMakeLists.txt",
+                "contains": [
+                    f"project({project}",
+                    'VERSION "${QT_REPO_MODULE_VERSION}"',
+                ],
+            },
+        ],
+        "license_checks": [
+            {
+                "path": license_paths[name],
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "contains": [
+                    "GNU LESSER GENERAL PUBLIC LICENSE"
+                    if name.startswith("LGPL")
+                    else "GNU GENERAL PUBLIC LICENSE",
+                    "Version 2, June 1991"
+                    if name.startswith("GPL-2")
+                    else "Version 3, 29 June 2007",
+                ],
+            }
+            for name, content in QT_TEST_LICENSES.items()
         ],
     }
     row.update(overrides)
@@ -1300,3 +1443,334 @@ def test_51_pyside_http_mirror_fallback_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ReleaseError, match="source fallback URL"):
         sources._source_rows(inventory)
+
+
+def test_52_exactly_four_remaining_qt_submodule_records_are_handled() -> None:
+    inventory = json.loads(
+        (PROJECT_ROOT / "tools/release/third_party_licenses.json").read_text(encoding="utf-8")
+    )
+    rows = [
+        row
+        for row in inventory["corresponding_source_archives"]
+        if str(row.get("url", "")).startswith(QT_SUBMODULE_ORIGIN)
+    ]
+    assert {row["filename"] for row in rows} == {
+        str(case["filename"]) for case in QT_SUBMODULE_CASES
+    }
+    assert len(rows) == len(QT_SUBMODULE_CASES) == 4
+    assert all(row.get("fallback_urls") for row in rows)
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+def test_53_qt_submodule_record_preserves_identity_and_scoped_policy(
+    case: dict[str, object],
+) -> None:
+    inventory = json.loads(
+        (PROJECT_ROOT / "tools/release/third_party_licenses.json").read_text(encoding="utf-8")
+    )
+    filename = str(case["filename"])
+    root = filename.removesuffix(".tar.xz")
+    row = next(
+        item
+        for item in inventory["corresponding_source_archives"]
+        if item["filename"] == filename
+    )
+    assert row["url"] == QT_SUBMODULE_ORIGIN + filename
+    assert row["fallback_urls"] == [QT_SUBMODULE_MIRROR + filename]
+    assert row["sha256"] == case["sha256"]
+    assert row["size_bytes"] == case["size_bytes"]
+    assert row["maximum_size_bytes"] == sources.MAX_SOURCE_ARCHIVE_BYTES
+    assert row["archive_format"] == "tar.xz"
+    assert set(row["content_types"]) == {
+        "application/x-xz",
+        "application/x-tar",
+        "application/octet-stream",
+    }
+    assert row["allowed_hosts"] == ["download.qt.io", "qt.mirror.constant.com"]
+    assert all("*" not in host for host in row["allowed_hosts"])
+    assert not any(
+        "qt.mirror.constant.com" in hosts
+        for hosts in sources.KNOWN_HTTPS_REDIRECT_HOSTS.values()
+    )
+    assert row["timeout_seconds"] == 60
+    assert row["max_redirects"] == 5
+    assert row["primary_attempts"] == row["fallback_attempts"] == 1
+    assert row["top_level"] == root
+    assert f"{root}/CMakeLists.txt" in row["required_paths"]
+    assert f"{root}/.cmake.conf" in row["required_paths"]
+    assert len(row["version_checks"]) == 2
+    assert len(row["license_checks"]) == 3
+    assert row["source_provenance"]["primary"] == {
+        "kind": "official Qt download origin",
+        "host": "download.qt.io",
+    }
+    assert row["source_provenance"]["fallback"] == {
+        "kind": "official Qt mirror",
+        "host": "qt.mirror.constant.com",
+        "operator": "Constant Hosting",
+        "official_mirror_directory": "https://download.qt.io/static/mirrorlist/",
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+def test_54_each_qt_submodule_exact_redirect_is_accepted_and_recorded(
+    case: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filename = str(case["filename"])
+    primary = QT_SUBMODULE_ORIGIN + filename
+    mirror = QT_SUBMODULE_MIRROR + filename
+    body = qt_submodule_archive_bytes(case)
+    inventory = write_qt_submodule_inventory(tmp_path / "qt.json", case, body)
+    handler = sources._SafeRedirectHandler(
+        {"download.qt.io", "qt.mirror.constant.com"}, 3
+    )
+    redirected = handler.redirect_request(
+        sources.urllib.request.Request(primary),
+        None,
+        302,
+        "Found",
+        {},
+        mirror,
+    )
+    assert redirected.full_url == mirror
+    monkeypatch.setattr(
+        sources,
+        "_open_response",
+        lambda *_args, **_kwargs: FakeResponse(
+            body,
+            url=mirror,
+            content_type="application/x-xz",
+        ),
+    )
+    rows = sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+    assert rows[0]["provenance"] == {
+        "kind": "network",
+        "source_role": "primary",
+        "source_url": primary,
+        "redirect_url": mirror,
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+def test_55_each_qt_submodule_direct_fallback_is_verified(
+    case: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    filename = str(case["filename"])
+    primary = QT_SUBMODULE_ORIGIN + filename
+    mirror = QT_SUBMODULE_MIRROR + filename
+    body = qt_submodule_archive_bytes(case)
+    inventory = write_qt_submodule_inventory(tmp_path / "qt.json", case, body)
+    calls: list[str] = []
+
+    def fake_open(request, **_kwargs):
+        calls.append(request.full_url)
+        if request.full_url == primary:
+            raise ReleaseError("synthetic rejected primary redirect")
+        return FakeResponse(body, url=mirror, content_type="application/x-xz")
+
+    monkeypatch.setattr(sources, "_open_response", fake_open)
+    rows = sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+    assert calls == [primary, mirror]
+    assert rows[0]["provenance"] == {
+        "kind": "network",
+        "source_role": "fallback",
+        "source_url": mirror,
+    }
+    assert rows[0]["validation"]["cryptographic"]["status"] == "verified"
+    assert rows[0]["validation"]["size"]["status"] == "verified"
+    assert rows[0]["validation"]["archive"]["format"] == "tar.xz"
+    assert rows[0]["validation"]["semantics"] == {
+        "version": "verified",
+        "license": "verified",
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+@pytest.mark.parametrize(
+    "bad_host",
+    ["ftp.fau.de", "mirror.constant.com"],
+    ids=["undeclared-qt-mirror", "constant-sibling"],
+)
+def test_56_qt_submodule_redirects_reject_every_undeclared_host(
+    case: dict[str, object],
+    bad_host: str,
+) -> None:
+    filename = str(case["filename"])
+    handler = sources._SafeRedirectHandler(
+        {"download.qt.io", "qt.mirror.constant.com"}, 3
+    )
+    with pytest.raises(ReleaseError, match="unapproved host"):
+        handler.redirect_request(
+            sources.urllib.request.Request(QT_SUBMODULE_ORIGIN + filename),
+            None,
+            302,
+            "Found",
+            {},
+            f"https://{bad_host}/archive/qt/6.11/6.11.1/submodules/{filename}",
+        )
+
+
+@pytest.mark.parametrize(
+    "case_index",
+    range(len(QT_SUBMODULE_CASES)),
+    ids=[str(case["project"]) for case in QT_SUBMODULE_CASES],
+)
+def test_57_wrong_qt_component_path_cannot_bypass_the_pinned_hash(
+    case_index: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = QT_SUBMODULE_CASES[case_index]
+    wrong_case = QT_SUBMODULE_CASES[(case_index + 1) % len(QT_SUBMODULE_CASES)]
+    body = qt_submodule_archive_bytes(case)
+    received = bytearray(body)
+    received[-1] ^= 1
+    inventory = write_qt_submodule_inventory(
+        tmp_path / "qt.json",
+        case,
+        body,
+        fallback_urls=[],
+    )
+    wrong_url = QT_SUBMODULE_MIRROR + str(wrong_case["filename"])
+    monkeypatch.setattr(
+        sources,
+        "_open_response",
+        lambda *_args, **_kwargs: FakeResponse(
+            bytes(received),
+            url=wrong_url,
+            content_type="application/x-xz",
+        ),
+    )
+    with pytest.raises(ReleaseError) as raised:
+        sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+    message = str(raised.value)
+    assert "SHA-256 mismatch" in message
+    assert str(wrong_case["filename"]) in message
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+@pytest.mark.parametrize(
+    ("failure", "error"),
+    [
+        ("hash", "SHA-256 mismatch"),
+        ("size", "Content-Length"),
+        ("html", "Content-Type"),
+        ("archive", "magic"),
+        ("traversal", "archive member path"),
+        ("version", "version marker mismatch"),
+        ("license", "required path"),
+    ],
+)
+def test_58_qt_submodule_mirror_delivery_remains_fail_closed(
+    case: dict[str, object],
+    failure: str,
+    error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = qt_submodule_archive_bytes(case)
+    if failure == "archive":
+        body = b"not a tar.xz archive"
+    elif failure == "traversal":
+        body = qt_submodule_archive_bytes(case, unsafe_member="../escape.txt")
+    elif failure == "version":
+        body = qt_submodule_archive_bytes(case, version="6.11.2")
+    elif failure == "license":
+        body = qt_submodule_archive_bytes(case, omit_license="LGPL-3.0-only.txt")
+    overrides: dict[str, object] = {}
+    if failure == "hash":
+        overrides["sha256"] = "0" * 64
+    elif failure == "size":
+        overrides["size_bytes"] = len(body) + 1
+    inventory = write_qt_submodule_inventory(
+        tmp_path / "qt.json",
+        case,
+        body,
+        **overrides,
+    )
+    primary = QT_SUBMODULE_ORIGIN + str(case["filename"])
+
+    def fake_open(request, **_kwargs):
+        if request.full_url == primary:
+            raise TimeoutError("synthetic primary failure")
+        content_type = "text/html" if failure == "html" else "application/x-xz"
+        return FakeResponse(body, url=request.full_url, content_type=content_type)
+
+    monkeypatch.setattr(sources, "_open_response", fake_open)
+    with pytest.raises(ReleaseError, match=error):
+        sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+def test_59_qt_submodule_http_fallback_is_rejected(
+    case: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    body = qt_submodule_archive_bytes(case)
+    filename = str(case["filename"])
+    inventory = write_qt_submodule_inventory(
+        tmp_path / "qt.json",
+        case,
+        body,
+        fallback_urls=[(QT_SUBMODULE_MIRROR + filename).replace("https://", "http://")],
+    )
+    with pytest.raises(ReleaseError, match="source fallback URL"):
+        sources._source_rows(inventory)
+
+
+@pytest.mark.parametrize(
+    "case",
+    QT_SUBMODULE_CASES,
+    ids=lambda case: str(case["project"]),
+)
+def test_60_qt_submodule_private_dns_is_rejected_without_network(
+    case: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = qt_submodule_archive_bytes(case)
+    inventory = write_qt_submodule_inventory(tmp_path / "qt.json", case, body)
+    monkeypatch.setattr(sources, "_validate_public_dns", REAL_DNS_VALIDATOR)
+    monkeypatch.setattr(
+        sources.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (
+                sources.socket.AF_INET,
+                sources.socket.SOCK_STREAM,
+                6,
+                "",
+                ("127.0.0.1", 443),
+            )
+        ],
+    )
+    with pytest.raises(ReleaseError, match="non-public"):
+        sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
