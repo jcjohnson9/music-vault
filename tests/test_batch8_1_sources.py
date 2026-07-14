@@ -15,6 +15,21 @@ from tools.release.release_common import PROJECT_ROOT, ReleaseError
 
 
 ZLIB_HASH = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+PYSIDE_FILENAME = "pyside-setup-everywhere-src-6.11.1.tar.xz"
+PYSIDE_ROOT = "pyside-setup-everywhere-src-6.11.1"
+PYSIDE_PRIMARY = (
+    "https://download.qt.io/official_releases/QtForPython/pyside6/"
+    "PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz"
+)
+PYSIDE_MIRROR = (
+    "https://qt.mirror.constant.com/official_releases/QtForPython/pyside6/"
+    "PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz"
+)
+PYSIDE_HASH = "6ffd9835bb0dd2c56f061d62f1616bb1707cfc0202b80e3165d6be087f3965e2"
+PYSIDE_SIZE = 17_963_432
+PYSIDE_TEST_LICENSE = (
+    b"GNU LESSER GENERAL PUBLIC LICENSE\nVersion 3, 29 June 2007\n"
+)
 REAL_DNS_VALIDATOR = sources._validate_public_dns
 
 
@@ -106,6 +121,102 @@ def archive_bytes(
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
     return stream.getvalue()
+
+
+def pyside_archive_bytes(
+    *,
+    pyside_version: tuple[str, str, str] = ("6", "11", "1"),
+    shiboken_version: tuple[str, str, str] = ("6", "11", "1"),
+    license_text: bytes = PYSIDE_TEST_LICENSE,
+) -> bytes:
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:xz") as archive:
+        files = {
+            f"{PYSIDE_ROOT}/setup.py": b"# synthetic setup\n",
+            f"{PYSIDE_ROOT}/sources/pyside6/CMakeLists.txt": b"# synthetic PySide\n",
+            f"{PYSIDE_ROOT}/sources/pyside6/.cmake.conf": (
+                f'set(pyside_MAJOR_VERSION "{pyside_version[0]}")\n'
+                f'set(pyside_MINOR_VERSION "{pyside_version[1]}")\n'
+                f'set(pyside_MICRO_VERSION "{pyside_version[2]}")\n'
+            ).encode(),
+            f"{PYSIDE_ROOT}/sources/shiboken6/CMakeLists.txt": b"# synthetic Shiboken\n",
+            f"{PYSIDE_ROOT}/sources/shiboken6/.cmake.conf": (
+                f'set(shiboken_MAJOR_VERSION "{shiboken_version[0]}")\n'
+                f'set(shiboken_MINOR_VERSION "{shiboken_version[1]}")\n'
+                f'set(shiboken_MICRO_VERSION "{shiboken_version[2]}")\n'
+            ).encode(),
+            f"{PYSIDE_ROOT}/LICENSES/LGPL-3.0-only.txt": license_text,
+        }
+        for name, content in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return stream.getvalue()
+
+
+def write_pyside_inventory(path: Path, body: bytes, **overrides) -> Path:
+    pyside_version = f"{PYSIDE_ROOT}/sources/pyside6/.cmake.conf"
+    shiboken_version = f"{PYSIDE_ROOT}/sources/shiboken6/.cmake.conf"
+    license_path = f"{PYSIDE_ROOT}/LICENSES/LGPL-3.0-only.txt"
+    row = {
+        "component": "Synthetic PySide6 source",
+        "filename": PYSIDE_FILENAME,
+        "url": PYSIDE_PRIMARY,
+        "fallback_urls": [PYSIDE_MIRROR],
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "size_bytes": len(body),
+        "maximum_size_bytes": sources.MAX_SOURCE_ARCHIVE_BYTES,
+        "archive_format": "tar.xz",
+        "allowed_hosts": ["download.qt.io", "qt.mirror.constant.com"],
+        "content_types": ["application/x-xz", "application/octet-stream"],
+        "timeout_seconds": 7,
+        "max_redirects": 3,
+        "primary_attempts": 1,
+        "fallback_attempts": 1,
+        "top_level": PYSIDE_ROOT,
+        "required_paths": [
+            f"{PYSIDE_ROOT}/setup.py",
+            f"{PYSIDE_ROOT}/sources/pyside6/CMakeLists.txt",
+            pyside_version,
+            f"{PYSIDE_ROOT}/sources/shiboken6/CMakeLists.txt",
+            shiboken_version,
+            license_path,
+        ],
+        "version_checks": [
+            {
+                "path": pyside_version,
+                "contains": [
+                    'set(pyside_MAJOR_VERSION "6")',
+                    'set(pyside_MINOR_VERSION "11")',
+                    'set(pyside_MICRO_VERSION "1")',
+                ],
+            },
+            {
+                "path": shiboken_version,
+                "contains": [
+                    'set(shiboken_MAJOR_VERSION "6")',
+                    'set(shiboken_MINOR_VERSION "11")',
+                    'set(shiboken_MICRO_VERSION "1")',
+                ],
+            },
+        ],
+        "license_checks": [
+            {
+                "path": license_path,
+                "sha256": hashlib.sha256(PYSIDE_TEST_LICENSE).hexdigest(),
+                "contains": [
+                    "GNU LESSER GENERAL PUBLIC LICENSE",
+                    "Version 3, 29 June 2007",
+                ],
+            }
+        ],
+    }
+    row.update(overrides)
+    path.write_text(
+        json.dumps({"corresponding_source_archives": [row]}),
+        encoding="utf-8",
+    )
+    return path
 
 
 def write_inventory(
@@ -981,3 +1092,211 @@ def test_44_current_working_directory_cannot_be_the_cache(
     monkeypatch.chdir(tmp_path)
     with pytest.raises(ReleaseError, match="current working directory"):
         sources._prepare_cache(Path.cwd())
+
+
+def test_45_pyside_record_scopes_the_exact_official_mirror_and_validation() -> None:
+    inventory = json.loads(
+        (PROJECT_ROOT / "tools/release/third_party_licenses.json").read_text(encoding="utf-8")
+    )
+    row = next(
+        item
+        for item in inventory["corresponding_source_archives"]
+        if item["filename"] == PYSIDE_FILENAME
+    )
+    assert row["url"] == PYSIDE_PRIMARY
+    assert row["fallback_urls"] == [PYSIDE_MIRROR]
+    assert row["allowed_hosts"] == ["download.qt.io", "qt.mirror.constant.com"]
+    assert row["sha256"] == PYSIDE_HASH
+    assert row["size_bytes"] == PYSIDE_SIZE
+    assert row["maximum_size_bytes"] == sources.MAX_SOURCE_ARCHIVE_BYTES
+    assert row["archive_format"] == "tar.xz"
+    assert row["timeout_seconds"] == 60
+    assert row["max_redirects"] == 5
+    assert row["primary_attempts"] == row["fallback_attempts"] == 1
+    assert row["top_level"] == PYSIDE_ROOT
+    assert len(row["version_checks"]) == 2
+    assert len(row["license_checks"]) == 3
+    assert row["source_provenance"]["primary"]["kind"] == "official Qt download origin"
+    assert row["source_provenance"]["fallback"] == {
+        "kind": "official Qt mirror",
+        "operator": "Constant Hosting",
+        "official_mirror_directory": "https://download.qt.io/static/mirrorlist/",
+    }
+
+
+def test_46_pyside_exact_mirror_redirect_is_accepted_and_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = pyside_archive_bytes()
+    inventory = write_pyside_inventory(tmp_path / "pyside.json", body)
+    handler = sources._SafeRedirectHandler(
+        {"download.qt.io", "qt.mirror.constant.com"}, 3
+    )
+    redirected = handler.redirect_request(
+        sources.urllib.request.Request(PYSIDE_PRIMARY),
+        None,
+        302,
+        "Found",
+        {},
+        PYSIDE_MIRROR,
+    )
+    assert redirected.full_url == PYSIDE_MIRROR
+
+    calls: list[str] = []
+
+    def fake_open(request, **_kwargs):
+        calls.append(request.full_url)
+        return FakeResponse(body, url=PYSIDE_MIRROR, content_type="application/x-xz")
+
+    monkeypatch.setattr(sources, "_open_response", fake_open)
+    rows = sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+    assert calls == [PYSIDE_PRIMARY]
+    assert rows[0]["provenance"] == {
+        "kind": "network",
+        "source_role": "primary",
+        "source_url": PYSIDE_PRIMARY,
+        "redirect_url": PYSIDE_MIRROR,
+    }
+
+
+@pytest.mark.parametrize(
+    "redirect_url",
+    [
+        "https://ftp.fau.de/qtproject/official_releases/QtForPython/pyside6/"
+        "PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz",
+        "https://mirror.constant.com/official_releases/QtForPython/pyside6/"
+        "PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz",
+    ],
+)
+def test_47_pyside_redirect_rejects_undeclared_qt_and_constant_hosts(
+    redirect_url: str,
+) -> None:
+    handler = sources._SafeRedirectHandler(
+        {"download.qt.io", "qt.mirror.constant.com"}, 3
+    )
+    with pytest.raises(ReleaseError, match="unapproved host"):
+        handler.redirect_request(
+            sources.urllib.request.Request(PYSIDE_PRIMARY),
+            None,
+            302,
+            "Found",
+            {},
+            redirect_url,
+        )
+
+
+def test_48_pyside_declared_fallback_survives_an_unusable_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = pyside_archive_bytes()
+    inventory = write_pyside_inventory(tmp_path / "pyside.json", body)
+    calls: list[str] = []
+
+    def fake_open(request, **_kwargs):
+        calls.append(request.full_url)
+        if request.full_url == PYSIDE_PRIMARY:
+            raise ReleaseError("Source download redirected to an unapproved host")
+        return FakeResponse(body, url=request.full_url, content_type="application/x-xz")
+
+    monkeypatch.setattr(sources, "_open_response", fake_open)
+    rows = sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+    assert calls == [PYSIDE_PRIMARY, PYSIDE_MIRROR]
+    assert rows[0]["provenance"] == {
+        "kind": "network",
+        "source_role": "fallback",
+        "source_url": PYSIDE_MIRROR,
+    }
+    assert rows[0]["validation"]["cryptographic"]["status"] == "verified"
+    assert rows[0]["validation"]["size"]["status"] == "verified"
+    assert rows[0]["validation"]["archive"]["format"] == "tar.xz"
+    assert rows[0]["validation"]["semantics"] == {
+        "version": "verified",
+        "license": "verified",
+    }
+
+
+def test_49_pyside_altered_mirror_path_cannot_bypass_the_pinned_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = pyside_archive_bytes()
+    received = bytearray(body)
+    received[-1] ^= 1
+    inventory = write_pyside_inventory(
+        tmp_path / "pyside.json",
+        body,
+        fallback_urls=[],
+    )
+    altered = PYSIDE_MIRROR.replace(PYSIDE_FILENAME, "altered-source.tar.xz")
+    altered += "?token=DO_NOT_PRINT"
+    monkeypatch.setattr(
+        sources,
+        "_open_response",
+        lambda *_args, **_kwargs: FakeResponse(
+            bytes(received),
+            url=altered,
+            content_type="application/x-xz",
+        ),
+    )
+    with pytest.raises(ReleaseError) as raised:
+        sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+    message = str(raised.value)
+    assert "SHA-256 mismatch" in message
+    assert "https://qt.mirror.constant.com/official_releases/QtForPython/pyside6/" in message
+    assert "altered-source.tar.xz" in message
+    assert "DO_NOT_PRINT" not in message
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("hash", "SHA-256 mismatch"),
+        ("size", "Content-Length"),
+        ("archive", "magic"),
+        ("version", "version marker mismatch"),
+        ("license", "license file hash mismatch"),
+        ("html", "Content-Type"),
+    ],
+)
+def test_50_pyside_direct_mirror_fallback_remains_fail_closed(
+    case: str,
+    error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = pyside_archive_bytes()
+    if case == "archive":
+        body = b"not a tar.xz archive"
+    elif case == "version":
+        body = pyside_archive_bytes(pyside_version=("6", "11", "2"))
+    elif case == "license":
+        body = pyside_archive_bytes(license_text=b"unexpected license\n")
+    overrides: dict[str, object] = {}
+    if case == "hash":
+        overrides["sha256"] = "0" * 64
+    elif case == "size":
+        overrides["size_bytes"] = len(body) + 1
+    inventory = write_pyside_inventory(tmp_path / "pyside.json", body, **overrides)
+
+    def fake_open(request, **_kwargs):
+        if request.full_url == PYSIDE_PRIMARY:
+            raise TimeoutError("synthetic primary failure")
+        content_type = "text/html" if case == "html" else "application/x-xz"
+        return FakeResponse(body, url=request.full_url, content_type=content_type)
+
+    monkeypatch.setattr(sources, "_open_response", fake_open)
+    with pytest.raises(ReleaseError, match=error):
+        sources.fetch_sources(tmp_path / "cache", inventory_path=inventory)
+
+
+def test_51_pyside_http_mirror_fallback_is_rejected(tmp_path: Path) -> None:
+    body = pyside_archive_bytes()
+    inventory = write_pyside_inventory(
+        tmp_path / "pyside.json",
+        body,
+        fallback_urls=[PYSIDE_MIRROR.replace("https://", "http://")],
+    )
+    with pytest.raises(ReleaseError, match="source fallback URL"):
+        sources._source_rows(inventory)

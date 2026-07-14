@@ -38,7 +38,92 @@
       "component": "PySide6, PySide6 Essentials/Addons, and Shiboken6",
       "filename": "pyside-setup-everywhere-src-6.11.1.tar.xz",
       "url": "https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz",
+      "fallback_urls": [
+        "https://qt.mirror.constant.com/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz"
+      ],
       "sha256": "6ffd9835bb0dd2c56f061d62f1616bb1707cfc0202b80e3165d6be087f3965e2",
+      "size_bytes": 17963432,
+      "maximum_size_bytes": 536870912,
+      "archive_format": "tar.xz",
+      "allowed_hosts": [
+        "download.qt.io",
+        "qt.mirror.constant.com"
+      ],
+      "content_types": [
+        "application/x-xz",
+        "application/x-tar",
+        "application/octet-stream"
+      ],
+      "timeout_seconds": 60,
+      "max_redirects": 5,
+      "primary_attempts": 1,
+      "fallback_attempts": 1,
+      "top_level": "pyside-setup-everywhere-src-6.11.1",
+      "required_paths": [
+        "pyside-setup-everywhere-src-6.11.1/setup.py",
+        "pyside-setup-everywhere-src-6.11.1/sources/pyside6/CMakeLists.txt",
+        "pyside-setup-everywhere-src-6.11.1/sources/pyside6/.cmake.conf",
+        "pyside-setup-everywhere-src-6.11.1/sources/shiboken6/CMakeLists.txt",
+        "pyside-setup-everywhere-src-6.11.1/sources/shiboken6/.cmake.conf",
+        "pyside-setup-everywhere-src-6.11.1/LICENSES/GPL-2.0-only.txt",
+        "pyside-setup-everywhere-src-6.11.1/LICENSES/GPL-3.0-only.txt",
+        "pyside-setup-everywhere-src-6.11.1/LICENSES/LGPL-3.0-only.txt"
+      ],
+      "version_checks": [
+        {
+          "path": "pyside-setup-everywhere-src-6.11.1/sources/pyside6/.cmake.conf",
+          "contains": [
+            "set(pyside_MAJOR_VERSION \"6\")",
+            "set(pyside_MINOR_VERSION \"11\")",
+            "set(pyside_MICRO_VERSION \"1\")"
+          ]
+        },
+        {
+          "path": "pyside-setup-everywhere-src-6.11.1/sources/shiboken6/.cmake.conf",
+          "contains": [
+            "set(shiboken_MAJOR_VERSION \"6\")",
+            "set(shiboken_MINOR_VERSION \"11\")",
+            "set(shiboken_MICRO_VERSION \"1\")"
+          ]
+        }
+      ],
+      "license_checks": [
+        {
+          "path": "pyside-setup-everywhere-src-6.11.1/LICENSES/GPL-2.0-only.txt",
+          "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+          "contains": [
+            "GNU GENERAL PUBLIC LICENSE",
+            "Version 2, June 1991"
+          ]
+        },
+        {
+          "path": "pyside-setup-everywhere-src-6.11.1/LICENSES/GPL-3.0-only.txt",
+          "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+          "contains": [
+            "GNU GENERAL PUBLIC LICENSE",
+            "Version 3, 29 June 2007"
+          ]
+        },
+        {
+          "path": "pyside-setup-everywhere-src-6.11.1/LICENSES/LGPL-3.0-only.txt",
+          "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+          "contains": [
+            "GNU LESSER GENERAL PUBLIC LICENSE",
+            "Version 3, 29 June 2007"
+          ]
+        }
+      ],
+      "source_provenance": {
+        "primary": {
+          "kind": "official Qt download origin"
+        },
+        "fallback": {
+          "kind": "official Qt mirror",
+          "operator": "Constant Hosting",
+          "official_mirror_directory": "https://download.qt.io/static/mirrorlist/"
+        },
+        "integrity_note": "Both endpoints must match the same preapproved hash, exact size, archive layout, PySide6/Shiboken6 version markers, and license semantics."
+      },
       "covers_components": [
         "PySide6, PySide6 Essentials/Addons, and Shiboken6",
         "CPython 3.7 buffer-protocol code used by Shiboken6",

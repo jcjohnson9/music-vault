@@ -841,6 +841,7 @@ def _validated_result(
     provenance_kind: str,
     source_role: str,
     source_url: str | None,
+    delivery_url: str | None = None,
 ) -> dict[str, object]:
     actual_size = path.stat().st_size
     expected_size = row["size_bytes"]
@@ -860,6 +861,13 @@ def _validated_result(
             f"actual_bytes={actual_size}"
         )
     _validate_archive(path, row)
+    provenance = {
+        "kind": provenance_kind,
+        "source_role": source_role,
+        "source_url": _sanitize_url(source_url) if source_url else None,
+    }
+    if source_url and delivery_url and delivery_url != source_url:
+        provenance["redirect_url"] = _sanitize_url(delivery_url)
     return {
         "component": row["component"],
         "filename": path.name,
@@ -898,11 +906,7 @@ def _validated_result(
                 "license": "verified" if row["license_checks"] else "not_declared",
             },
         },
-        "provenance": {
-            "kind": provenance_kind,
-            "source_role": source_role,
-            "source_url": _sanitize_url(source_url) if source_url else None,
-        },
+        "provenance": provenance,
     }
 
 
@@ -946,7 +950,7 @@ def _download_attempt(
     url: str,
     target: Path,
     row: dict[str, object],
-) -> None:
+) -> str:
     _, requested_host = _validated_https_url(url, label="source URL")
     if requested_host not in row["allowed_hosts"]:
         raise ReleaseError(f"Source URL host is not approved: {_sanitize_url(url)}")
@@ -1033,6 +1037,7 @@ def _download_attempt(
     except Exception:
         target.unlink(missing_ok=True)
         raise
+    return final_url
 
 
 def _safe_attempt_error(exc: BaseException) -> str:
@@ -1069,6 +1074,7 @@ def fetch_sources(
         failures: list[str] = []
         fetched = False
         selected_url: str | None = None
+        selected_delivery_url: str | None = None
         selected_role = ""
         for url_index, url in enumerate(row["urls"]):
             attempts = int(row["primary_attempts"] if url_index == 0 else row["fallback_attempts"])
@@ -1078,13 +1084,14 @@ def fetch_sources(
                 )
                 _remove_partial(temporary)
                 try:
-                    _download_attempt(str(url), temporary, row)
+                    delivery_url = _download_attempt(str(url), temporary, row)
                     _validate_cache_entry(target)
                     if target.exists():
                         raise ReleaseError(f"Source cache target appeared during download: {target.name}")
                     os.replace(temporary, target)
                     fetched = True
                     selected_url = str(url)
+                    selected_delivery_url = delivery_url
                     selected_role = "primary" if url_index == 0 else "fallback"
                     break
                 except Exception as exc:
@@ -1107,6 +1114,7 @@ def fetch_sources(
                     provenance_kind="network",
                     source_role=selected_role,
                     source_url=selected_url,
+                    delivery_url=selected_delivery_url,
                 )
             )
         except (OSError, ReleaseError) as exc:
