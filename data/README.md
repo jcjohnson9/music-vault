@@ -8,7 +8,8 @@ contain no user library or credentials.
 
 Never commit user databases, API keys, configuration, status files, download
 archives, failed-item records, media, cover art, artist images, metadata reports,
-backups, logs, or private playlist information from this directory.
+backups, logs, lyrics, lyric-provider results, or private playlist information
+from this directory.
 
 Music Vault may create timestamped SQLite migration backups under `backups/`
 and a neutral external App Status document named `music_vault_status.json`.
@@ -47,6 +48,22 @@ is disabled by default, requires no provider or YouTube API key, and can be
 disabled or cleared from the application. These images may belong to third
 parties; neither the files nor their manifest belongs in source control or a
 public build.
+
+Optional Party Mode lyrics use a versioned private cache under `lyrics/`.
+Content-addressed `.lyrics` payloads derived from imported or fetched LRC/plain
+text, manual imports, the cache index, provider provenance, negative-cache
+state, and lookup metadata are runtime-only data. Online lookup is disabled by
+default and requires consent; it sends only the current track's title, artist,
+optional album, and duration to LRCLIB. It does not send the YouTube API key,
+audio, or a bulk library inventory. Fetched lyrics are never written into music
+files, App Status, or public logs.
+
+Lyric content may be copyrighted or otherwise subject to third-party rights and
+is retained only for the user's private local use. Never commit or publicly
+attach the `lyrics/` directory, an adjacent personal sidecar, raw provider
+response, or test fixture containing lyric text. Publication and release gates
+reject `.lrc`/`.lyrics` payloads, lyric-cache text, and lyric-provider fixture
+paths.
 
 Only this README and `.gitkeep` are intended to be tracked here. Never build a
 public portable package from an initialized personal data directory.

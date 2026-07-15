@@ -46,6 +46,14 @@ FORBIDDEN_PARTS = {
     "build", "data", "dist", "release_artifacts", "metadata_reports", "provider_cache",
     "media_backups", "youtube_downloads", "artist_images", "covers", "backups",
 }
+LYRIC_CACHE_PARTS = {"lyric_cache", "lyrics_cache"}
+LYRIC_FIXTURE_PARTS = {
+    "lyric_fixtures",
+    "lyrics_fixtures",
+    "lyrics_provider_fixtures",
+    "provider_fixtures",
+    "provider_lyrics_fixtures",
+}
 SECRET_PATTERNS = (
     ("likely Google API key", re.compile(rb"AIza[0-9A-Za-z_-]{30,}")),
     ("bearer token", re.compile(rb"(?i)bearer[ \t]+[A-Za-z0-9._~+/-]{20,}")),
@@ -404,6 +412,31 @@ def canonical_payload_hash(records: list[dict[str, object]]) -> str:
     return sha256_bytes(payload)
 
 
+def is_lyrics_payload_path(relative: str) -> bool:
+    """Identify private lyric content without rejecting lyrics source code/docs."""
+
+    normalized = relative.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    lowered_parts = {part.casefold() for part in path.parts}
+    name = path.name.casefold()
+    suffix = path.suffix.casefold()
+    if suffix in {".lrc", ".lyrics"}:
+        return True
+    if lowered_parts & (LYRIC_CACHE_PARTS | LYRIC_FIXTURE_PARTS):
+        return True
+    fixture_markers = ("fixture", "payload", "response")
+    if suffix in {".json", ".txt"} and (
+        ("lrclib" in name and any(marker in name for marker in fixture_markers))
+        or ("lyrics" in name and any(marker in name for marker in fixture_markers))
+    ):
+        return True
+    if suffix != ".txt":
+        return False
+    return "lyrics" in lowered_parts or name in {"lyric.txt", "lyrics.txt"} or name.endswith(
+        (".lyrics.txt", "-lyrics.txt", "_lyrics.txt")
+    )
+
+
 def violation_for_path(relative: str, *, allow_package_zip: bool = False) -> str | None:
     normalized = relative.replace("\\", "/")
     path = PurePosixPath(normalized)
@@ -412,6 +445,8 @@ def violation_for_path(relative: str, *, allow_package_zip: bool = False) -> str
     suffix = path.suffix.casefold()
     if name in FORBIDDEN_EXACT_NAMES:
         return "runtime or secret filename"
+    if is_lyrics_payload_path(normalized):
+        return "lyrics cache or provider-fixture payload"
     if suffix in MEDIA_EXTENSIONS:
         return "media file"
     if suffix in DATABASE_EXTENSIONS or name.endswith((".sqlite3-wal", ".sqlite3-shm", ".sqlite3-journal")):

@@ -12,6 +12,7 @@ runtime data are not source artifacts.
 | `.\tools\dev\capture_ui_review.ps1` | Run the explicitly gated synthetic application review matrix. |
 | `.\tools\dev\profile_media_browsers.ps1` | Profile browser structure with temporary synthetic databases. |
 | `.\tools\dev\run_party_mode_review.ps1` | Review PartyCanvas and real PartyModeWindow states plus bounded frame performance with temporary synthetic audio/artwork. |
+| `.\tools\dev\run_party_mode_9_1_review.ps1` | Review the 22-state Batch 9.1 motion/lyrics matrix and performance using temporary synthetic data with networking blocked. |
 | `.\tools\dev\pre_public_commit_check.ps1` | Scan the current publication candidate for private/runtime content. |
 | `.\tools\dev\pre_public_history_check.ps1` | Scan all reachable Git history and refs before publication. |
 
@@ -51,3 +52,20 @@ Delete retained captures after recording findings. Never commit a generated
 WAV, image capture, benchmark JSON, temporary database, or runtime directory.
 The harness reports timing as informational; structural failures such as an
 unbounded particle count, continuing hidden timer, or failed cleanup are gates.
+
+## Batch 9.1 motion and lyrics review
+
+The Batch 9.1 helper exercises the exact six-preset motion sequence and 22
+sanitized motion/lyrics states at 720p, 1080p, and 1440p. It also checks the
+album-motion invariant, compact lyric/control geometry, Static's stopped render
+timer, bounded peak Fireworks particles, Aurora release smoothing, timeline and
+private-cache lookup costs, and temporary-runtime cleanup. Python network calls
+are blocked for the entire helper process.
+
+```powershell
+.\tools\dev\run_party_mode_9_1_review.ps1 -Scale 1.25
+.\tools\dev\run_party_mode_9_1_review.ps1 -Scale 1.5
+```
+
+Pass `-Output .\.ui-review\batch9-1` only for a temporary human review. Delete
+that ignored output after recording the findings.

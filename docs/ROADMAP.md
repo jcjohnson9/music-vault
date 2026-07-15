@@ -161,6 +161,26 @@ semantics.
 **Status:** Complete on the v1.1.0 development line. The public stable release
 remains v1.0.0.
 
+## Batch 9.1 — Party Mode Motion Refinement and Premium Lyrics
+
+**Objective:** Refine Party Mode into slower phrase-driven motion and add an
+optional premium, local-first lyrics overlay without changing playback or the
+approved album/metadata/control layout.
+
+**Scope:** Static as the migrated default; smooth beat, four-beat bar, and
+32-beat phrase timing; fixed artwork outside Pulse; refined Starfield/Aurora;
+bounded 3D Orb Cluster and Fireworks; synchronized and honestly unsynchronized
+lyrics directly above the playback bar; manual/sidecar/embedded/cache discovery;
+consent-gated read-only LRCLIB lookup; strict matching; private hashed cache;
+and publication/release safety gates for lyric content.
+
+**Non-goals:** No lyrics editor, bulk lyric download, provider contribution,
+word-level karaoke, audio-tag writeback, additional provider, queue/playback
+change, database-schema change, or public v1.1.0 release.
+
+**Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0;
+Batch 10 remains next.
+
 ## Batch 10 — Multiple Source Playlists
 
 **Objective:** Support several authorized source playlists without losing

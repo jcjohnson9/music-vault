@@ -20,6 +20,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/safety.py` | Secret redaction, video-ID extraction, source-date normalization, and safe output paths. |
 | `music_vault/core/playback_state.py` | Pure volume normalization/config filtering and track-ID-to-table-row helpers. |
 | `music_vault/core/audio_analysis.py` | Bounded PCM conversion, spectral features, smoothing, beat detection, and latest-buffer analysis for Party Mode. |
+| `music_vault/core/musical_motion.py` | Bounded tempo estimation, smooth beat/bar/phrase phase, missed-beat continuation, and deterministic sparse accent scheduling. |
 | `music_vault/core/library_browser.py` | SQL-aggregated album/artist summaries, stable browser identities, exact track lookup, revision fingerprints, and summary-cache invalidation. |
 | `music_vault/core/paths.py` | Central source, portable-marker, selected runtime-data, asset, and frozen-application path resolution. |
 | `music_vault/core/ffmpeg.py` | Bounded discovery and validation of a complete external `ffmpeg.exe`/`ffprobe.exe` pair. |
@@ -37,8 +38,11 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/onboarding.py` | Blank-runtime detection helpers and the local-first, optional-sync first-run guide. |
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
 | `music_vault/ui/party_mode.py` | Full-screen Party Mode lifecycle, overlay, command routing, screen selection, and existing-player bridge. |
-| `music_vault/ui/party_visuals.py` | Shared PartyCanvas renderer, particle simulation, three visual presets, frame timing, and adaptive quality. |
+| `music_vault/ui/party_visuals.py` | Shared PartyCanvas renderer, six bounded visual presets, centralized album transform, frame timing, and adaptive quality. |
 | `music_vault/ui/party_palette.py` | Deterministic artwork palette extraction, contrast handling, caching, and color interpolation. |
+| `music_vault/ui/party_lyrics.py` | Independent synchronized/plain lyrics overlay, loading/empty states, position lookup, scrolling, and provider attribution. |
+| `music_vault/lyrics/` | Bounded lyric models/parser/cache/service, read-only local/embedded/sidecar discovery, and the provider-neutral lookup boundary. |
+| `music_vault/lyrics/providers/lrclib.py` | Consent-gated, read-only LRCLIB client with HTTPS destination controls, bounded responses, and strict result matching. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
 | `music_vault/metadata/remediation_schema.py` | Additive schema-v4 remediation job, item, cache, constraint, and index definitions. |
@@ -298,22 +302,41 @@ never recorded, written to disk, placed in App Status, or sent over a network.
 Backends without buffer output use an explicitly non-audio-reactive ambient
 fallback derived from timing and playback state.
 
-`PartyCanvas` owns data-only particles and paints them in one widget. Its timer
-runs only while visible. Presets share artwork-derived palettes and bounded
-brightness/motion rules; reduced motion lowers movement and particle budgets.
-Auto quality uses measured frame history to reduce work with hysteresis rather
-than oscillating. Palette extraction is cached per artwork identity and performs
-no file mutation or provider request.
+The musical-motion layer converts transient beat detections into continuous
+beat, four-beat bar, and 32-beat phrase phases. It estimates a bounded tempo,
+rejects outliers, continues calmly across missed beats, and corrects phase
+without restarting animations. Raw beat flags do not directly move the album,
+cluster, aurora, or particles.
+
+`PartyCanvas` owns data-only particles and paints them in one widget. Static,
+Starfield, Aurora, Orb Cluster, Fireworks, and Pulse share artwork-derived
+palettes and bounded brightness/motion rules. A centralized transform keeps the
+album exactly fixed outside Pulse; Pulse uses a restrained four-beat curve.
+Static stops high-frequency visual simulation. Reduced motion lowers movement
+and particle budgets. Auto quality uses measured frame history to reduce work
+with hysteresis rather than oscillating. Palette extraction is cached per
+artwork identity and performs no file mutation or provider request.
+
+Lyrics remain a separate overlay above the playback bar and use the existing
+player position, not the render clock. The lyrics service resolves manual,
+adjacent, embedded, and cached local sources before optional network work. A
+generation guard prevents a stale provider result from appearing after a track
+change. Only one consent-gated LRCLIB request may be active, and strict matching
+rejects ambiguous metadata. Cached bodies are content-addressed under the
+selected runtime `data/lyrics/` directory; writes are atomic, filenames contain
+no track titles, and fetched text is never written to media, App Status, or
+public logs. See [Lyrics](LYRICS.md).
 
 `tools/dev/run_party_mode_review.py` is a separate development harness. It sets
 an isolated temporary project root, creates only synthetic WAV/artwork/metadata,
-blocks Python network access, drives the canvas offscreen, records aggregate
-frame metrics, and removes its runtime. Four full-profile states exercise the
-real `PartyModeWindow` against a synthetic host/player/DB contract, including
-overlay/help/queue stacking and single-player ownership. The two-state
-`scale-smoke` profile is used for non-default scale checks. Optional retained
-captures are allowed only in an ignored review directory or outside the
-repository and must be deleted after review.
+synthetic lyric inputs and fake provider responses, blocks public network
+access, drives the canvas offscreen, records aggregate frame metrics, and
+removes its runtime. The deterministic Batch 9/9.1 matrix exercises the real
+`PartyModeWindow` against a synthetic host/player/DB contract, including all
+presets, lyric states, transitions, overlay/help/queue stacking, and
+single-player ownership. Optional retained captures are allowed only in an
+ignored review directory or outside the repository and must be deleted after
+review.
 
 ## Known architectural debt
 

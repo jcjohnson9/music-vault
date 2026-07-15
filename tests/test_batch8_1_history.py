@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from tools.security import pre_public_commit_check as publication
 from tools.security import pre_public_history_check as history
 
 
@@ -95,6 +96,40 @@ def test_history_scanner_detects_historical_media_path(tmp_path: Path, capsys) -
     assert result == 1
     assert "music or media file" in output
     assert "synthetic-track" not in output
+
+
+def test_candidate_path_policy_rejects_lyric_payloads_but_not_source() -> None:
+    for relative in (
+        "adjacent/synthetic.lrc",
+        "cache/files/synthetic.lyrics",
+        "cache/lyrics/synthetic.txt",
+        "tests/provider_fixtures/lrclib.json",
+        "tests/lrclib_response.json",
+    ):
+        rules = {
+            rule for rule, _remediation in publication._path_violations(relative)
+        }
+        assert "private lyric cache or provider fixture" in rules
+
+    assert publication._path_violations("music_vault/lyrics/service.py") == []
+    assert publication._path_violations("tests/test_lyrics_provider.py") == []
+    assert publication._path_violations("docs/LYRICS.md") == []
+
+
+def test_history_scanner_detects_lyrics_without_printing_path(
+    tmp_path: Path, capsys
+) -> None:
+    repo = _repository(tmp_path)
+    relative = "sidecars/synthetic-private-track.lrc"
+    _commit_file(repo, relative, b"[00:01.00]synthetic fixture", "add lyric fixture")
+    _remove_and_tag(repo, relative)
+
+    result = history.main(["--repo", str(repo)])
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert "lyric" in output.casefold()
+    assert "synthetic-private-track" not in output
 
 
 def test_clean_synthetic_git_history_passes(tmp_path: Path, capsys) -> None:

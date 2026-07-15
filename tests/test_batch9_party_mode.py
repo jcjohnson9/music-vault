@@ -221,6 +221,7 @@ def test_party_settings_normalization_is_strict_bounded_and_non_mutating() -> No
     original = dict(source)
     normalized = normalize_party_mode_settings(source)
     assert normalized == {
+        "party_mode_config_version": 2,
         "party_mode_preset": "aurora",
         "party_mode_quality": "auto",
         "party_mode_frame_rate": "60",
@@ -531,16 +532,22 @@ def test_audio_features_drive_capability_and_fall_back_when_stale(party_surface)
     )
     window.on_audio_features(features)
     assert window.audio_reactivity_available is True
-    assert window.canvas._features is features
+    assert window.current_preset == "static"
+    assert window.canvas._features is None
+    assert window._latest_audio_features is features
     assert window.performance_metrics()["audio_reactivity_available"] is True
     assert signal.count() == 1
 
     window.on_audio_features(object())
+    assert window._latest_audio_features is features
+    window.cycle_preset()
+    assert window.current_preset == "starfield"
     assert window.canvas._features is features
     window._last_audio_feature_at = time.monotonic() - 2.0
     window._update_audio_capability()
     assert window.audio_reactivity_available is False
     assert window.canvas._features is None
+    assert window._latest_audio_features is None
     assert signal.count() == 2
 
 
@@ -592,6 +599,7 @@ def test_party_window_close_stops_rendering_timers_and_emits_once(
     _host, window = party_surface
     closed = QSignalSpy(window.party_closed)
     window.show()
+    window.canvas.set_preset("starfield")
     window.canvas.start_rendering()
     window.state_timer.start()
     window.fallback_timer.start()
@@ -786,7 +794,10 @@ def test_actual_music_vault_open_close_preserves_authoritative_playback_state(
 
     assert len(window.findChildren(QMediaPlayer)) == 1
     assert party.findChildren(QMediaPlayer) == []
-    assert party.rendering_active is True
+    # Static is intentionally idle: entering Party Mode records a render
+    # request without running the high-frequency visual timer.
+    assert party.current_preset == "static"
+    assert party.rendering_active is False
 
     party.close()
     qapp.processEvents()
@@ -804,7 +815,8 @@ def test_actual_music_vault_open_close_preserves_authoritative_playback_state(
         window.open_party_mode()
         qapp.processEvents()
         assert window.party_mode_window is party
-        assert party.rendering_active is True
+        assert party.current_preset == "static"
+        assert party.rendering_active is False
         party.close()
         qapp.processEvents()
         assert window.party_audio_thread is None
