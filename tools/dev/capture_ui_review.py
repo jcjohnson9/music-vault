@@ -314,6 +314,7 @@ def seed_synthetic_runtime(
         generated_artwork(covers / f"synthetic_cover_{index + 1}.png", index)
 
     party_wavs: tuple[Path, ...] = ()
+    party_sidecars: tuple[Path, ...] = ()
     if include_party:
         party_media = data / "synthetic_party_mode"
         party_media.mkdir()
@@ -323,6 +324,21 @@ def seed_synthetic_runtime(
         )
         for variant, wav_path in enumerate(party_wavs):
             write_synthetic_party_wav(wav_path, variant=variant)
+        party_sidecars = (
+            party_wavs[0].with_suffix(".lrc"),
+            party_wavs[1].with_suffix(".txt"),
+        )
+        party_sidecars[0].write_text(
+            "[00:00.00]Synthetic opening line\n"
+            "[00:01.20]Synthetic current line\n"
+            "[00:02.40]Synthetic following line\n",
+            encoding="utf-8",
+        )
+        party_sidecars[1].write_text(
+            "Synthetic unsynchronized review line one.\n\n"
+            "Synthetic unsynchronized review line two.\n",
+            encoding="utf-8",
+        )
 
     previous_environment = {
         name: os.environ.get(name)
@@ -513,6 +529,12 @@ def seed_synthetic_runtime(
         "artist_image_fetch_enabled_by_default": False,
         "synthetic_mp3_count": 1,
         "synthetic_party_wav_count": len(party_wavs),
+        "synthetic_party_lrc_count": sum(
+            path.suffix.casefold() == ".lrc" for path in party_sidecars
+        ),
+        "synthetic_party_txt_count": sum(
+            path.suffix.casefold() == ".txt" for path in party_sidecars
+        ),
     }
 
 
@@ -711,11 +733,26 @@ def validate_output(
             "queue_preserved",
             "base_context_preserved",
             "ambient_fallback_verified",
+            "static_default_migrated",
+            "static_timer_stopped",
+            "six_presets_verified",
             "pulse_verified",
             "starfield_verified",
             "aurora_verified",
+            "orb_cluster_verified",
+            "fireworks_verified",
             "overlay_controls_verified",
             "track_transition_verified",
+            "lyrics_default_off",
+            "lyrics_toggle_persisted",
+            "synced_lyrics_verified",
+            "plain_lyrics_verified",
+            "lyrics_cache_verified",
+            "lyrics_track_transition_verified",
+            "lyrics_above_controls",
+            "lyrics_visible_overlay_hidden",
+            "synthetic_lyrics_provider",
+            "lyrics_tasks_bounded",
             "render_timer_stopped_on_exit",
             "analysis_worker_stopped_on_exit",
             "status_safe",
@@ -947,6 +984,11 @@ def validate_output(
         )
         if party_wavs != expected_party_wavs or len(party_wavs) != 2:
             raise RuntimeError("Synthetic Party Mode WAV inventory is invalid.")
+        party_root = runtime / "data" / "synthetic_party_mode"
+        if len(list(party_root.glob("*.lrc"))) != 1 or len(
+            list(party_root.glob("*.txt"))
+        ) != 1:
+            raise RuntimeError("Synthetic Party Mode lyric inventory is invalid.")
     elif party_wavs:
         raise RuntimeError("Non-Party UI review unexpectedly generated WAV files.")
     if any((runtime / "data").rglob("*.pcm")) or any(
@@ -959,6 +1001,13 @@ def validate_output(
     if config.get("artist_image_fetch_enabled") is not False:
         raise RuntimeError("Synthetic runtime persisted artist-photo fetching as enabled.")
     if captured_scenes.intersection(PARTY_SCENES):
+        if not (
+            config.get("party_mode_config_version") == 2
+            and config.get("party_mode_preset") == "aurora"
+            and config.get("party_mode_lyrics_enabled") is True
+            and config.get("lyrics_online_lookup_enabled") is False
+        ):
+            raise RuntimeError("Synthetic Party Mode configuration validation failed.")
         status = json.loads(
             (runtime / "data" / "music_vault_status.json").read_text(encoding="utf-8")
         )

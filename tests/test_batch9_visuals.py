@@ -131,17 +131,35 @@ def test_palette_transparent_image_uses_fallback() -> None:
 
 
 def test_presets_and_quality_budgets_are_explicit_and_bounded() -> None:
-    assert PRESETS == ("pulse", "starfield", "aurora")
+    assert PRESETS == (
+        "static",
+        "starfield",
+        "aurora",
+        "orb_cluster",
+        "fireworks",
+        "pulse",
+    )
     assert QUALITY_LEVELS == ("low", "medium", "high")
     assert set(QUALITY_BUDGETS) == set(QUALITY_LEVELS)
     for quality in QUALITY_LEVELS:
-        engine = PartyVisualEngine(seed=7, quality=quality)
         for preset in PRESETS:
-            engine.set_preset(preset)
+            engine = PartyVisualEngine(seed=7, quality=quality, preset=preset)
             frame = engine.update(0.0)
-            assert len(frame.particles) == engine.particle_budget(preset)
-            assert 0 < len(frame.particles) <= MAX_PARTICLES
-            assert 2 <= len(frame.aurora_offsets) <= 7
+            budget = engine.particle_budget(preset)
+            if preset == "static":
+                assert budget == 0
+                assert not frame.particles and not frame.orbs
+            elif preset == "orb_cluster":
+                assert len(frame.orbs) == budget
+                assert not frame.particles
+            elif preset == "fireworks":
+                assert len(frame.firework_particles) <= budget
+                assert not frame.orbs
+            else:
+                assert len(frame.particles) == budget
+                assert 0 < len(frame.particles) <= MAX_PARTICLES
+            if preset == "aurora":
+                assert 2 <= len(frame.aurora_offsets) <= 7
         assert 1 <= engine.target_fps <= 60
 
 
@@ -232,11 +250,13 @@ def test_aurora_offsets_and_frame_contract_follow_frequency_bands() -> None:
 
 
 def test_preset_transition_and_reduced_motion_are_deterministic() -> None:
-    engine = PartyVisualEngine(seed=5, preset="pulse", transition_seconds=0.2)
+    engine = PartyVisualEngine(seed=5, preset="pulse", transition_seconds=0.4)
     engine.set_preset("starfield")
+    engine.update(0.1)
     halfway = engine.update(0.1)
     assert halfway.previous_preset == "pulse"
     assert halfway.transition_progress == pytest.approx(0.5)
+    engine.update(0.1)
     complete = engine.update(0.1)
     assert complete.previous_preset is None
     assert complete.transition_progress == 1.0

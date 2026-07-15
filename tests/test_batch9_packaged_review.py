@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,9 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QMainWindow
 
 from music_vault.core.db import MusicVaultDB
+from music_vault.lyrics.models import LyricsQuery, LyricsStatus, TrackLyricsIdentity
 from music_vault.ui import review
+from music_vault.ui.party_mode import normalize_party_mode_settings
 from music_vault.ui.review import (
     PARTY_REVIEW_SCENES,
     REVIEW_SCHEMA_VERSION,
@@ -79,6 +82,8 @@ def test_party_review_seed_contains_two_bounded_wavs_and_no_decoded_dump(
     tool, runtime, result = _seed_runtime(tmp_path)
     assert result["track_count"] == 300
     assert result["synthetic_party_wav_count"] == 2
+    assert result["synthetic_party_lrc_count"] == 1
+    assert result["synthetic_party_txt_count"] == 1
     wavs = sorted((runtime / "data" / "synthetic_party_mode").glob("*.wav"))
     assert len(wavs) == 2
     for wav_path in wavs:
@@ -94,6 +99,23 @@ def test_party_review_seed_contains_two_bounded_wavs_and_no_decoded_dump(
     assert not list((runtime / "data").rglob("*.pcm"))
     assert not list((runtime / "data").rglob("*.raw"))
     assert not (runtime / "data" / "youtube_api_key.txt").exists()
+    party_root = runtime / "data" / "synthetic_party_mode"
+    lyric_files = sorted([*party_root.glob("*.lrc"), *party_root.glob("*.txt")])
+    assert len(lyric_files) == 2
+    assert all(
+        path.resolve().is_relative_to(runtime.resolve())
+        and 0 < path.stat().st_size <= 64 * 1024
+        and not path.is_symlink()
+        for path in lyric_files
+    )
+    seeded_config = json.loads(
+        (runtime / "data" / "music_vault_config.json").read_text(encoding="utf-8")
+    )
+    assert "party_mode_config_version" not in seeded_config
+    assert seeded_config["party_mode_preset"] == "pulse"
+    normalized = normalize_party_mode_settings(seeded_config)
+    assert normalized["party_mode_config_version"] == 2
+    assert normalized["party_mode_preset"] == "static"
 
     monkeypatch.setenv("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "1")
     db = MusicVaultDB(
@@ -116,6 +138,8 @@ def test_party_review_seed_contains_two_bounded_wavs_and_no_decoded_dump(
             Path(str(track["path"])).resolve().is_relative_to(runtime.resolve())
             for track in fixture["tracks"]
         )
+        assert Path(fixture["synced_sidecar"]).suffix.casefold() == ".lrc"
+        assert Path(fixture["plain_sidecar"]).suffix.casefold() == ".txt"
     finally:
         db.close()
 
@@ -148,3 +172,29 @@ def test_party_status_forbidden_field_scan_is_recursive() -> None:
     assert review._PARTY_REVIEW_FORBIDDEN_STATUS_FIELDS.intersection(
         review._status_field_names(unsafe)
     ) == {"samples"}
+
+
+def test_review_only_lyrics_provider_is_bounded_and_offline(monkeypatch) -> None:
+    network_calls: list[object] = []
+
+    def network_forbidden(*args, **kwargs):
+        network_calls.append((args, kwargs))
+        raise AssertionError("synthetic review provider attempted network access")
+
+    monkeypatch.setattr("socket.socket.connect", network_forbidden)
+    identity = TrackLyricsIdentity(
+        42,
+        "Synthetic Party Signal",
+        "Music Vault Review",
+        "Synthetic Party Mode",
+        20_000,
+    )
+    provider = review._SyntheticReviewLyricsProvider(42)
+    result = provider.lookup(LyricsQuery(identity), threading.Event())
+
+    assert result.status is LyricsStatus.AVAILABLE
+    assert result.synchronized
+    assert result.identity is identity
+    assert provider.call_count == 1
+    assert result.provider == "synthetic_review"
+    assert not network_calls

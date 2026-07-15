@@ -52,6 +52,28 @@ data/metadata_reports/
 data/backups/
 data/backups/metadata_jobs/
 data/provider_cache/
+data/lyrics/
+
+# Lyrics are private runtime/third-party content, not source fixtures
+*.lrc
+*.lyrics
+**/lyrics/**/*.txt
+lyric.txt
+lyrics.txt
+*.lyrics.txt
+*_lyrics.txt
+*-lyrics.txt
+lyric_cache/
+lyrics_cache/
+lyric_fixtures/
+lyrics_fixtures/
+provider_fixtures/
+tests/fixtures/lyrics/
+tests/fixtures/lyrics_provider/
+*lrclib*fixture*.json
+*lrclib*response*.json
+*lyrics*fixture*.json
+*lyrics*response*.json
 
 # Archived local material
 _archive/

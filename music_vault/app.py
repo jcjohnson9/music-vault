@@ -158,7 +158,16 @@ from music_vault.ui.party_mode import (
     PartyAudioAnalysisThread,
     PartyModeWindow,
     normalize_party_mode_settings,
+    party_preset_label,
+    party_preset_value,
 )
+from music_vault.ui.party_lyrics import (
+    LYRICS_CACHE_SCHEMA_VERSION,
+    LYRICS_CONSENT_VERSION,
+    LYRICS_DEFAULTS,
+    normalize_lyrics_settings,
+)
+from music_vault.lyrics.cache import LyricsCache
 from music_vault.ui.review import schedule_ui_review
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
 from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
@@ -304,6 +313,8 @@ class MusicVaultWindow(QMainWindow):
         self.party_audio_thread: PartyAudioAnalysisThread | None = None
         self.party_mode_active = False
         self.party_audio_reactivity_available = False
+        self.party_lyrics_available = False
+        self.party_lyrics_synchronized = False
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -356,17 +367,20 @@ class MusicVaultWindow(QMainWindow):
             "artist_image_fetch_enabled": False,
             "onboarding_completed": False,
             **PARTY_MODE_DEFAULTS,
+            **LYRICS_DEFAULTS,
         }
 
     def load_config(self) -> dict:
         config = self.default_config()
         path = self.config_file_path()
+        saved: dict | None = None
 
         try:
             if path.exists():
-                saved = json.loads(path.read_text(encoding="utf-8"))
+                loaded = json.loads(path.read_text(encoding="utf-8"))
 
-                if isinstance(saved, dict):
+                if isinstance(loaded, dict):
+                    saved = loaded
                     config.update(saved)
         except Exception:
             pass
@@ -380,7 +394,27 @@ class MusicVaultWindow(QMainWindow):
         config["artist_image_fetch_enabled"] = (
             config.get("artist_image_fetch_enabled") is True
         )
-        config.update(normalize_party_mode_settings(config))
+        party_source = dict(config)
+        needs_party_migration = bool(
+            isinstance(saved, dict)
+            and "party_mode_config_version" not in saved
+        )
+        if needs_party_migration:
+            party_source.pop("party_mode_config_version", None)
+        config.update(normalize_party_mode_settings(party_source))
+        config.update(normalize_lyrics_settings(config))
+        if needs_party_migration:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_name(f"{path.name}.tmp")
+                temporary.write_text(
+                    json.dumps(config_for_persistence(config), indent=2),
+                    encoding="utf-8",
+                )
+                temporary.replace(path)
+            except OSError:
+                # An unwritable config must never prevent Music Vault startup.
+                pass
         return config
 
     def save_config(self) -> None:
@@ -478,10 +512,19 @@ class MusicVaultWindow(QMainWindow):
                 },
                 "party_mode_active": self.party_mode_active,
                 "party_mode_preset": str(
-                    self.config.get("party_mode_preset", "pulse")
+                    self.config.get("party_mode_preset", "static")
                 ),
                 "audio_reactivity_available": (
                     self.party_audio_reactivity_available
+                ),
+                "party_mode_lyrics_enabled": bool(
+                    self.config.get("party_mode_lyrics_enabled") is True
+                ),
+                "lyrics_available": bool(
+                    getattr(self, "party_lyrics_available", False)
+                ),
+                "lyrics_synchronized": bool(
+                    getattr(self, "party_lyrics_synchronized", False)
                 ),
             }
 
@@ -499,6 +542,9 @@ class MusicVaultWindow(QMainWindow):
                     "party_mode_active",
                     "party_mode_preset",
                     "audio_reactivity_available",
+                    "party_mode_lyrics_enabled",
+                    "lyrics_available",
+                    "lyrics_synchronized",
                 ):
                     if field in extra:
                         status_extra[field] = extra[field]
@@ -588,12 +634,17 @@ class MusicVaultWindow(QMainWindow):
             window.audio_reactivity_changed.connect(
                 self.on_party_audio_reactivity_changed
             )
+            window.lyrics_status_changed.connect(
+                self.on_party_lyrics_status_changed
+            )
             self.party_mode_window = window
 
+        self.party_audio_reactivity_available = False
+        self.party_lyrics_available = False
+        self.party_lyrics_synchronized = False
         window.apply_settings(self.config)
         self._ensure_party_audio_thread()
         self.party_mode_active = True
-        self.party_audio_reactivity_available = False
 
         screen = QApplication.screenAt(self.frameGeometry().center())
         if screen is None:
@@ -604,6 +655,8 @@ class MusicVaultWindow(QMainWindow):
     def on_party_mode_closed(self) -> None:
         self.party_mode_active = False
         self.party_audio_reactivity_available = False
+        self.party_lyrics_available = False
+        self.party_lyrics_synchronized = False
         self._shutdown_party_audio_thread()
         self.write_app_status()
 
@@ -615,7 +668,9 @@ class MusicVaultWindow(QMainWindow):
         if hasattr(self, "settings_party_preset"):
             previous = self.settings_party_preset.blockSignals(True)
             try:
-                self.settings_party_preset.setCurrentText(preset.title())
+                self.settings_party_preset.setCurrentText(
+                    party_preset_label(preset)
+                )
             finally:
                 self.settings_party_preset.blockSignals(previous)
         self.write_app_status()
@@ -625,6 +680,29 @@ class MusicVaultWindow(QMainWindow):
         if normalized == self.party_audio_reactivity_available:
             return
         self.party_audio_reactivity_available = normalized
+        self.write_app_status()
+
+    def on_party_lyrics_status_changed(
+        self,
+        enabled: bool,
+        available: bool,
+        synchronized: bool,
+    ) -> None:
+        next_enabled = bool(enabled)
+        previous_enabled = bool(
+            self.config.get("party_mode_lyrics_enabled", False)
+        )
+        self.config["party_mode_lyrics_enabled"] = next_enabled
+        next_available = bool(available)
+        next_synchronized = bool(synchronized)
+        if (
+            next_enabled == previous_enabled
+            and next_available == self.party_lyrics_available
+            and next_synchronized == self.party_lyrics_synchronized
+        ):
+            return
+        self.party_lyrics_available = next_available
+        self.party_lyrics_synchronized = next_synchronized
         self.write_app_status()
 
     def build_ui(self) -> None:
@@ -1413,6 +1491,54 @@ class MusicVaultWindow(QMainWindow):
         party_options_row.addWidget(self.settings_party_auto_hide)
         party_options_row.addStretch(1)
 
+        lyrics_title = QLabel("Party Mode Lyrics")
+        lyrics_title.setObjectName("CardTitle")
+        lyrics_description = QLabel(
+            "Lyrics are off by default. Music Vault checks private manual, "
+            "same-stem sidecar, embedded, and cached lyrics before any optional "
+            "LRCLIB request."
+        )
+        lyrics_description.setObjectName("MutedLabel")
+        lyrics_description.setWordWrap(True)
+        self.settings_lyrics_enabled = QCheckBox("Show lyrics in Party Mode")
+        self.settings_lyrics_enabled.setAccessibleName(
+            "Show lyrics in Party Mode"
+        )
+        self.settings_lyrics_online = QCheckBox(
+            "Enable online lyrics lookup through LRCLIB"
+        )
+        self.settings_lyrics_online.setAccessibleName(
+            "Enable online lyrics lookup through LRCLIB"
+        )
+        self.settings_lyrics_online.clicked.connect(
+            self.on_lyrics_online_setting_clicked
+        )
+        lyrics_options_row = QHBoxLayout()
+        lyrics_options_row.addWidget(self.settings_lyrics_enabled)
+        lyrics_options_row.addWidget(self.settings_lyrics_online)
+        lyrics_options_row.addStretch(1)
+
+        self.lyrics_provider_status = QLabel("Lyrics Provider: LRCLIB")
+        self.lyrics_provider_status.setObjectName("StatusLine")
+        self.lyrics_cache_status = QLabel()
+        self.lyrics_cache_status.setObjectName("StatusLine")
+        self.lyrics_cache_status.setWordWrap(True)
+        lyrics_actions = QHBoxLayout()
+        clear_lyrics_cache_btn = self.make_action_button(
+            "Clear Lyrics Cache",
+            "remove",
+            self.clear_lyrics_cache,
+            object_name="DangerButton",
+        )
+        open_lyrics_cache_btn = self.make_action_button(
+            "Open Lyrics Folder",
+            "folder",
+            self.open_lyrics_cache_folder,
+        )
+        lyrics_actions.addWidget(clear_lyrics_cache_btn)
+        lyrics_actions.addWidget(open_lyrics_cache_btn)
+        lyrics_actions.addStretch(1)
+
         save_btn = QPushButton("Save Settings")
         save_btn.setObjectName("PrimaryButton")
         save_btn.setIcon(
@@ -1537,6 +1663,13 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(party_mode_description)
         settings_layout.addLayout(party_controls)
         settings_layout.addLayout(party_options_row)
+        settings_layout.addSpacing(10)
+        settings_layout.addWidget(lyrics_title)
+        settings_layout.addWidget(lyrics_description)
+        settings_layout.addLayout(lyrics_options_row)
+        settings_layout.addWidget(self.lyrics_provider_status)
+        settings_layout.addWidget(self.lyrics_cache_status)
+        settings_layout.addLayout(lyrics_actions)
         settings_layout.addWidget(save_btn)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(artist_images_title)
@@ -4054,6 +4187,95 @@ class MusicVaultWindow(QMainWindow):
                 "Artist Photo Cache: Status unavailable"
             )
 
+    def on_lyrics_online_setting_clicked(self, checked: bool) -> None:
+        enabled = bool(checked)
+        consent_version = int(
+            normalize_lyrics_settings(self.config)["lyrics_lookup_consent_version"]
+        )
+        if enabled and consent_version < LYRICS_CONSENT_VERSION:
+            dialog = QMessageBox(self)
+            dialog.setIcon(QMessageBox.Icon.Information)
+            dialog.setWindowTitle("Online Lyrics")
+            dialog.setText(
+                "Enable optional online lyrics lookup through LRCLIB?"
+            )
+            dialog.setInformativeText(
+                "Only after private manual, same-stem sidecar, embedded, and "
+                "cached lyrics are unavailable, Music Vault sends the current "
+                "track title, artist, optional album, and duration to LRCLIB over "
+                "HTTPS. Successful results are cached privately. No API key or "
+                "audio file is sent."
+            )
+            accept = dialog.addButton(
+                "Enable Online Lyrics", QMessageBox.ButtonRole.AcceptRole
+            )
+            dialog.addButton(
+                "Keep Local Only", QMessageBox.ButtonRole.RejectRole
+            )
+            dialog.setDefaultButton(accept)
+            dialog.exec()
+            enabled = dialog.clickedButton() is accept
+            self.settings_lyrics_online.setChecked(enabled)
+            self.config["lyrics_lookup_consent_version"] = LYRICS_CONSENT_VERSION
+        self.config["lyrics_online_lookup_enabled"] = enabled
+        self.save_config()
+        if self.party_mode_window is not None:
+            self.party_mode_window.apply_settings(self.config)
+        self.refresh_lyrics_cache_status()
+
+    def refresh_lyrics_cache_status(self) -> None:
+        if not hasattr(self, "lyrics_cache_status"):
+            return
+        folder = data_dir() / "lyrics"
+        try:
+            stats = LyricsCache(folder).statistics()
+            self.lyrics_cache_status.setText(
+                f"Lyrics Cache: {folder.resolve()}\n"
+                f"Private Tracks: {stats['track_count']}  ·  "
+                f"Automatic: {stats['automatic_count']}  ·  "
+                f"Manual: {stats['manual_count']}  ·  "
+                f"Size: {self._format_cache_bytes(stats['total_bytes'])}"
+            )
+        except Exception:
+            self.lyrics_cache_status.setText(
+                f"Lyrics Cache: {folder.resolve()}\nStatus unavailable"
+            )
+
+    def clear_lyrics_cache(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Clear automatic lyrics cache?",
+            "Remove Music Vault-managed automatic lyric results and lookup "
+            "history? Manually imported, embedded, and sidecar lyrics are preserved.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        party_window = self.party_mode_window
+        try:
+            if party_window is not None:
+                party_window.prepare_lyrics_cache_clear()
+            LyricsCache(data_dir() / "lyrics").clear_automatic()
+            self.refresh_lyrics_cache_status()
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "Lyrics cache",
+                "The automatic lyrics cache could not be cleared.",
+            )
+        finally:
+            if party_window is not None:
+                try:
+                    party_window.lyrics_cache_cleared()
+                except RuntimeError:
+                    pass
+
+    def open_lyrics_cache_folder(self) -> None:
+        folder = data_dir() / "lyrics"
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
     def save_settings_from_ui(self) -> None:
         data_dir().mkdir(parents=True, exist_ok=True)
 
@@ -4087,7 +4309,12 @@ class MusicVaultWindow(QMainWindow):
         )
         party_settings = normalize_party_mode_settings(
             {
-                "party_mode_preset": self.settings_party_preset.currentText().lower(),
+                "party_mode_config_version": self.config.get(
+                    "party_mode_config_version"
+                ),
+                "party_mode_preset": party_preset_value(
+                    self.settings_party_preset.currentText()
+                ),
                 "party_mode_quality": self.settings_party_quality.currentText().lower(),
                 "party_mode_frame_rate": (
                     self.settings_party_frame_rate.currentText().split()[0].lower()
@@ -4107,10 +4334,30 @@ class MusicVaultWindow(QMainWindow):
             }
         )
         self.config.update(party_settings)
+        consent_version = int(
+            normalize_lyrics_settings(self.config)["lyrics_lookup_consent_version"]
+        )
+        online_enabled = bool(self.settings_lyrics_online.isChecked())
+        if online_enabled and consent_version < LYRICS_CONSENT_VERSION:
+            online_enabled = False
+            self.settings_lyrics_online.setChecked(False)
+        lyrics_settings = normalize_lyrics_settings(
+            {
+                "party_mode_lyrics_enabled": (
+                    self.settings_lyrics_enabled.isChecked()
+                ),
+                "lyrics_online_lookup_enabled": online_enabled,
+                "lyrics_lookup_consent_version": consent_version,
+                "lyrics_cache_schema_version": LYRICS_CACHE_SCHEMA_VERSION,
+            }
+        )
+        self.config.update(lyrics_settings)
         self.save_config()
 
         if self.party_mode_window is not None:
-            self.party_mode_window.apply_settings(party_settings)
+            self.party_mode_window.apply_settings(
+                {**party_settings, **lyrics_settings}
+            )
 
         if hasattr(self, "youtube_output"):
             self.youtube_output.setText(self.config["download_folder"])
@@ -4256,7 +4503,7 @@ class MusicVaultWindow(QMainWindow):
         party_controls = (
             (
                 "settings_party_preset",
-                party_settings["party_mode_preset"].title(),
+                party_preset_label(party_settings["party_mode_preset"]),
             ),
             (
                 "settings_party_quality",
@@ -4311,6 +4558,27 @@ class MusicVaultWindow(QMainWindow):
                 )
             finally:
                 self.settings_party_overlay_timeout.blockSignals(previous)
+        lyrics_settings = normalize_lyrics_settings(self.config)
+        lyrics_checks = (
+            (
+                "settings_lyrics_enabled",
+                lyrics_settings["party_mode_lyrics_enabled"],
+            ),
+            (
+                "settings_lyrics_online",
+                lyrics_settings["lyrics_online_lookup_enabled"],
+            ),
+        )
+        for attribute, value in lyrics_checks:
+            widget = getattr(self, attribute, None)
+            if widget is None:
+                continue
+            previous = widget.blockSignals(True)
+            try:
+                widget.setChecked(bool(value))
+            finally:
+                widget.blockSignals(previous)
+        self.refresh_lyrics_cache_status()
         self.refresh_artist_cache_status()
 
     def resizeEvent(self, event) -> None:
@@ -4325,7 +4593,7 @@ class MusicVaultWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self.party_mode_window is not None:
             try:
-                self.party_mode_window.close()
+                self.party_mode_window.shutdown()
             except RuntimeError:
                 pass
         self._shutdown_party_audio_thread()

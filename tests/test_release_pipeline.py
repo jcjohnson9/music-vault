@@ -208,6 +208,7 @@ def test_public_builder_rejects_dirty_or_non_head_source(
         ("data/music_vault.sqlite3", "database"),
         ("data/track.mp3", "media"),
         ("data/youtube_api_key.txt", "runtime"),
+        ("data/lyrics/files/synthetic.lrc", "lyrics"),
         ("covers/private.png", "private"),
         ("ffmpeg.exe", "FFmpeg"),
     ],
@@ -223,6 +224,54 @@ def test_builder_rejects_forbidden_distribution_inputs(
     injected.write_bytes(b"private")
     with pytest.raises(release_common.ReleaseError, match=expected_rule):
         builder.copy_distribution(dist, tmp_path / "portable")
+
+
+def test_release_path_policy_blocks_lyrics_payloads_but_allows_source() -> None:
+    assert release_common.violation_for_path("sidecars/synthetic.lrc") == (
+        "lyrics cache or provider-fixture payload"
+    )
+    assert release_common.violation_for_path("cache/files/synthetic.lyrics") == (
+        "lyrics cache or provider-fixture payload"
+    )
+    assert release_common.violation_for_path("cache/lyrics/synthetic.txt") == (
+        "lyrics cache or provider-fixture payload"
+    )
+    assert release_common.violation_for_path("tests/provider_fixtures/lrclib.json") == (
+        "lyrics cache or provider-fixture payload"
+    )
+    assert release_common.violation_for_path("tests/lrclib_response.json") == (
+        "lyrics cache or provider-fixture payload"
+    )
+    assert release_common.violation_for_path("music_vault/lyrics/service.py") is None
+    assert release_common.violation_for_path("tests/test_lyrics_provider.py") is None
+    assert release_common.violation_for_path("docs/LYRICS.md") is None
+
+
+def test_source_compliance_builder_rejects_lyric_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def export_with_lyrics(destination: Path, *_args) -> None:
+        target = destination / "sidecars" / "synthetic.lrc"
+        target.parent.mkdir(parents=True)
+        target.write_text("[00:01.00]synthetic fixture", encoding="utf-8")
+
+    monkeypatch.setattr(builder, "_export_git_commit", export_with_lyrics)
+    with pytest.raises(release_common.ReleaseError, match="private lyric content"):
+        builder.build_source_compliance(
+            tmp_path,
+            tmp_path / "staging-owner",
+            "a" * 40,
+            application_root=tmp_path,
+            source_tag="v1.0.0",
+            source_tag_object="b" * 40,
+            source_tree_hash="c" * 40,
+            release_tooling_commit="d" * 40,
+            release_tooling_tree_hash="e" * 40,
+            license_inventory=tmp_path / "inventory.json",
+            release_license_inventory_git_blob="f" * 40,
+            release_license_inventory_sha256="0" * 64,
+            release_version="1.0.0",
+        )
 
 
 def test_builder_rejects_unmapped_native_artifact(tmp_path: Path) -> None:
@@ -322,6 +371,28 @@ def test_source_compliance_scanner_reports_personal_path_without_crashing(
     findings = verifier.verify_source_compliance(archive)
     assert any(
         finding.path == "note.txt" and finding.rule == "personal absolute path"
+        for finding in findings
+    )
+
+
+def test_source_compliance_scanner_rejects_lyrics_provider_fixture(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / f"MusicVault-v{APP_VERSION}-Source-Compliance"
+    fixture = source_root / "tests" / "provider_fixtures" / "lrclib.json"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text('{"syncedLyrics":"synthetic"}', encoding="utf-8")
+    archive = tmp_path / release_common.COMPLIANCE_FILENAME
+    release_common.deterministic_zip(source_root, archive, prefix=source_root.name)
+    archive.with_name(archive.name + ".sha256").write_text(
+        f"{release_common.sha256_file(archive)}  {archive.name}\n",
+        encoding="ascii",
+    )
+
+    findings = verifier.verify_source_compliance(archive)
+    assert any(
+        finding.path == "tests/provider_fixtures/lrclib.json"
+        and finding.rule == "runtime/private lyric content"
         for finding in findings
     )
 
@@ -447,6 +518,7 @@ def _copy_release(synthetic_release: dict[str, Path], tmp_path: Path) -> Path:
         ("database", "forbidden content"),
         ("media", "forbidden content"),
         ("api-key", "sensitive content"),
+        ("lyrics", "forbidden content"),
         ("personal-path", "sensitive content"),
         ("ffmpeg", "forbidden content"),
     ],
@@ -461,6 +533,10 @@ def test_verifier_rejects_private_or_unexpected_injections(
         (root / "private.mp3").write_bytes(b"media")
     elif mutation == "api-key":
         (root / "note.txt").write_text("AIza" + "A" * 35, encoding="utf-8")
+    elif mutation == "lyrics":
+        target = root / "_internal" / "lyrics" / "files" / "synthetic.txt"
+        target.parent.mkdir(parents=True)
+        target.write_text("synthetic lyric fixture", encoding="utf-8")
     elif mutation == "personal-path":
         (root / "note.txt").write_text(
             "C:\\Users\\" + "private\\Music", encoding="utf-8"

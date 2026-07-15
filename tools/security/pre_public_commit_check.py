@@ -30,6 +30,17 @@ FORBIDDEN_DIRECTORY_NAMES = {
     "metadata_jobs",
     "provider_cache",
 }
+LYRIC_CACHE_DIRECTORY_NAMES = {
+    "lyric_cache",
+    "lyrics_cache",
+}
+LYRIC_FIXTURE_DIRECTORY_NAMES = {
+    "lyric_fixtures",
+    "lyrics_fixtures",
+    "lyrics_provider_fixtures",
+    "provider_fixtures",
+    "provider_lyrics_fixtures",
+}
 DATABASE_SUFFIXES = {
     ".db",
     ".sqlite",
@@ -88,6 +99,32 @@ RUNTIME_BASENAMES = {
 }
 
 
+def _is_lyric_payload_path(relative_path: str) -> bool:
+    """Return whether a path can contain cached, sidecar, or fixture lyrics."""
+
+    normalized = relative_path.replace("\\", "/")
+    pure_path = PurePosixPath(normalized)
+    parts = {part.casefold() for part in pure_path.parts}
+    name = pure_path.name.casefold()
+    suffix = pure_path.suffix.casefold()
+
+    if suffix in {".lrc", ".lyrics"}:
+        return True
+    if parts & (LYRIC_CACHE_DIRECTORY_NAMES | LYRIC_FIXTURE_DIRECTORY_NAMES):
+        return True
+    fixture_markers = ("fixture", "payload", "response")
+    if suffix in {".json", ".txt"} and (
+        ("lrclib" in name and any(marker in name for marker in fixture_markers))
+        or ("lyrics" in name and any(marker in name for marker in fixture_markers))
+    ):
+        return True
+    if suffix != ".txt":
+        return False
+    return "lyrics" in parts or name in {"lyric.txt", "lyrics.txt"} or name.endswith(
+        (".lyrics.txt", "-lyrics.txt", "_lyrics.txt")
+    )
+
+
 def _run_git(*args: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [
@@ -144,6 +181,9 @@ def _path_violations(relative_path: str) -> list[tuple[str, str]]:
 
     if set(parts) & FORBIDDEN_DIRECTORY_NAMES:
         violations.append(("forbidden local/generated directory", "remove local or generated material from the Git index"))
+
+    if _is_lyric_payload_path(normalized):
+        violations.append(("private lyric cache or provider fixture", "remove lyric content and use an in-memory synthetic test fixture"))
 
     if suffix in DATABASE_SUFFIXES or re.search(r"\.(?:db|sqlite|sqlite3)-", lower):
         violations.append(("database or database sidecar", "remove private database state from the Git index"))

@@ -24,6 +24,7 @@ try:
         exact_requirements,
         git_tree_entries_at,
         git_value,
+        is_lyrics_payload_path,
         is_reparse_or_link,
         load_license_inventory,
         missing_embedded_artifact_mappings,
@@ -48,6 +49,7 @@ except ImportError:  # Direct script execution.
         exact_requirements,
         git_tree_entries_at,
         git_value,
+        is_lyrics_payload_path,
         is_reparse_or_link,
         load_license_inventory,
         missing_embedded_artifact_mappings,
@@ -737,6 +739,8 @@ def verify_source_compliance(
                 "music_vault.sqlite3", "youtube_failed_ids.txt", "youtube_download_archive.txt",
             }:
                 findings.append(Finding(relative, "runtime/private source content", "compliance"))
+            if is_lyrics_payload_path(relative):
+                findings.append(Finding(relative, "runtime/private lyric content", "compliance"))
             if item.suffix.casefold() in {".exe", ".dll", ".pyd", ".pyc", ".pyo", ".mp3", ".flac", ".m4a", ".wav", ".webm"}:
                 findings.append(Finding(relative, "binary/runtime content in source artifact", "compliance"))
             for issue in scan_sensitive_bytes(item):

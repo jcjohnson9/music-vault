@@ -22,3 +22,8 @@ Party Mode adds four assets in the same original geometric system:
 
 All four use the existing 24 by 24 view box, 1.8-unit rounded stroke, tintable
 single-color geometry, and no third-party artwork or external resources.
+
+Batch 9.1 adds `lyrics.svg`, an original speech-panel geometry with three
+balanced lyric lines and a restrained lower tail. It uses the same tintable
+24 by 24, 1.8-unit rounded-stroke language. It is not an LRCLIB/provider mark
+and contains no copied logo, lyric text, font, or external resource.

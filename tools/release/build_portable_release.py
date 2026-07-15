@@ -34,6 +34,7 @@ try:
         exact_requirements,
         git_value,
         git_value_at,
+        is_lyrics_payload_path,
         is_reparse_or_link,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
@@ -64,6 +65,7 @@ except ImportError:  # Direct script execution.
         exact_requirements,
         git_value,
         git_value_at,
+        is_lyrics_payload_path,
         is_reparse_or_link,
         missing_embedded_artifact_mappings,
         native_artifact_owners,
@@ -542,6 +544,10 @@ def build_source_compliance(
         application_root, "rev-parse", f"{source_commit}^{{tree}}"
     )
     _export_git_commit(staging, source_commit, application_root)
+    for path in safe_files(staging):
+        relative = path.relative_to(staging).as_posix()
+        if is_lyrics_payload_path(relative):
+            raise ReleaseError("Source snapshot contains private lyric content.")
     tooling_inventory = staging / "release-tooling" / "third_party_licenses.json"
     tooling_inventory.parent.mkdir()
     shutil.copy2(license_inventory, tooling_inventory)

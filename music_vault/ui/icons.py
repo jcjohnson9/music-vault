@@ -49,6 +49,7 @@ REQUIRED_ICONS: Final[tuple[str, ...]] = (
     "exit-fullscreen",
     "visual-preset",
     "overlay-help",
+    "lyrics",
 )
 
 OPTIONAL_ICONS: Final[tuple[str, ...]] = (

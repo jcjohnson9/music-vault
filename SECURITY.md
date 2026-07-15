@@ -10,6 +10,7 @@ attachment, screenshot, log excerpt, or reproduction repository:
 - API keys, access tokens, cookies, credentials, or private keys
 - Music Vault database, configuration, archive, failure, or status files
 - Downloaded media, cover art, or other copyrighted/private assets
+- Cached, imported, adjacent, embedded, or provider-returned lyric content
 - Private playlist URLs or contents
 - Personal filesystem paths or usernames
 - Unsanitized logs that may contain any of the above
@@ -33,8 +34,9 @@ automatic updater and does not request administrator access.
 
 The published portable package is blank by construction and is checked for
 credentials, personal paths, databases, configuration, status, archives,
-media, artwork, reports, backups, unsafe ZIP entries, and manifest/hash
-mismatches. It includes the explicit `music-vault.portable.json` root marker
+media, artwork, lyrics, provider fixtures, reports, backups, unsafe ZIP entries,
+and manifest/hash mismatches. It includes the explicit
+`music-vault.portable.json` root marker
 and creates private runtime data only after launch. Do not redistribute an
 initialized portable folder as though it were the clean release.
 
@@ -50,6 +52,32 @@ Music Vault's repository source remains MIT licensed. The combined portable
 binary includes separately licensed components and is distributed under the
 terms described in [Binary Distribution License](docs/BINARY_DISTRIBUTION_LICENSE.md)
 and [Third-Party Notices](THIRD_PARTY_NOTICES.md); it is not an MIT-only binary.
+
+## Optional lyrics lookup
+
+Party Mode lyrics and online lookup are independent and Off by default. Local,
+manual, adjacent, embedded, and cached sources are checked before any network
+work. If no local result exists, Music Vault requests consent before enabling
+online lookup. Keeping local-only mode makes no provider request.
+
+When explicitly enabled, the read-only LRCLIB request contains only the current
+title, artist, optional album, and duration. It never includes the YouTube API
+key, cookies, media/audio bytes, playlists, local paths, or a bulk library
+inventory, and Music Vault does not upload or contribute lyrics. Requests use
+HTTPS only, allow only `lrclib.net`, disable environment proxy inheritance,
+apply connection/read and response-size limits, revalidate redirects and DNS
+destinations, reject local/private addresses and malformed content, and reduce
+failures to sanitized user-facing states. Strict metadata, qualifier, duration,
+and ambiguity checks prefer no result over a weak match.
+
+Managed lyric bodies and metadata are content-addressed, bounded, and written
+atomically under private `data/lyrics/` runtime storage. Fetched lyrics are not
+written into audio tags. Lyric text, provider queries/result IDs, cache paths,
+and raw errors do not enter App Status or public logs. Cache content and
+provider responses may be copyrighted and may identify a personal library;
+never commit or attach them. Publication/history and portable/source-compliance
+gates reject `.lrc` files, `.lyrics` cache payloads, lyric-cache text, and
+provider fixtures. See [Lyrics](docs/LYRICS.md).
 
 ## Metadata provider requests and artwork
 

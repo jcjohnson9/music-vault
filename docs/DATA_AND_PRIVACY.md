@@ -14,6 +14,7 @@ Depending on which features are used, local runtime data can include:
 - synchronization archive history and structured failed-item records;
 - downloaded audio and other media;
 - extracted or downloaded cover and artist artwork;
+- manually imported or provider-cached lyrics and negative-cache records;
 - field-level metadata provenance, source observations, confidence, locks, and
   change history;
 - metadata-remediation reports; and
@@ -33,9 +34,11 @@ Vault uses SQLite's backup API to create a timestamped copy under
 The generic `data/music_vault_status.json` App Status file contains operational
 counts, paths, playback state, and the latest sanitized synchronization result.
 Its additive Party Mode fields report only whether Party Mode is active, the
-selected preset, and whether decoded-buffer reactivity is currently available.
+selected preset, whether decoded-buffer reactivity is currently available, and
+optional boolean lyric availability/synchronization state.
 App Status never contains PCM, audio samples, spectra, or other decoded-audio
-content, and it does not contain the YouTube API key. Music Vault has no
+content. It also never contains lyric lines, provider queries/results, cached
+lyric paths, raw lyric errors, or the YouTube API key. Music Vault has no
 Watchtower relationship or integration.
 
 Synchronization supports public and unlisted playlists and performs anonymous
@@ -59,6 +62,37 @@ is configured, the API key is written only through the local secret-file
 mechanism; it is not added to JSON configuration, App Status, release manifests,
 or logs. The release neither bundles nor automatically downloads the
 `ffmpeg.exe` and `ffprobe.exe` command-line tools.
+
+## Optional Party Mode lyrics
+
+Lyrics display and online lookup are separate settings; both default to Off.
+Display state persists when Party Mode or the application closes. Music Vault
+first checks manually imported cache content, an adjacent same-stem `.lrc`,
+read-only embedded synchronized lyrics, cached synchronized provider content,
+an adjacent same-stem `.txt`, read-only embedded plain lyrics, and cached plain
+provider content. It never modifies an adjacent file or embedded audio tag and
+never writes fetched lyrics into personal media.
+
+Managed content is stored in the selected private runtime directory under
+`data/lyrics/`. The versioned index and content-addressed files use hashed
+filenames, content hashes, atomic writes, track/fingerprint metadata, source
+provenance, confidence, timestamps, and bounded negative-cache state. Cached
+content may identify a personal library and may be subject to third-party lyric
+rights; it is retained only for private local use. Cache files, manually
+imported lyrics, adjacent personal sidecars, and provider responses must never
+be committed, attached publicly, logged, or bundled. Git/history and portable/
+source-compliance gates reject lyric payloads and provider-fixture paths.
+
+When no local result exists, Music Vault asks before enabling online lookup.
+Keeping local-only mode produces no request. When explicitly enabled, the
+read-only LRCLIB lookup may send only the current track's title, artist,
+optional album, and duration. It sends no API key, cookie, media/audio bytes,
+playlist, filesystem path, or bulk-library inventory and performs no lyric
+upload or contribution. Requests are HTTPS-only to `lrclib.net`, bounded by
+timeouts and response limits, and protected by redirect/DNS public-address,
+content-type, JSON, and strict-match validation. Weak, conflicting, or
+ambiguous results are not automatically cached. Errors are sanitized and lyric
+text never enters App Status or public logs. See [Lyrics](LYRICS.md).
 
 ## Manual metadata and candidate review
 

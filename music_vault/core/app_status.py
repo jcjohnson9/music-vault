@@ -164,8 +164,14 @@ def write_app_status(db, config, extra=None) -> Path:
         },
         "sync": _previous_sync(status_file),
         "party_mode_active": False,
-        "party_mode_preset": "pulse",
+        "party_mode_preset": "static",
         "audio_reactivity_available": False,
+        "party_mode_lyrics_enabled": bool(
+            isinstance(config, dict)
+            and config.get("party_mode_lyrics_enabled") is True
+        ),
+        "lyrics_available": False,
+        "lyrics_synchronized": False,
         "paths": {
             "project_root": str(root),
             "data_dir": str(resolved_data_dir),
@@ -183,6 +189,9 @@ def write_app_status(db, config, extra=None) -> Path:
             "party_mode_active",
             "party_mode_preset",
             "audio_reactivity_available",
+            "party_mode_lyrics_enabled",
+            "lyrics_available",
+            "lyrics_synchronized",
         ):
             if field in extra:
                 payload[field] = extra[field]

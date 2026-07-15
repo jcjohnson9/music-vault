@@ -13,9 +13,9 @@ public or unlisted YouTube playlists into a persistent local library.
 licensing, and known-limit details.
 
 **Current main development line: v1.1.0 Development.** Batch 9 adds
-full-screen audio-reactive Party Mode to the source tree. No v1.1.0 tag or
-public v1.1.0 release has been created. Music Vault has no Watchtower
-relationship or runtime dependency.
+full-screen audio-reactive Party Mode; Batch 9.1 refines its musical motion and
+adds optional local-first lyrics. No v1.1.0 tag or public v1.1.0 release has
+been created. Music Vault has no Watchtower relationship or runtime dependency.
 
 ## Install the portable release
 
@@ -63,12 +63,22 @@ the entire computer.
 ## v1.1.0 development preview
 
 Current `main` includes Party Mode, an optional full-screen now-playing
-experience with Pulse, Starfield, and Aurora presets. It reuses the existing
-player, output, queue, playback context, volume, and transport behavior. Decoded
-audio features drive the visuals when the Qt backend provides them; otherwise a
-clearly bounded ambient fallback keeps the display useful without interrupting
-playback. Party Mode performs no networking, records no audio, and stores no PCM
-samples. See [Party Mode](docs/PARTY_MODE.md).
+experience with Static, Starfield, Aurora, Orb Cluster, Fireworks, and Pulse in
+that order. Static is the default. The album remains fixed in every preset
+except the restrained four-beat Pulse, while a smooth beat clock turns transient
+analysis into phrase-scale motion. Party Mode reuses the existing player,
+output, queue, playback context, volume, and transport behavior.
+
+Lyrics are Off by default and appear in a separate overlay directly above the
+playback bar. Local/manual, adjacent, embedded, and cached sources are checked
+before an optional consent-gated LRCLIB lookup. Synchronized lyrics follow the
+player position; plain lyrics are labeled and never presented as synchronized.
+Provider results are cached privately under `data/lyrics/`, never written into
+audio files, App Status, or public logs, and never bundled into releases. The
+visual pipeline records no audio or PCM and performs no networking; only the
+separately enabled lyrics lookup may send the current title, artist, optional
+album, and duration to LRCLIB. See [Party Mode](docs/PARTY_MODE.md) and
+[Lyrics](docs/LYRICS.md).
 
 ## First launch and local data
 
@@ -81,7 +91,7 @@ By default, a portable copy stores private runtime data in `data` beside
 `MusicVault.exe`. A different writable location can be selected during first-run
 setup; Settings reports and opens the active location. That location can contain
 the database, API-key file, configuration, status, downloaded media, artwork,
-archives, remediation state, and backups.
+archives, remediation state, private lyric cache, and backups.
 Back it up as private personal data and never add it to source control or a
 public release. See [Data and Privacy](docs/DATA_AND_PRIVACY.md).
 
@@ -158,9 +168,9 @@ proposing a change.
 Music Vault is a standalone application. Neutral Prime interoperability is only
 a possible external future option. Android, multiple source playlists, Best
 Original quality, an installer/updater, an editable queue panel, and personal
-radio are not V1 requirements. Batch 9 Party Mode is complete on the v1.1.0
-development line; Batch 10 Multiple Source Playlists is next. See the
-[roadmap](docs/ROADMAP.md).
+radio are not V1 requirements. Batch 9 Party Mode and Batch 9.1 motion/lyrics
+refinement are complete on the v1.1.0 development line; Batch 10 Multiple
+Source Playlists is next. See the [roadmap](docs/ROADMAP.md).
 
 ## Licensing
 

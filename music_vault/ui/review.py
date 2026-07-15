@@ -345,6 +345,52 @@ class ReviewNetworkAccessBlocked(RuntimeError):
     """Raised before explicitly reviewed Python code can access the network."""
 
 
+class _SyntheticReviewLyricsProvider:
+    """Bounded provider used only by the isolated packaged Party Mode review."""
+
+    name = "synthetic_review"
+
+    def __init__(self, expected_track_id: int) -> None:
+        self.expected_track_id = int(expected_track_id)
+        self.call_count = 0
+
+    def lookup(self, query: object, cancel_event: object | None = None):
+        from music_vault.lyrics.models import (
+            LyricLine,
+            LyricsResult,
+            LyricsSource,
+            LyricsStatus,
+        )
+
+        identity = getattr(query, "identity", None)
+        if identity is None:
+            raise ReviewPlanError("Synthetic lyrics query identity is unavailable.")
+        self.call_count += 1
+        if callable(getattr(cancel_event, "is_set", None)) and cancel_event.is_set():
+            return LyricsResult(
+                LyricsStatus.TEMPORARY_ERROR,
+                identity,
+                error_code="cancelled",
+            )
+        if str(identity.stable_id) != str(self.expected_track_id):
+            return LyricsResult(LyricsStatus.NO_MATCH, identity)
+        return LyricsResult(
+            LyricsStatus.AVAILABLE,
+            identity,
+            LyricsSource.PROVIDER,
+            (
+                LyricLine(0, "Synthetic cached opening line"),
+                LyricLine(1_200, "Synthetic cached current line"),
+                LyricLine(2_400, "Synthetic cached following line"),
+            ),
+            provider=self.name,
+            provider_result_id="synthetic-review-result",
+            provider_duration_ms=20_000,
+            attribution="Synthetic offline review provider",
+            confidence=1.0,
+        )
+
+
 def _install_review_network_guard() -> None:
     global _REVIEW_NETWORK_GUARD_INSTALLED
 
@@ -406,7 +452,8 @@ def _party_review_fixture(window: object, plan: ReviewPlan) -> dict[str, object]
         raise ReviewPlanError("Synthetic Party Mode track identities are invalid.")
 
     tracks = []
-    for track_id in track_ids:
+    sidecars: list[Path] = []
+    for index, track_id in enumerate(track_ids):
         track = window.db.get_track(track_id)
         if track is None:
             raise ReviewPlanError("Synthetic Party Mode track is missing.")
@@ -424,7 +471,16 @@ def _party_review_fixture(window: object, plan: ReviewPlan) -> dict[str, object]
             _ensure_under_runtime(resolved_cover, plan.runtime_root, "Party Mode artwork")
             if not resolved_cover.is_file():
                 raise ReviewPlanError("Synthetic Party Mode artwork is missing.")
+        sidecar_path = media_path.with_suffix(".lrc" if index == 0 else ".txt")
+        _ensure_under_runtime(sidecar_path, plan.runtime_root, "Party Mode lyrics")
+        try:
+            sidecar_size = sidecar_path.stat().st_size
+        except OSError as exc:
+            raise ReviewPlanError("Synthetic Party Mode lyrics are unavailable.") from exc
+        if not 0 < sidecar_size <= 64 * 1024 or sidecar_path.is_symlink():
+            raise ReviewPlanError("Synthetic Party Mode lyrics are invalid.")
         tracks.append(track)
+        sidecars.append(sidecar_path)
 
     if window.db.get_track(queue_track_id) is None:
         raise ReviewPlanError("Synthetic Party Mode queue track is missing.")
@@ -432,6 +488,8 @@ def _party_review_fixture(window: object, plan: ReviewPlan) -> dict[str, object]
         "track_ids": tuple(track_ids),
         "queue_track_id": queue_track_id,
         "tracks": tuple(tracks),
+        "synced_sidecar": sidecars[0],
+        "plain_sidecar": sidecars[1],
     }
 
 
@@ -534,6 +592,12 @@ def _validate_party_status(plan: ReviewPlan, *, expected_track_id: int) -> bool:
         raise ReviewPlanError("Party Mode App Status did not record the active surface.")
     if payload.get("party_mode_preset") != "aurora":
         raise ReviewPlanError("Party Mode App Status did not record the active preset.")
+    if not (
+        payload.get("party_mode_lyrics_enabled") is True
+        and payload.get("lyrics_available") is True
+        and payload.get("lyrics_synchronized") is True
+    ):
+        raise ReviewPlanError("Party Mode App Status lyrics state is inaccurate.")
     playback = payload.get("playback")
     if not isinstance(playback, dict) or not (
         playback.get("currently_playing") == expected_track_id
@@ -654,14 +718,142 @@ def validate_party_review_behaviors(
         label="decoded audio features",
         required=False,
     )
-    if party.current_preset != "pulse":
-        raise ReviewPlanError("Party Mode did not begin with the Pulse preset.")
-    _send_review_key(party, Qt.Key.Key_V, text="v")
-    if party.current_preset != "starfield":
-        raise ReviewPlanError("Party Mode did not switch to Starfield.")
-    _send_review_key(party, Qt.Key.Key_V, text="v")
-    if party.current_preset != "aurora":
-        raise ReviewPlanError("Party Mode did not switch to Aurora.")
+    if not (
+        party.current_preset == "static"
+        and party.preset_button.text() == "Static"
+        and window.config.get("party_mode_config_version") == 2
+        and window.config.get("party_mode_preset") == "static"
+    ):
+        raise ReviewPlanError("Party Mode legacy default did not migrate to Static.")
+    if party.rendering_active:
+        raise ReviewPlanError("Static retained its high-frequency visual timer.")
+
+    from music_vault.lyrics.cache import LyricsCache
+    from music_vault.lyrics.service import LyricsService
+
+    lyrics_cache = LyricsCache(plan.runtime_root / "data" / "lyrics")
+    lyrics_provider = _SyntheticReviewLyricsProvider(track_ids[1])
+    if getattr(party.lyrics_controller, "_service", None) is not None:
+        raise ReviewPlanError("Lyrics service started while lyrics were disabled.")
+    party.lyrics_controller._service_factory = lambda: LyricsService(
+        lyrics_provider,
+        lyrics_cache,
+        max_workers=1,
+    )
+    if not (
+        party._lyrics_settings.get("party_mode_lyrics_enabled") is False
+        and party._lyrics_settings.get("lyrics_online_lookup_enabled") is False
+        and not party.lyrics_controller.enabled
+        and party.lyrics_panel.presentation_mode == "hidden"
+    ):
+        raise ReviewPlanError("Party Mode lyrics did not default Off.")
+
+    locked_layout = (
+        party.canvas.geometry().getRect(),
+        party.title_label.geometry().getRect(),
+        party.artist_label.geometry().getRect(),
+        party.album_label.geometry().getRect(),
+    )
+    _send_review_key(party, Qt.Key.Key_L, text="l")
+    _wait_for_review_state(
+        app,
+        lambda: (
+            party.lyrics_controller.enabled
+            and party.lyrics_panel.lyrics_available
+            and party.lyrics_panel.lyrics_synchronized
+            and party.lyrics_panel.presentation_mode == "synchronized"
+        ),
+        timeout=2.0,
+        label="local synchronized lyrics",
+    )
+    player.setPosition(1_500)
+    _wait_for_review_state(
+        app,
+        lambda: player.position() >= 1_200,
+        timeout=2.0,
+        label="lyrics playback position",
+    )
+    party.lyrics_controller.set_position(1_500)
+    if not all(
+        label.text().strip()
+        for label in (
+            party.lyrics_panel.previous_label,
+            party.lyrics_panel.current_label,
+            party.lyrics_panel.next_label,
+        )
+    ):
+        raise ReviewPlanError("Synchronized lyric context did not render.")
+    if locked_layout != (
+        party.canvas.geometry().getRect(),
+        party.title_label.geometry().getRect(),
+        party.artist_label.geometry().getRect(),
+        party.album_label.geometry().getRect(),
+    ):
+        raise ReviewPlanError("Lyrics changed the approved Party Mode layout.")
+    root = party.centralWidget()
+    controls_top = party.controls_panel.mapTo(root, QPoint(0, 0)).y()
+    if party.lyrics_panel.geometry().bottom() >= controls_top:
+        raise ReviewPlanError("Party Mode lyrics overlap the playback controls.")
+    _send_review_key(party, Qt.Key.Key_H, text="h")
+    if party.overlay_visible or not party.lyrics_panel.isVisible():
+        raise ReviewPlanError("Auto-hidden controls also hid the lyrics panel.")
+    _send_review_key(party, Qt.Key.Key_H, text="h")
+
+    def settle_visual_transition(seconds: float = 0.72) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+
+    def fixed_album_geometry() -> bool:
+        frame = getattr(party.canvas, "_frame", None)
+        transform = getattr(frame, "album_transform", None)
+        return transform is not None and (
+            transform.scale,
+            transform.translate_x,
+            transform.translate_y,
+            transform.rotation_degrees,
+        ) == (1.0, 0.0, 0.0, 0.0)
+
+    expected_cycle = (
+        ("starfield", "Starfield"),
+        ("aurora", "Aurora"),
+        ("orb_cluster", "Orb Cluster"),
+        ("fireworks", "Fireworks"),
+        ("pulse", "Pulse"),
+        ("static", "Static"),
+    )
+    for expected_preset, expected_label in expected_cycle:
+        _send_review_key(party, Qt.Key.Key_V, text="v")
+        settle_visual_transition()
+        if not (
+            party.current_preset == expected_preset
+            and party.preset_button.text() == expected_label
+        ):
+            raise ReviewPlanError("Party Mode preset order or label is incorrect.")
+        frame = getattr(party.canvas, "_frame", None)
+        if expected_preset != "pulse" and not fixed_album_geometry():
+            raise ReviewPlanError("A non-Pulse preset changed album geometry.")
+        if expected_preset == "orb_cluster" and not getattr(frame, "orbs", ()):
+            raise ReviewPlanError("Orb Cluster did not render its bounded cluster.")
+        if expected_preset == "fireworks" and getattr(frame, "orbs", ()):
+            raise ReviewPlanError("Fireworks retained a persistent Orb Cluster.")
+        if expected_preset == "pulse":
+            transform = getattr(frame, "album_transform", None)
+            if transform is None or not (
+                1.0 <= transform.scale <= 1.04
+                and transform.translate_x == 0.0
+                and transform.translate_y == 0.0
+                and transform.rotation_degrees == 0.0
+            ):
+                raise ReviewPlanError("Pulse album motion exceeded its safe scale-only range.")
+    if party.rendering_active:
+        raise ReviewPlanError("Static did not stop rendering after a preset cycle.")
+    for expected_preset in ("starfield", "aurora"):
+        _send_review_key(party, Qt.Key.Key_V, text="v")
+        settle_visual_transition()
+        if party.current_preset != expected_preset:
+            raise ReviewPlanError("Party Mode did not restore Aurora for capture.")
 
     _send_review_key(party, Qt.Key.Key_Question, text="?")
     if not party._help_visible or not party.help_panel.isVisible():
@@ -739,6 +931,86 @@ def validate_party_review_behaviors(
     ):
         raise ReviewPlanError("Track transition lost the base playback context.")
 
+    _wait_for_review_state(
+        app,
+        lambda: (
+            party.lyrics_panel.lyrics_available
+            and not party.lyrics_panel.lyrics_synchronized
+            and party.lyrics_panel.presentation_mode == "plain"
+        ),
+        timeout=2.0,
+        label="local unsynchronized lyrics",
+    )
+    if not (
+        party.lyrics_panel.unsynced_label.isVisible()
+        and party.lyrics_panel.plain_view.toPlainText().strip()
+        and not party.lyrics_panel.current_label.isVisible()
+    ):
+        raise ReviewPlanError("Plain lyrics did not render honestly as unsynchronized.")
+
+    plain_sidecar = Path(fixture["plain_sidecar"])
+    disabled_sidecar = plain_sidecar.with_suffix(".txt.review-disabled")
+    _ensure_under_runtime(disabled_sidecar, plan.runtime_root, "disabled lyrics sidecar")
+    try:
+        plain_sidecar.replace(disabled_sidecar)
+        online_review_settings = dict(party._lyrics_settings)
+        online_review_settings.update(
+            {
+                "party_mode_lyrics_enabled": True,
+                "lyrics_online_lookup_enabled": True,
+                "lyrics_lookup_consent_version": 1,
+            }
+        )
+        party.lyrics_controller.apply_settings(online_review_settings)
+        _wait_for_review_state(
+            app,
+            lambda: (
+                lyrics_provider.call_count == 1
+                and party.lyrics_panel.lyrics_available
+                and party.lyrics_panel.lyrics_synchronized
+                and party.lyrics_controller.pending_count == 0
+            ),
+            timeout=3.0,
+            label="synthetic cached lyrics",
+        )
+        identity = party._lyrics_identity
+        cached = lyrics_cache.lookup_automatic(identity) if identity is not None else None
+        if cached is None or not cached.from_cache or not cached.synchronized:
+            raise ReviewPlanError("Synthetic provider lyrics were not cached safely.")
+    finally:
+        if disabled_sidecar.exists():
+            disabled_sidecar.replace(plain_sidecar)
+
+    if not window.play_base_track_by_id(track_ids[0]):
+        raise ReviewPlanError("Synthetic lyrics cache replay could not change tracks.")
+    _wait_for_review_state(
+        app,
+        lambda: party._current_track_id == track_ids[0]
+        and party.lyrics_panel.lyrics_synchronized,
+        timeout=3.0,
+        label="synchronized sidecar replay",
+    )
+    if not window.play_base_track_by_id(track_ids[1]):
+        raise ReviewPlanError("Synthetic lyrics cache replay could not return tracks.")
+    _wait_for_review_state(
+        app,
+        lambda: (
+            party._current_track_id == track_ids[1]
+            and party.lyrics_panel.lyrics_synchronized
+            and lyrics_provider.call_count == 1
+            and party.lyrics_controller.pending_count == 0
+        ),
+        timeout=3.0,
+        label="cached lyrics replay",
+    )
+    party.lyrics_controller.apply_settings(party._lyrics_settings)
+    if not (
+        window.config.get("party_mode_lyrics_enabled") is True
+        and window.config.get("lyrics_online_lookup_enabled") is False
+        and lyrics_provider.call_count == 1
+    ):
+        raise ReviewPlanError("Lyrics persistence or offline-default state is inaccurate.")
+
     escape_snapshot = _party_playback_snapshot(window)
     _send_review_key(party, Qt.Key.Key_Escape)
     _wait_for_review_state(
@@ -756,6 +1028,7 @@ def validate_party_review_behaviors(
             party.palette_timer.isActive(),
             party.overlay_timer.isActive(),
             window.party_audio_thread is not None,
+            party.lyrics_controller.pending_count,
         )
     ):
         raise ReviewPlanError("Party Mode retained render or analysis work after Escape.")
@@ -767,6 +1040,12 @@ def validate_party_review_behaviors(
         timeout=3.0,
         label="second F11 entry",
     )
+    if not (
+        party.lyrics_controller.enabled
+        and party.lyrics_panel.isVisible()
+        and party.lyrics_panel.lyrics_available
+    ):
+        raise ReviewPlanError("Lyrics state did not survive Party Mode close and reopen.")
     second_open_snapshot = _party_playback_snapshot(window)
     _send_review_key(party, Qt.Key.Key_F11)
     _wait_for_review_state(
@@ -776,6 +1055,8 @@ def validate_party_review_behaviors(
         label="F11 exit",
     )
     _assert_party_snapshot_preserved(window, second_open_snapshot, label="F11 exit")
+    if party.lyrics_controller.pending_count:
+        raise ReviewPlanError("Lyrics work remained pending after F11 exit.")
 
     _send_review_key(window, Qt.Key.Key_F11)
     _wait_for_review_state(
@@ -786,6 +1067,14 @@ def validate_party_review_behaviors(
     )
     if party.current_preset != "aurora" or not party.rendering_active:
         raise ReviewPlanError("Party Mode did not restore its persisted visual state.")
+    if not (
+        party.lyrics_controller.enabled
+        and party.lyrics_panel.isVisible()
+        and party.lyrics_panel.lyrics_available
+        and party.lyrics_panel.lyrics_synchronized
+        and party.lyrics_controller.pending_count == 0
+    ):
+        raise ReviewPlanError("Party Mode did not restore its persisted lyrics state.")
     if audio_features_observed:
         _wait_for_review_state(
             app,
@@ -825,11 +1114,27 @@ def validate_party_review_behaviors(
             "reactive" if audio_features_observed else "ambient_only"
         ),
         "ambient_fallback_verified": True,
+        "static_default_migrated": True,
+        "static_timer_stopped": True,
+        "six_presets_verified": True,
         "pulse_verified": True,
         "starfield_verified": True,
         "aurora_verified": True,
+        "orb_cluster_verified": True,
+        "fireworks_verified": True,
         "overlay_controls_verified": True,
         "track_transition_verified": True,
+        "lyrics_default_off": True,
+        "lyrics_toggle_persisted": True,
+        "synced_lyrics_verified": True,
+        "plain_lyrics_verified": True,
+        "lyrics_cache_verified": True,
+        "lyrics_track_transition_verified": True,
+        "lyrics_above_controls": True,
+        "lyrics_visible_overlay_hidden": True,
+        "synthetic_lyrics_provider": True,
+        "lyrics_provider_call_count": lyrics_provider.call_count,
+        "lyrics_tasks_bounded": True,
         "render_timer_stopped_on_exit": True,
         "analysis_worker_stopped_on_exit": True,
         "status_safe": status_safe,

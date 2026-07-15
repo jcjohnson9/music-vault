@@ -15,11 +15,31 @@ Notable changes to Music Vault are documented here. The format follows
   fallback when decoded buffers are unavailable.
 - Added original Party Mode icons and a synthetic, offscreen, network-disabled
   review and frame-benchmark tool.
+- Added Static, Orb Cluster, and Fireworks Party presets, a phrase-aware beat
+  clock, and centralized album-transform rules that keep the artwork fixed
+  outside the restrained four-beat Pulse mode.
+- Added optional premium synchronized/plain lyrics with local/manual,
+  sidecar, embedded, and private-cache discovery; consent-gated read-only
+  LRCLIB lookup; strict matching; negative caching; provider attribution; and
+  an original Lyrics icon.
 
 ### Changed
 
 - Advanced the current source tree to `1.1.0` on the `development` channel.
   The latest public stable release and immutable release tag remain `v1.0.0`.
+- Made Static the one-time migrated Party default, routed long-lived animation
+  through smooth beat/bar/phrase timing, and refined Starfield, Aurora, Orb
+  Cluster, Fireworks, and Pulse for bounded, comfortable motion.
+
+### Security and privacy
+
+- Kept lyrics Off and online lookup Off by default. Provider lookup requires
+  consent and sends only the current title, artist, optional album, and
+  duration; it sends no API key, audio, playlist, or bulk library inventory.
+- Added fail-closed Git/history/publication and portable/source-compliance
+  checks for private lyric caches, `.lrc`/`.lyrics`/lyric-text payloads, and
+  provider fixtures. Lyric text is never written to audio files, App Status,
+  or public logs.
 
 ### Fixed
 

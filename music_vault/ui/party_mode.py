@@ -25,11 +25,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
+    QFileDialog,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSlider,
     QStackedLayout,
@@ -39,20 +41,36 @@ from PySide6.QtWidgets import (
 )
 
 from music_vault.core.audio_analysis import AudioAnalyzer, AudioFeatures
+from music_vault.lyrics.models import TrackLyricsIdentity
 from music_vault.ui.components import ElidedLabel, IconButton
 from music_vault.ui.icons import render_icon_pixmap, ui_icon
+from music_vault.ui.party_lyrics import (
+    LYRICS_CONSENT_VERSION,
+    LYRICS_DEFAULTS,
+    PartyLyricsController,
+    PartyLyricsPanel,
+    normalize_lyrics_settings,
+    request_online_lyrics_consent,
+)
 from music_vault.ui.party_palette import (
     DEFAULT_PARTY_PALETTE,
     ArtworkPalette,
     PaletteExtractor,
     interpolate_palette,
 )
-from music_vault.ui.party_visuals import PRESETS, PartyCanvas
+from music_vault.ui.party_visuals import (
+    PRESETS,
+    PartyCanvas,
+    center_artwork_rect,
+    center_content_bottom,
+)
 from music_vault.ui.theme import COLORS
 
 
+PARTY_MODE_CONFIG_VERSION = 2
 PARTY_MODE_DEFAULTS: dict[str, object] = {
-    "party_mode_preset": "pulse",
+    "party_mode_config_version": PARTY_MODE_CONFIG_VERSION,
+    "party_mode_preset": "static",
     "party_mode_quality": "auto",
     "party_mode_frame_rate": "auto",
     "party_mode_reduced_motion": False,
@@ -61,6 +79,14 @@ PARTY_MODE_DEFAULTS: dict[str, object] = {
     "party_mode_overlay_timeout_seconds": 3,
 }
 PARTY_PRESETS = tuple(PRESETS)
+PARTY_PRESET_LABELS = {
+    "static": "Static",
+    "starfield": "Starfield",
+    "aurora": "Aurora",
+    "orb_cluster": "Orb Cluster",
+    "fireworks": "Fireworks",
+    "pulse": "Pulse",
+}
 PARTY_QUALITIES = ("auto", "low", "medium", "high")
 PARTY_FRAME_RATES = ("auto", "30", "60")
 
@@ -88,12 +114,23 @@ def normalize_party_mode_settings(config: Mapping[str, object] | None) -> dict[s
     """Return safe Party Mode values without discarding unrelated config."""
 
     source = config if isinstance(config, Mapping) else {}
+    configured_version = source.get("party_mode_config_version")
+    try:
+        version = int(configured_version) if not isinstance(configured_version, bool) else 0
+    except (TypeError, ValueError, OverflowError):
+        version = 0
+    requested_preset = _choice(
+        source.get("party_mode_preset"),
+        PARTY_PRESETS,
+        str(PARTY_MODE_DEFAULTS["party_mode_preset"]),
+    )
+    # Batch 9 shipped Pulse as an automatic default.  A missing config version
+    # therefore means a stored Pulse was not an intentional v2 selection.
+    if version < PARTY_MODE_CONFIG_VERSION and requested_preset == "pulse":
+        requested_preset = "static"
     return {
-        "party_mode_preset": _choice(
-            source.get("party_mode_preset"),
-            PARTY_PRESETS,
-            str(PARTY_MODE_DEFAULTS["party_mode_preset"]),
-        ),
+        "party_mode_config_version": PARTY_MODE_CONFIG_VERSION,
+        "party_mode_preset": requested_preset,
         "party_mode_quality": _choice(
             source.get("party_mode_quality"),
             PARTY_QUALITIES,
@@ -120,6 +157,18 @@ def normalize_party_mode_settings(config: Mapping[str, object] | None) -> dict[s
             source.get("party_mode_overlay_timeout_seconds")
         ),
     }
+
+
+def party_preset_label(value: object) -> str:
+    return PARTY_PRESET_LABELS.get(str(value), PARTY_PRESET_LABELS["static"])
+
+
+def party_preset_value(label: object) -> str:
+    normalized = str(label).strip().casefold()
+    for value, friendly in PARTY_PRESET_LABELS.items():
+        if normalized in {value.casefold(), friendly.casefold()}:
+            return value
+    return "static"
 
 
 class PartyAudioAnalysisThread(QThread):
@@ -196,6 +245,7 @@ class PartyModeWindow(QMainWindow):
     party_closed = Signal()
     preset_changed = Signal(str)
     audio_reactivity_changed = Signal(bool)
+    lyrics_status_changed = Signal(bool, bool, bool)
 
     def __init__(self, host: QMainWindow) -> None:
         super().__init__(None)
@@ -206,15 +256,18 @@ class PartyModeWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setMouseTracking(True)
         self._settings = normalize_party_mode_settings(getattr(host, "config", {}))
+        self._lyrics_settings = normalize_lyrics_settings(getattr(host, "config", {}))
         self._closed_notified = False
         self._player_signals_connected = False
         self._current_track_id: int | None = None
+        self._lyrics_identity: TrackLyricsIdentity | None = None
         self._current_cover_identity = ""
         self._overlay_visible = True
         self._overlay_hovered = False
         self._help_visible = False
         self._audio_reactivity_available = False
         self._last_audio_feature_at = 0.0
+        self._latest_audio_features: AudioFeatures | None = None
         self._last_nonzero_volume = int(getattr(host, "volume_percent", 70) or 70)
         self._palette_extractor = PaletteExtractor()
         self._palette = DEFAULT_PARTY_PALETTE
@@ -222,6 +275,13 @@ class PartyModeWindow(QMainWindow):
         self._palette_to = self._palette
         self._palette_started_at = 0.0
         self._build_ui()
+        self.lyrics_controller = PartyLyricsController(
+            self.lyrics_panel,
+            parent=self,
+        )
+        self.lyrics_controller.state_changed.connect(self._on_lyrics_state_changed)
+        self.lyrics_controller.consent_required.connect(self._request_lyrics_consent)
+        self.lyrics_panel.presentation_changed.connect(self._position_lyrics_panel)
 
         self.overlay_timer = QTimer(self)
         self.overlay_timer.setSingleShot(True)
@@ -239,7 +299,7 @@ class PartyModeWindow(QMainWindow):
         for child in self.findChildren(QWidget):
             child.setMouseTracking(True)
             child.installEventFilter(self)
-        self.apply_settings(self._settings)
+        self.apply_settings({**self._settings, **self._lyrics_settings})
         self.refresh_from_host(force=True)
 
     @property
@@ -280,7 +340,30 @@ class PartyModeWindow(QMainWindow):
         self.party_brand.setObjectName("PartyEyebrow")
         top_row.addWidget(self.party_brand)
         top_row.addStretch(1)
-        self.preset_button = QPushButton("Pulse")
+        self.lyrics_button = QPushButton("Lyrics")
+        self.lyrics_button.setObjectName("PartyGlassButton")
+        self.lyrics_button.setIcon(ui_icon("lyrics", 18, COLORS["text_primary"]))
+        self.lyrics_button.setToolTip("Lyrics (L)")
+        self.lyrics_button.setAccessibleName("Toggle Lyrics")
+        self.lyrics_button.clicked.connect(self.toggle_lyrics)
+        self.lyrics_button.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.lyrics_menu = QMenu(self.lyrics_button)
+        self.lyrics_menu.addAction("Refresh Lyrics", self.refresh_lyrics)
+        self.lyrics_menu.addAction("Import Lyrics…", self.import_lyrics)
+        self.lyrics_menu.addAction(
+            "Clear Automatic Lyrics", self.clear_automatic_lyrics
+        )
+        self.lyrics_menu.addSeparator()
+        self.lyrics_menu.addAction("Open Lyrics Settings", self.open_lyrics_settings)
+        self.lyrics_button.customContextMenuRequested.connect(
+            lambda point: self.lyrics_menu.exec(
+                self.lyrics_button.mapToGlobal(point)
+            )
+        )
+
+        self.preset_button = QPushButton("Static")
         self.preset_button.setObjectName("PartyGlassButton")
         self.preset_button.setIcon(ui_icon("visual-preset", 18, COLORS["text_primary"]))
         self.preset_button.setToolTip("Cycle visual preset (V)")
@@ -297,6 +380,7 @@ class PartyModeWindow(QMainWindow):
         self.exit_button.setToolTip("Exit Party Mode (Esc or F11)")
         self.exit_button.setAccessibleName("Exit full screen Party Mode")
         self.exit_button.clicked.connect(self.close)
+        top_row.addWidget(self.lyrics_button)
         top_row.addWidget(self.preset_button)
         top_row.addWidget(self.help_button)
         top_row.addWidget(self.exit_button)
@@ -421,7 +505,8 @@ class PartyModeWindow(QMainWindow):
         shortcuts = QLabel(
             "Space  Play / Pause     ← / →  Seek 10 seconds\n"
             "Ctrl+← / Ctrl+→  Previous / Next     ↑ / ↓  Volume\n"
-            "M  Mute     V  Visual preset     H  Overlay\n"
+            "M  Mute     V  Visual preset     H  Overlay     L  Lyrics\n"
+            "Page Up / Page Down  Scroll unsynchronized lyrics\n"
             "A  Auto     S  Shuffle     R  Repeat\n"
             "Esc or F11  Exit full screen"
         )
@@ -439,6 +524,13 @@ class PartyModeWindow(QMainWindow):
         stack.setAlignment(self.help_panel, Qt.AlignmentFlag.AlignCenter)
         stack.setCurrentWidget(self.overlay)
         self.root_stack = stack
+
+        # Lyrics are deliberately independent of the control overlay.  The
+        # panel is manually positioned above the existing player bar, so
+        # hiding controls never hides lyrics and no approved geometry moves.
+        self.lyrics_panel = PartyLyricsPanel(root)
+        self.lyrics_panel.hide()
+        self.lyrics_panel.raise_()
 
         self.setCentralWidget(root)
         self.setStyleSheet(self._stylesheet())
@@ -465,6 +557,10 @@ class PartyModeWindow(QMainWindow):
         }}
         QPushButton#PartyGlassButton:hover, QPushButton#PartyExitButton:hover, QPushButton#PartyModeButton:hover {{
             background: rgba(255,255,255,30); border-color: rgba(255,255,255,62);
+        }}
+        QPushButton#PartyGlassButton[active="true"] {{
+            color: {COLORS['accent']}; border-color: {COLORS['accent']};
+            background: rgba(78, 205, 196, 18);
         }}
         QPushButton#PartyModeButton[active="true"] {{ color: {COLORS['accent']}; border-color: {COLORS['accent']}; }}
         QPushButton#IconButton {{
@@ -494,10 +590,14 @@ class PartyModeWindow(QMainWindow):
 
     def apply_settings(self, settings: Mapping[str, object] | None) -> None:
         merged = dict(self._settings)
+        lyrics_merged = dict(self._lyrics_settings)
         if isinstance(settings, Mapping):
             merged.update(settings)
+            lyrics_merged.update(settings)
         self._settings = normalize_party_mode_settings(merged)
+        self._lyrics_settings = normalize_lyrics_settings(lyrics_merged)
         self.canvas.set_preset(str(self._settings["party_mode_preset"]))
+        self._apply_canvas_audio_features()
         self.canvas.set_quality(str(self._settings["party_mode_quality"]))
         self.canvas.set_reduced_motion(bool(self._settings["party_mode_reduced_motion"]))
         if hasattr(self.canvas, "set_show_artwork"):
@@ -505,8 +605,17 @@ class PartyModeWindow(QMainWindow):
         frame_rate = str(self._settings["party_mode_frame_rate"])
         if hasattr(self.canvas, "set_frame_rate"):
             self.canvas.set_frame_rate(frame_rate)
-        self.preset_button.setText(str(self._settings["party_mode_preset"]).title())
+        self.preset_button.setText(
+            party_preset_label(self._settings["party_mode_preset"])
+        )
+        self.lyrics_panel.set_reduced_motion(
+            bool(self._settings["party_mode_reduced_motion"])
+        )
+        self.lyrics_controller.apply_settings(self._lyrics_settings)
+        self._update_lyrics_button()
         self.refresh_from_host(force=True)
+        self.lyrics_controller.resume()
+        self._position_lyrics_panel()
         self._restart_overlay_timer()
 
     def show_on_screen(self, screen: object | None) -> None:
@@ -530,6 +639,7 @@ class PartyModeWindow(QMainWindow):
         self.state_timer.start()
         self.fallback_timer.start()
         self.show_overlay()
+        self._position_lyrics_panel()
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
@@ -554,6 +664,7 @@ class PartyModeWindow(QMainWindow):
             control is watched or control.isAncestorOf(watched)
             for control in (
                 self.controls_panel,
+                self.lyrics_button,
                 self.preset_button,
                 self.help_button,
                 self.exit_button,
@@ -595,6 +706,14 @@ class PartyModeWindow(QMainWindow):
             self.toggle_mute()
         elif key == Qt.Key.Key_V:
             self.cycle_preset()
+        elif key == Qt.Key.Key_L:
+            self.toggle_lyrics()
+        elif key == Qt.Key.Key_PageUp:
+            if not self.lyrics_panel.page_scroll(-1):
+                return False
+        elif key == Qt.Key.Key_PageDown:
+            if not self.lyrics_panel.page_scroll(1):
+                return False
         elif key == Qt.Key.Key_H:
             self.toggle_overlay()
         elif key == Qt.Key.Key_S:
@@ -665,11 +784,14 @@ class PartyModeWindow(QMainWindow):
         self._help_visible = not self._help_visible
         self.help_panel.setVisible(self._help_visible)
         if self._help_visible:
+            self.lyrics_panel.hide()
+            self._update_firework_lyrics_protection()
             self.root_stack.setCurrentWidget(self.help_panel)
             self.show_overlay()
             self.overlay_timer.stop()
         else:
             self.root_stack.setCurrentWidget(self.overlay)
+            self._position_lyrics_panel()
             self._restart_overlay_timer()
 
     def cycle_preset(self) -> str:
@@ -678,13 +800,108 @@ class PartyModeWindow(QMainWindow):
         preset = PARTY_PRESETS[(index + 1) % len(PARTY_PRESETS)]
         self._settings["party_mode_preset"] = preset
         self.canvas.set_preset(preset)
-        self.preset_button.setText(preset.title())
+        self._apply_canvas_audio_features()
+        self.preset_button.setText(party_preset_label(preset))
         host = self._host()
         if host is not None:
             host.config["party_mode_preset"] = preset
+            host.config["party_mode_config_version"] = PARTY_MODE_CONFIG_VERSION
             host.save_config()
         self.preset_changed.emit(preset)
         return preset
+
+    def toggle_lyrics(self) -> bool:
+        enabled = not bool(self._lyrics_settings["party_mode_lyrics_enabled"])
+        self._lyrics_settings["party_mode_lyrics_enabled"] = enabled
+        host = self._host()
+        if host is not None:
+            host.config.update(self._lyrics_settings)
+            host.save_config()
+        self.lyrics_controller.apply_settings(self._lyrics_settings)
+        self._update_lyrics_button()
+        self._on_lyrics_state_changed(
+            self.lyrics_controller.lyrics_available,
+            self.lyrics_controller.lyrics_synchronized,
+        )
+        return enabled
+
+    def refresh_lyrics(self) -> None:
+        if not bool(self._lyrics_settings["party_mode_lyrics_enabled"]):
+            self.toggle_lyrics()
+        self.lyrics_controller.refresh()
+
+    def import_lyrics(self) -> None:
+        if self._lyrics_identity is None:
+            return
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Import Lyrics",
+            str(Path(self._lyrics_identity.media_path or "").parent),
+            "Lyrics (*.lrc *.txt)",
+        )
+        if not path:
+            return
+        if not bool(self._lyrics_settings["party_mode_lyrics_enabled"]):
+            self.toggle_lyrics()
+        self.lyrics_controller.import_manual(path)
+
+    def clear_automatic_lyrics(self) -> None:
+        self.lyrics_controller.clear_automatic()
+
+    def prepare_lyrics_cache_clear(self) -> None:
+        self.lyrics_controller.suspend()
+
+    def lyrics_cache_cleared(self) -> None:
+        self.lyrics_controller.reload_local_only()
+
+    def open_lyrics_settings(self) -> None:
+        host = self._host()
+        self.close()
+        if host is not None:
+            pages = getattr(host, "pages", None)
+            if pages is not None:
+                pages.setCurrentIndex(2)
+            host.show()
+            host.raise_()
+            host.activateWindow()
+
+    def _request_lyrics_consent(self, identity: object) -> None:
+        if not isinstance(identity, TrackLyricsIdentity):
+            return
+        enabled = request_online_lyrics_consent(self, identity)
+        self._lyrics_settings["lyrics_lookup_consent_version"] = (
+            LYRICS_CONSENT_VERSION
+        )
+        self._lyrics_settings["lyrics_online_lookup_enabled"] = enabled
+        host = self._host()
+        if host is not None:
+            host.config.update(self._lyrics_settings)
+            host.save_config()
+            refresh = getattr(host, "refresh_settings_status", None)
+            if callable(refresh):
+                refresh()
+        self.lyrics_controller.apply_settings(self._lyrics_settings)
+
+    def _update_lyrics_button(self) -> None:
+        enabled = bool(self._lyrics_settings["party_mode_lyrics_enabled"])
+        self.lyrics_button.setProperty("active", enabled)
+        self.lyrics_button.setText("Lyrics")
+        self.lyrics_button.setToolTip("Lyrics (L)")
+        self.lyrics_button.style().unpolish(self.lyrics_button)
+        self.lyrics_button.style().polish(self.lyrics_button)
+
+    def _on_lyrics_state_changed(
+        self,
+        available: bool,
+        synchronized: bool,
+    ) -> None:
+        enabled = bool(self._lyrics_settings["party_mode_lyrics_enabled"])
+        self._position_lyrics_panel()
+        self.lyrics_status_changed.emit(
+            enabled,
+            bool(available),
+            bool(synchronized),
+        )
 
     def on_audio_features(self, features: AudioFeatures) -> None:
         if not isinstance(features, AudioFeatures):
@@ -700,8 +917,18 @@ class PartyModeWindow(QMainWindow):
         )
         if available:
             self._last_audio_feature_at = time.monotonic()
+            self._latest_audio_features = features
+        else:
+            self._latest_audio_features = None
         self._set_audio_reactivity_available(available)
-        self.canvas.set_features(features if available else None)
+        self._apply_canvas_audio_features()
+
+    def _apply_canvas_audio_features(self) -> None:
+        """Keep Static genuinely idle while retaining the latest audio state."""
+
+        if self.current_preset == "static":
+            return
+        self.canvas.set_features(self._latest_audio_features)
 
     def _update_audio_capability(self) -> None:
         if self._last_audio_feature_at <= 0.0:
@@ -712,6 +939,8 @@ class PartyModeWindow(QMainWindow):
 
     def _set_audio_reactivity_available(self, available: bool) -> None:
         normalized = bool(available)
+        if not normalized:
+            self._latest_audio_features = None
         if normalized == self._audio_reactivity_available:
             return
         self._audio_reactivity_available = normalized
@@ -740,6 +969,8 @@ class PartyModeWindow(QMainWindow):
 
     def _set_track(self, track: object | None) -> None:
         if track is None:
+            self._lyrics_identity = None
+            self.lyrics_controller.set_track(None)
             self.title_label.setText("Choose a song to begin")
             self.artist_label.setText("Music Vault is ready")
             self.album_label.setText("")
@@ -760,6 +991,18 @@ class PartyModeWindow(QMainWindow):
             cover_path = str(track["cover_path"] or "")
         except (KeyError, TypeError, IndexError):
             return
+        host = self._host()
+        player = getattr(host, "player", None) if host is not None else None
+        duration = max(0, int(player.duration())) if player is not None else 0
+        self._lyrics_identity = TrackLyricsIdentity(
+            track_id=self._current_track_id or "current",
+            title=title,
+            artist=artist,
+            album=album,
+            duration_ms=duration or None,
+            media_path=path,
+        )
+        self.lyrics_controller.set_track(self._lyrics_identity)
         self.title_label.setText(title)
         self.artist_label.setText(artist)
         self.album_label.setText(album)
@@ -854,11 +1097,30 @@ class PartyModeWindow(QMainWindow):
             with QSignalBlocker(self.progress_slider):
                 self.progress_slider.setValue(value)
         self.elapsed_label.setText(self._format_time(value))
+        self.lyrics_controller.set_position(value)
 
     def _set_duration(self, duration: int) -> None:
         value = max(0, int(duration))
         self.progress_slider.setRange(0, value)
         self.duration_label.setText(self._format_time(value))
+        identity = self._lyrics_identity
+        if (
+            identity is not None
+            and value > 0
+            and (
+                identity.duration_ms is None
+                or abs(identity.duration_ms - value) > 1_000
+            )
+        ):
+            self._lyrics_identity = TrackLyricsIdentity(
+                track_id=identity.track_id,
+                title=identity.title,
+                artist=identity.artist,
+                album=identity.album,
+                duration_ms=value,
+                media_path=identity.media_path,
+            )
+            self.lyrics_controller.set_track(self._lyrics_identity)
 
     def _set_playback_state(self, state: object) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
@@ -948,7 +1210,86 @@ class PartyModeWindow(QMainWindow):
             self._sync_modes()
 
     def performance_metrics(self) -> dict[str, object]:
-        return dict(self.canvas.performance_metrics())
+        metrics = dict(self.canvas.performance_metrics())
+        metrics["lyrics_pending_count"] = self.lyrics_controller.pending_count
+        return metrics
+
+    def resizeEvent(self, event: object) -> None:
+        super().resizeEvent(event)
+        self._position_lyrics_panel()
+
+    def _position_lyrics_panel(self) -> None:
+        panel = getattr(self, "lyrics_panel", None)
+        root = self.centralWidget()
+        if panel is None or root is None:
+            return
+        if (
+            self._help_visible
+            or not bool(self._lyrics_settings["party_mode_lyrics_enabled"])
+            or panel.presentation_mode == "hidden"
+        ):
+            panel.hide()
+            self._update_firework_lyrics_protection()
+            return
+        width = max(320, min(1_040, root.width() - 72))
+        mode = panel.presentation_mode
+        compact = root.height() <= 800
+        panel.set_compact(compact)
+        preferred_height = {
+            "synchronized": 154,
+            "plain": 292,
+            "state": 96,
+        }.get(mode, 120)
+        if compact:
+            preferred_height = {
+                "synchronized": 24,
+                "state": 24,
+                "plain": 140,
+            }.get(mode, 24)
+        x = max(0, (root.width() - width) // 2)
+        controls_top = self.controls_panel.mapTo(
+            root, self.controls_panel.rect().topLeft()
+        ).y()
+        protected_bottom = round(center_content_bottom(root.width(), root.height()))
+        content_y = protected_bottom + 4
+        available_height = max(0, controls_top - 8 - content_y)
+        minimum_height = 120 if mode == "plain" else preferred_height
+        if available_height >= minimum_height:
+            height = min(preferred_height, available_height)
+            y = controls_top - 8 - height
+        else:
+            artwork_top = center_artwork_rect(root.width(), root.height()).top()
+            height = preferred_height
+            y = max(76, round(artwork_top - height - 12))
+        panel.setGeometry(x, y, width, height)
+        panel.show()
+        panel.raise_()
+        self._update_firework_lyrics_protection()
+
+    def _update_firework_lyrics_protection(self) -> None:
+        """Keep firework burst centers outside the visible lyrics overlay."""
+
+        panel = getattr(self, "lyrics_panel", None)
+        canvas = getattr(self, "canvas", None)
+        if panel is None or canvas is None:
+            return
+        if not panel.isVisible() or canvas.width() <= 0 or canvas.height() <= 0:
+            canvas.set_firework_protected_rects(())
+            return
+        top_left = panel.mapTo(canvas, panel.rect().topLeft())
+        padding = 12
+        canvas_width = float(canvas.width())
+        canvas_height = float(canvas.height())
+        canvas.set_firework_protected_rects(
+            (
+                (
+                    (top_left.x() - padding) / canvas_width,
+                    (top_left.y() - padding) / canvas_height,
+                    (top_left.x() + panel.width() + padding) / canvas_width,
+                    (top_left.y() + panel.height() + padding) / canvas_height,
+                ),
+            )
+        )
 
     def _host(self) -> Any | None:
         return self._host_ref()
@@ -982,7 +1323,14 @@ class PartyModeWindow(QMainWindow):
                     pass
         self._player_signals_connected = False
 
+    def shutdown(self) -> None:
+        """Close the reusable surface and release its one lyrics worker."""
+
+        self.close()
+        self.lyrics_controller.close()
+
     def closeEvent(self, event: object) -> None:
+        self.lyrics_controller.suspend()
         self._disconnect_player_signals()
         self._overlay_hovered = False
         self.overlay_timer.stop()
@@ -1003,6 +1351,7 @@ class PartyModeWindow(QMainWindow):
     def hideEvent(self, event: object) -> None:
         """Suspend all Party Mode work whenever the top-level surface is hidden."""
 
+        self.lyrics_controller.suspend()
         self._disconnect_player_signals()
         self._overlay_hovered = False
         self.overlay_timer.stop()
@@ -1010,7 +1359,9 @@ class PartyModeWindow(QMainWindow):
         self.fallback_timer.stop()
         self.palette_timer.stop()
         self.canvas.stop_rendering()
+        self.canvas.set_firework_protected_rects(())
         self._last_audio_feature_at = 0.0
+        self._latest_audio_features = None
         self._set_audio_reactivity_available(False)
         self._notify_closed()
         super().hideEvent(event)
@@ -1024,10 +1375,14 @@ class PartyModeWindow(QMainWindow):
 
 __all__ = [
     "PARTY_FRAME_RATES",
+    "PARTY_MODE_CONFIG_VERSION",
     "PARTY_MODE_DEFAULTS",
+    "PARTY_PRESET_LABELS",
     "PARTY_PRESETS",
     "PARTY_QUALITIES",
     "PartyAudioAnalysisThread",
     "PartyModeWindow",
     "normalize_party_mode_settings",
+    "party_preset_label",
+    "party_preset_value",
 ]
