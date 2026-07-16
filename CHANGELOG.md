@@ -7,6 +7,15 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Added
 
+- Added persistent saved YouTube playlist sources with Library Only and Managed
+  Local Playlist destinations, deterministic enable/order controls, sequential
+  Sync Selected and Sync All execution, Stop After Current, per-source run and
+  failure history, and a premium multi-source Sync Center.
+- Added schema-v5 source definitions, durable playlist-item occurrences,
+  cross-source video-to-track identity, non-destructive identity-conflict
+  diagnostics, origin-aware playlist materialization, and safe source
+  detachment/archive behavior.
+
 - Added full-screen Party Mode with artwork-led Pulse, Starfield, and Aurora
   presets, a readable auto-hiding control overlay, keyboard controls, reduced
   motion, and adaptive quality.
@@ -30,8 +39,19 @@ Notable changes to Music Vault are documented here. The format follows
 - Made Static the one-time migrated Party default, routed long-lived animation
   through smooth beat/bar/phrase timing, and refined Starfield, Aurora, Orb
   Cluster, Fireworks, and Pulse for bounded, comfortable motion.
+- Replaced the one-playlist-at-a-time synchronization screen with persistent
+  multiple-source management. Complete source snapshots may reconcile remote
+  removals; failed or partial enumeration preserves the last known-good
+  membership and local playlist order.
 
 ### Security and privacy
+
+- Kept saved source URLs, labels, remote titles, playlist/item identities,
+  membership snapshots, local source folders, and per-item failures inside
+  private runtime data. App Status receives aggregate source/batch values only.
+- Preserved one canonical local track/media identity across overlapping
+  sources, and made source removal, remote removal, and destination changes
+  explicitly non-destructive to media, metadata, artwork, lyrics, and history.
 
 - Kept lyrics Off and online lookup Off by default. Provider lookup requires
   consent and sends only the current title, artist, optional album, and

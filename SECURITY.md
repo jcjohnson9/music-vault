@@ -11,7 +11,8 @@ attachment, screenshot, log excerpt, or reproduction repository:
 - Music Vault database, configuration, archive, failure, or status files
 - Downloaded media, cover art, or other copyrighted/private assets
 - Cached, imported, adjacent, embedded, or provider-returned lyric content
-- Private playlist URLs or contents
+- Saved/private playlist URLs, labels, titles, item IDs, membership snapshots,
+  destination mappings, source-run history, or contents
 - Personal filesystem paths or usernames
 - Unsanitized logs that may contain any of the above
 
@@ -23,6 +24,20 @@ Synchronization sanitizes external error text before it reaches the activity
 log, structured failure history, or App Status. Common Google API keys, query
 tokens, bearer/authorization values, and private-key blocks are redacted. The
 supported public/unlisted workflow does not silently access browser cookies.
+
+Batch 10 source definitions and occurrence/run history remain in the private
+SQLite runtime database. App Status exposes aggregate source/batch counts only;
+it excludes source URLs, labels, titles, playlist/item IDs, destination names,
+local source folders, memberships, and per-item errors. Source activity logs
+are bounded and sanitized and must not contain API keys, authorization headers,
+cookies, raw provider responses, or unrestricted private paths.
+
+Source synchronization is explicit and sequential. Saving a source does not
+make a request, no source runs at startup, and the application does not support
+private-playlist OAuth or Google login. Only complete pagination may reconcile
+remote removals. Failed or partial enumeration preserves the last known-good
+snapshot. Remote removal, source archive/detachment, and destination changes
+cannot delete media or rewrite metadata, artwork, lyrics, or histories.
 
 ## Portable release integrity
 

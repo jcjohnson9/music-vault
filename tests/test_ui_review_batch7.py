@@ -204,7 +204,7 @@ def test_capture_seed_is_schema4_has_valid_mp3_and_no_key(tmp_path):
         from music_vault.metadata.tag_writer import inspect_mp3
 
         assert inspect_mp3(mp3).audio_payload_sha256
-        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         db.close()

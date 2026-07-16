@@ -54,6 +54,14 @@ data/backups/metadata_jobs/
 data/provider_cache/
 data/lyrics/
 
+# Multiple-source sync runtime state must stay private
+source_membership_snapshots/
+sync_source_snapshots/
+sync_source_runtime/
+*source_membership_snapshot*.json
+*sync_source_snapshot*.json
+*sync_source_run*.json
+
 # Lyrics are private runtime/third-party content, not source fixtures
 *.lrc
 *.lyrics

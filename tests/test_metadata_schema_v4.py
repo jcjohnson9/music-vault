@@ -127,11 +127,11 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
-def test_new_database_initializes_schema_v4_with_remediation_structures(tmp_path):
+def test_new_database_keeps_schema_v4_remediation_structures_at_latest_schema(tmp_path):
     db = MusicVaultDB(tmp_path / "new.sqlite3", backup_dir=tmp_path / "backups")
 
-    assert CURRENT_SCHEMA_VERSION == 4
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert CURRENT_SCHEMA_VERSION == 5
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
     assert db.last_migration_backup is None
     tables = {
         str(row[0])
@@ -200,12 +200,12 @@ def test_new_database_initializes_schema_v4_with_remediation_structures(tmp_path
     db.close()
 
 
-def test_v3_to_v4_migration_is_backed_up_additive_and_preserves_all_state(tmp_path):
+def test_v3_to_latest_migration_is_backed_up_additive_and_preserves_all_state(tmp_path):
     path = _v3_database(tmp_path / "library.sqlite3")
     backups = tmp_path / "backups"
     db = MusicVaultDB(path, backup_dir=backups)
 
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
     assert db.last_migration_backup and db.last_migration_backup.is_file()
     with sqlite3.connect(db.last_migration_backup) as backup:
         assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -278,14 +278,14 @@ def test_v3_to_v4_migration_is_backed_up_additive_and_preserves_all_state(tmp_pa
     reopened.close()
 
 
-def test_current_v4_open_idempotently_repairs_prerelease_remediation_schema(tmp_path):
+def test_current_v4_open_migrates_and_repairs_prerelease_remediation_schema(tmp_path):
     path = _v3_database(tmp_path / "prerelease-v4.sqlite3")
     with sqlite3.connect(path) as conn:
         conn.execute("PRAGMA user_version=4")
 
     db = MusicVaultDB(path, backup_dir=tmp_path / "backups")
     try:
-        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert "approved_fields" in _table_columns(db.conn, REMEDIATION_ITEMS_TABLE)
         assert "prepared_file" in _table_columns(db.conn, REMEDIATION_ITEMS_TABLE)
         assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
