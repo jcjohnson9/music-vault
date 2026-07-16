@@ -116,6 +116,27 @@ def test_candidate_path_policy_rejects_lyric_payloads_but_not_source() -> None:
     assert publication._path_violations("docs/LYRICS.md") == []
 
 
+def test_candidate_path_policy_rejects_multiple_source_runtime_snapshots() -> None:
+    for relative in (
+        "source_membership_snapshots/current.json",
+        "sync_source_snapshots/source-a.json",
+        "sync_source_runtime/active.json",
+        "diagnostics/sync_source_snapshot_private.json",
+        "diagnostics/source_membership_snapshot_private.json",
+        "diagnostics/sync_source_run_private.json",
+    ):
+        rules = {
+            rule for rule, _remediation in publication._path_violations(relative)
+        }
+        assert rules & {
+            "forbidden local/generated directory",
+            "private source-sync runtime file",
+        }
+
+    assert publication._path_violations("tests/test_batch10_sync_sources.py") == []
+    assert publication._path_violations("docs/MULTIPLE_SOURCE_PLAYLISTS.md") == []
+
+
 def test_history_scanner_detects_lyrics_without_printing_path(
     tmp_path: Path, capsys
 ) -> None:

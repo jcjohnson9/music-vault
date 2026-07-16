@@ -112,6 +112,12 @@ from music_vault.core.paths import (
     youtube_failed_ids_path,
 )
 from music_vault.core.safety import sanitize_error_text
+from music_vault.core.multi_source_sync import MultiSourceSyncOrchestrator
+from music_vault.core.playlist_membership import PlaylistMembershipService
+from music_vault.core.sync_sources import (
+    SyncSourceService,
+    normalize_youtube_playlist_source,
+)
 from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
 from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
 from music_vault.metadata.service import MetadataChangeResult, MetadataService
@@ -169,6 +175,12 @@ from music_vault.ui.party_lyrics import (
 )
 from music_vault.lyrics.cache import LyricsCache
 from music_vault.ui.review import schedule_ui_review
+from music_vault.ui.sync_center import (
+    SyncCenterController,
+    SyncCenterWidget,
+    explain_source_managed_removal,
+    multi_source_status_payload,
+)
 from music_vault.ui.theme import COLORS, application_stylesheet, apply_dark_title_bar, repolish
 from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
 
@@ -264,6 +276,14 @@ class MusicVaultWindow(QMainWindow):
             youtube_download_root=self.config.get("download_folder"),
             legacy_failure_file=youtube_failed_ids_path(),
         )
+        self.playlist_membership_service = PlaylistMembershipService(self.db)
+        self.sync_source_service = SyncSourceService(
+            self.db,
+            membership_service=self.playlist_membership_service,
+        )
+        self._migrate_legacy_sync_source_from_config()
+        self.sync_center_controller: SyncCenterController | None = None
+        self._close_after_sync = False
         self.metadata_service = MetadataService(self.db)
         self.artist_image_cache = ArtistImageCache()
         self.artist_image_service = ArtistImageService(
@@ -353,11 +373,32 @@ class MusicVaultWindow(QMainWindow):
         self.load_library()
         self.load_playlists()
         self.refresh_settings_status()
-        self.write_app_status()
+        self.on_multi_source_status_transition({})
 
 
     def config_file_path(self) -> Path:
         return config_path()
+
+    def _migrate_legacy_sync_source_from_config(self) -> None:
+        """Register one genuine persisted legacy URL without exposing or syncing it."""
+
+        for key in (
+            "youtube_playlist_url",
+            "youtube_sync_playlist_url",
+            "playlist_url",
+        ):
+            value = self.config.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                normalize_youtube_playlist_source(value)
+                self.sync_source_service.create_source(
+                    value,
+                    destination_kind="library",
+                )
+            except Exception:
+                pass
+            return
 
     def default_config(self) -> dict:
         return {
@@ -881,11 +922,23 @@ class MusicVaultWindow(QMainWindow):
         title_row = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(4)
+        page_heading = QHBoxLayout()
+        page_heading.setSpacing(8)
         self.page_title = QLabel("Library")
         self.page_title.setObjectName("PageTitle")
+        self.playlist_managed_badge = QLabel("Managed Source")
+        self.playlist_managed_badge.setObjectName("ManagedSourceBadge")
+        self.playlist_managed_badge.setToolTip(
+            "This local playlist is ordered by a saved synchronization source."
+        )
+        self.playlist_managed_badge.setAccessibleName("Managed source playlist")
+        self.playlist_managed_badge.hide()
         self.page_subtitle = QLabel("Your local music collection, synced and ready.")
         self.page_subtitle.setObjectName("MutedLabel")
-        title_col.addWidget(self.page_title)
+        page_heading.addWidget(self.page_title)
+        page_heading.addWidget(self.playlist_managed_badge)
+        page_heading.addStretch(1)
+        title_col.addLayout(page_heading)
         title_col.addWidget(self.page_subtitle)
         title_row.addLayout(title_col, 1)
 
@@ -1148,151 +1201,136 @@ class MusicVaultWindow(QMainWindow):
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
 
-        sync_content = QWidget()
-        sync_content.setObjectName("SyncContent")
-        layout = QVBoxLayout(sync_content)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        self.sync_center = SyncCenterWidget(page)
+        self.sync_center_controller = SyncCenterController(
+            self.sync_center,
+            self.sync_source_service,
+            normalize_source=normalize_youtube_playlist_source,
+            orchestrator_factory=self.create_multi_source_orchestrator,
+            playlist_provider=self.db.list_playlists,
+            playlist_creator=self.db.create_playlist,
+            dialog_parent=self,
+        )
+        self.sync_center_controller.sources_changed.connect(
+            self.on_sync_sources_changed
+        )
+        self.sync_center_controller.sync_started.connect(
+            lambda: self.write_app_status()
+        )
+        self.sync_center_controller.sync_finished.connect(
+            self.multi_source_sync_finished
+        )
+        self.sync_center_controller.status_transition.connect(
+            self.on_multi_source_status_transition
+        )
 
-        header = QFrame()
-        header.setObjectName("TopHeader")
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(22, 18, 22, 18)
+        # Compatibility aliases retain the established single-result helpers
+        # and older non-network UI checks without exposing the obsolete URL form.
+        self.youtube_sync_btn = self.sync_center.sync_all_button
+        self.youtube_log = self.sync_center.activity_log
+        self.sync_progress = self.sync_center.progress
+        self.sync_status_card = self.sync_center.summary_cards["completed_sources"]
+        self.sync_downloaded_card = self.sync_center.summary_cards["downloaded"]
+        self.sync_skipped_card = self.sync_center.summary_cards["existing"]
+        self.sync_failed_card = self.sync_center.summary_cards["failed_items"]
 
-        title = QLabel("Sync Center")
-        title.setObjectName("PageTitle")
-        subtitle = QLabel("Bring authorized playlist music into Music Vault.")
-        subtitle.setObjectName("MutedLabel")
-
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
-
-        metric_row = QHBoxLayout()
-        self.sync_status_card = self.sync_metric_card("Status", "Idle")
-        self.sync_downloaded_card = self.sync_metric_card("Downloaded", "0")
-        self.sync_skipped_card = self.sync_metric_card("Existing", "—")
-        self.sync_failed_card = self.sync_metric_card("Failed", "0")
-
-        metric_row.addWidget(self.sync_status_card)
-        metric_row.addWidget(self.sync_downloaded_card)
-        metric_row.addWidget(self.sync_skipped_card)
-        metric_row.addWidget(self.sync_failed_card)
-
-        sync_card = QFrame()
-        sync_card.setObjectName("Card")
-        sync_layout = QVBoxLayout(sync_card)
-        sync_layout.setContentsMargins(18, 18, 18, 18)
-        sync_layout.setSpacing(12)
-
-        form_title = QLabel("Playlist Sync")
-        form_title.setObjectName("CardTitle")
-
-        self.sync_quality_label = QLabel()
-        self.sync_quality_label.setObjectName("MutedLabel")
-        self.update_sync_quality_label()
-
-        self.youtube_url = QLineEdit()
-        self.youtube_url.setPlaceholderText("Paste your YouTube playlist URL")
-        self.youtube_url.setObjectName("SearchBox")
-        self.youtube_url.setAccessibleName("Authorized YouTube playlist URL")
-
-        output_row = QHBoxLayout()
+        self.youtube_url = QLineEdit(page)
+        self.youtube_url.setAccessibleName("Legacy authorized YouTube playlist URL")
+        self.youtube_url.hide()
         self.youtube_output = QLineEdit(
-            self.config.get(
-                "download_folder",
-                str(default_downloads_dir())
-            )
+            self.config.get("download_folder", str(default_downloads_dir())),
+            page,
         )
-        self.youtube_output.setObjectName("SearchBox")
-        self.youtube_output.setAccessibleName("YouTube download folder")
-
-        choose_output = self.make_action_button(
-            "Choose Folder", "folder", self.choose_youtube_output
-        )
-        open_output = self.make_action_button(
-            "Open Downloads", "downloaded", self.open_youtube_output
-        )
-
-        output_row.addWidget(self.youtube_output, 1)
-        output_row.addWidget(choose_output)
-        output_row.addWidget(open_output)
-
-        self.youtube_confirm = QCheckBox("I own this music or have permission to download it.")
-        self.youtube_confirm.setObjectName("PermissionCheck")
-
-        action_row = QHBoxLayout()
-
-        self.youtube_sync_btn = QPushButton("Start Sync")
-        self.youtube_sync_btn.setObjectName("PrimaryButton")
-        self.youtube_sync_btn.setIcon(
-            ui_icon(
-                "sync",
-                18,
-                color=COLORS["accent_ink"],
-                active_color=COLORS["accent_ink"],
-            )
-        )
-        self.youtube_sync_btn.setToolTip("Start an authorized playlist sync")
-        self.youtube_sync_btn.setAccessibleName("Start authorized playlist sync")
-        self.youtube_sync_btn.clicked.connect(self.sync_youtube_playlist)
-
-        clear_log_btn = self.make_action_button(
-            "Clear Log", "remove", self.clear_sync_log
-        )
-
-        action_row.addWidget(self.youtube_sync_btn)
-        action_row.addWidget(clear_log_btn)
-        action_row.addStretch(1)
-
-        self.sync_progress = QProgressBar()
-        self.sync_progress.setObjectName("SyncProgress")
-        self.sync_progress.setRange(0, 100)
-        self.sync_progress.setValue(0)
-        self.sync_progress.setFormat("Ready")
-        self.sync_progress.setTextVisible(True)
-
-        log_header = QHBoxLayout()
-        log_title = QLabel("Activity Log")
-        log_title.setObjectName("CardTitle")
-        log_hint = QLabel("Detailed sync messages")
-        log_hint.setObjectName("MutedLabel")
-        log_header.addWidget(log_title)
-        log_header.addStretch(1)
-        log_header.addWidget(log_hint)
-
-        self.youtube_log = QTextEdit()
-        self.youtube_log.setReadOnly(True)
-        self.youtube_log.setObjectName("SyncLog")
-        self.youtube_log.setPlaceholderText(
-            "No sync activity yet. Authorized sync progress will appear here."
-        )
-        self.youtube_log.setAccessibleName("YouTube synchronization activity log")
-        self.youtube_log.setMinimumHeight(120)
-
-        sync_layout.addWidget(form_title)
-        sync_layout.addWidget(self.sync_quality_label)
-        sync_layout.addWidget(QLabel("Playlist URL"))
-        sync_layout.addWidget(self.youtube_url)
-        sync_layout.addWidget(QLabel("Download Folder"))
-        sync_layout.addLayout(output_row)
-        sync_layout.addWidget(self.youtube_confirm)
-        sync_layout.addLayout(action_row)
-        sync_layout.addWidget(self.sync_progress)
-        sync_layout.addLayout(log_header)
-        sync_layout.addWidget(self.youtube_log, 1)
-
-        layout.addWidget(header)
-        layout.addLayout(metric_row)
-        layout.addWidget(sync_card, 1)
+        self.youtube_output.hide()
+        self.youtube_confirm = QCheckBox(page)
+        self.youtube_confirm.setChecked(False)
+        self.youtube_confirm.hide()
+        self.sync_quality_label = QLabel(page)
+        self.sync_quality_label.hide()
 
         self.sync_scroll = QScrollArea()
         self.sync_scroll.setObjectName("SyncScroll")
         self.sync_scroll.setWidgetResizable(True)
         self.sync_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.sync_scroll.setWidget(sync_content)
+        self.sync_scroll.setWidget(self.sync_center)
         page_layout.addWidget(self.sync_scroll)
 
+        self.sync_center_controller.refresh(preserve_detail=False)
+
         return page
+
+    def create_multi_source_orchestrator(self, progress, transition):
+        """Create a worker-thread-owned database/service/orchestrator graph."""
+
+        worker_db = MusicVaultDB(
+            self.db.db_path,
+            backup_dir=self.db.backup_dir,
+            youtube_download_root=self.config.get("download_folder"),
+        )
+        membership = PlaylistMembershipService(worker_db)
+        service = SyncSourceService(worker_db, membership_service=membership)
+        orchestrator = MultiSourceSyncOrchestrator(
+            worker_db,
+            self.config.get("download_folder", str(default_downloads_dir())),
+            archive_file=youtube_download_archive_path(),
+            audio_quality=str(self.config.get("audio_quality", "320")),
+            ffmpeg_location=(
+                str(self.config.get("ffmpeg_location") or "").strip() or None
+            ),
+            source_service=service,
+            membership_service=membership,
+            progress=progress,
+            transition_callback=transition,
+        )
+        orchestrator._music_vault_worker_db = worker_db
+        return orchestrator
+
+    def on_sync_sources_changed(self) -> None:
+        self.load_playlists()
+        if self.current_view_kind == "custom":
+            self.refresh_current_view()
+        self.refresh_settings_status()
+        self.on_multi_source_status_transition({})
+
+    def on_multi_source_status_transition(self, values: object) -> None:
+        sources = self.sync_source_service.list_active()
+        status = {
+            "last_sync_playlist_title": None,
+            "last_sync_playlist_id": None,
+            "last_sync_failures": [],
+            "last_sync_error": None,
+            "sync_source_count": len(sources),
+            "enabled_sync_source_count": sum(source.enabled for source in sources),
+        }
+        if isinstance(values, dict):
+            status.update(values)
+        self.app_sync_status = status
+        self.write_app_status()
+
+    def multi_source_sync_finished(self, result: object) -> None:
+        sources = self.sync_source_service.list_active()
+        self.app_sync_status = multi_source_status_payload(
+            result,
+            sync_source_count=len(sources),
+            enabled_sync_source_count=sum(source.enabled for source in sources),
+        )
+        if int(getattr(result, "total_imported", 0) or 0):
+            self.invalidate_browser_data(BrowserInvalidationReason.YOUTUBE_IMPORT)
+        self.load_playlists()
+        self.refresh_current_view()
+        self.refresh_settings_status()
+        self.write_app_status()
+        status = str(getattr(result, "status", "failed"))
+        summary = (
+            f"{status.replace('_', ' ').title()}. "
+            f"Downloaded {int(getattr(result, 'total_downloaded', 0) or 0)}, "
+            f"imported {int(getattr(result, 'total_imported', 0) or 0)}, "
+            f"failed items {int(getattr(result, 'total_failed_items', 0) or 0)}."
+        )
+        if status == "complete":
+            QMessageBox.information(self, "Source synchronization complete", summary)
+        else:
+            QMessageBox.warning(self, "Source synchronization result", summary)
 
     def build_settings_page(self) -> QWidget:
         page = QWidget()
@@ -1598,6 +1636,10 @@ class MusicVaultWindow(QMainWindow):
         maintenance_title = QLabel("Maintenance")
         maintenance_title.setObjectName("CardTitle")
 
+        self.source_maintenance_status = QLabel()
+        self.source_maintenance_status.setObjectName("StatusLine")
+        self.source_maintenance_status.setWordWrap(True)
+
         maintenance_row = QHBoxLayout()
 
         open_data_btn = self.make_action_button(
@@ -1606,6 +1648,11 @@ class MusicVaultWindow(QMainWindow):
         clear_failed_btn = self.make_action_button(
             "Clear Failure History", "remove", self.clear_failed_downloads,
             object_name="DangerButton",
+        )
+        open_source_root_btn = self.make_action_button(
+            "Open Source Download Root",
+            "folder",
+            self.open_source_download_root,
         )
         refresh_btn = self.make_action_button(
             "Refresh Status", "refresh", self.refresh_settings_status
@@ -1616,6 +1663,7 @@ class MusicVaultWindow(QMainWindow):
         )
 
         maintenance_row.addWidget(open_data_btn)
+        maintenance_row.addWidget(open_source_root_btn)
         maintenance_row.addWidget(clear_failed_btn)
         maintenance_row.addWidget(refresh_btn)
         maintenance_row.addWidget(clean_btn)
@@ -1679,6 +1727,7 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(self.artist_images_status)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(maintenance_title)
+        settings_layout.addWidget(self.source_maintenance_status)
         settings_layout.addLayout(maintenance_row)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(status_title)
@@ -2094,6 +2143,8 @@ class MusicVaultWindow(QMainWindow):
         if subtitle and hasattr(self, "page_subtitle"):
             self.page_subtitle.setText(subtitle)
 
+        self.update_managed_playlist_presentation()
+
         if not tracks and hasattr(self, "library_empty_state"):
             if self.current_view_kind == "custom":
                 self.library_empty_state.title_label.setText("This playlist is empty")
@@ -2114,10 +2165,36 @@ class MusicVaultWindow(QMainWindow):
         self.update_metadata_action_state()
         self.write_app_status()
 
+    def update_managed_playlist_presentation(self) -> None:
+        badge = getattr(self, "playlist_managed_badge", None)
+        if badge is None:
+            return
+        managed = None
+        if self.current_view_kind == "custom" and self.current_playlist_id is not None:
+            managed = next(
+                (
+                    playlist
+                    for playlist in self.db.list_playlists()
+                    if int(playlist["id"]) == int(self.current_playlist_id)
+                    and bool(playlist["source_managed"])
+                ),
+                None,
+            )
+        badge.setVisible(managed is not None)
+        if managed is not None:
+            self.page_subtitle.setText(
+                "Managed from a saved YouTube source. Manual additions appear after source tracks."
+            )
+
     def load_playlists(self) -> None:
         self.playlists.clear()
 
-        def add_sidebar_item(label: str, kind: str, playlist_id: int | None = None) -> None:
+        def add_sidebar_item(
+            label: str,
+            kind: str,
+            playlist_id: int | None = None,
+            managing_source_id: int | None = None,
+        ) -> None:
             item = QListWidgetItem(label)
             icon_name = {
                 "library": "library",
@@ -2126,14 +2203,19 @@ class MusicVaultWindow(QMainWindow):
                 "albums": "albums",
                 "artists": "artists",
                 "new": "add",
-                "custom": "playlists",
+                "custom": "sync" if managing_source_id is not None else "playlists",
             }.get(kind, "playlists")
             item.setIcon(ui_icon(icon_name, 18))
-            item.setToolTip(label)
+            item.setToolTip(
+                f"{label}\nManaged from a saved source"
+                if managing_source_id is not None
+                else label
+            )
             item.setData(Qt.UserRole, {
                 "kind": kind,
                 "id": playlist_id,
                 "name": label,
+                "managing_source_id": managing_source_id,
             })
             self.playlists.addItem(item)
 
@@ -2145,7 +2227,16 @@ class MusicVaultWindow(QMainWindow):
         add_sidebar_item("+ New Playlist", "new")
 
         for playlist in self.db.list_playlists():
-            add_sidebar_item(playlist["name"], "custom", playlist["id"])
+            add_sidebar_item(
+                playlist["name"],
+                "custom",
+                playlist["id"],
+                (
+                    int(playlist["managing_source_id"])
+                    if playlist["managing_source_id"] is not None
+                    else None
+                ),
+            )
 
 
     def rounded_cover_pixmap(
@@ -2821,8 +2912,13 @@ class MusicVaultWindow(QMainWindow):
             QMessageBox.information(self, "Select a track", "Select a song first.")
             return
 
-        self.db.remove_track_from_playlist(self.current_playlist_id, track_id)
+        result = self.db.remove_track_from_playlist(self.current_playlist_id, track_id)
         self.refresh_current_view()
+        if result.source_managed and result.remains_visible:
+            explain_source_managed_removal(
+                self,
+                manual_origin_removed=result.manual_origin_removed,
+            )
 
     def import_music_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose music folder")
@@ -2868,6 +2964,14 @@ class MusicVaultWindow(QMainWindow):
 
 
     def sync_youtube_playlist(self) -> None:
+        controller = getattr(self, "sync_center_controller", None)
+        if controller is not None and controller._batch_running():
+            QMessageBox.information(
+                self,
+                "Synchronization active",
+                "A saved-source synchronization batch is already running.",
+            )
+            return
         playlist_url = self.youtube_url.text().strip()
         output_dir = self.youtube_output.text().strip()
 
@@ -2914,7 +3018,7 @@ class MusicVaultWindow(QMainWindow):
         self.set_sync_visual_state("syncing")
 
         self.log_youtube("Starting Music Vault sync.")
-        self.log_youtube(f"Download folder: {self.config['download_folder']}")
+        self.log_youtube("Download folder configured.")
         self.log_youtube(f"Audio quality: {self.config['audio_quality']} kbps")
 
         self.sync_worker = YouTubeSyncWorker(
@@ -3009,7 +3113,25 @@ class MusicVaultWindow(QMainWindow):
         for failure in result.failures:
             self.log_youtube(f"- {failure.title or failure.video_id or 'Sync'}: {failure.reason}")
 
-        self.app_sync_status = result.to_status_dict()
+        sources = self.sync_source_service.list_active()
+        self.app_sync_status = {
+            "last_sync_at": result.finished_at,
+            "last_sync_status": result.status,
+            "last_sync_playlist_title": None,
+            "last_sync_new_items": result.new_item_count,
+            "last_sync_imported_count": result.imported_count,
+            "last_sync_error": None,
+            "last_sync_playlist_id": None,
+            "last_sync_visible_item_count": result.visible_item_count,
+            "last_sync_downloaded_count": result.downloaded_count,
+            "last_sync_existing_count": result.existing_count,
+            "last_sync_failed_count": result.failed_count,
+            "last_sync_failures": [],
+            "sync_source_count": len(sources),
+            "enabled_sync_source_count": sum(source.enabled for source in sources),
+            "active_sync_batch": False,
+            "active_sync_source_index": None,
+        }
         self.write_app_status()
 
         summary = (
@@ -4381,7 +4503,22 @@ class MusicVaultWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
+    def open_source_download_root(self) -> None:
+        folder = Path(
+            self.config.get("download_folder") or default_downloads_dir()
+        ) / "sources"
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
     def clear_failed_downloads(self) -> None:
+        controller = getattr(self, "sync_center_controller", None)
+        if controller is not None and controller._batch_running():
+            QMessageBox.information(
+                self,
+                "Synchronization active",
+                "Failure history can be cleared after the active synchronization finishes.",
+            )
+            return
         if self.db.unresolved_failure_count() == 0:
             QMessageBox.information(self, "Failure history", "There are no unresolved failures to clear.")
             return
@@ -4397,6 +4534,8 @@ class MusicVaultWindow(QMainWindow):
 
         self.db.clear_failure_history()
         QMessageBox.information(self, "Failure history cleared", "Synchronization failure history was cleared.")
+        if self.sync_center_controller is not None:
+            self.sync_center_controller.refresh()
         self.refresh_settings_status()
 
 
@@ -4445,6 +4584,13 @@ class MusicVaultWindow(QMainWindow):
         self.db_status.setText(f"Database: {Path(db_path).resolve()}")
 
         failed_count = self.db.unresolved_failure_count()
+        active_sources = self.sync_source_service.list_active()
+        archived_sources = self.sync_source_service.list_archived()
+        unresolved_source_failures = sum(
+            self.sync_source_service.unresolved_failure_count(source.id)
+            for source in (*active_sources, *archived_sources)
+        )
+        source_identity_conflicts = self.sync_source_service.identity_conflict_count()
 
         config_lines = [
             f"Config: {self.config_file_path().resolve()}",
@@ -4454,6 +4600,14 @@ class MusicVaultWindow(QMainWindow):
         ]
 
         self.config_status.setText(chr(10).join(config_lines))
+
+        if hasattr(self, "source_maintenance_status"):
+            self.source_maintenance_status.setText(
+                f"Active Sources: {len(active_sources)}\n"
+                f"Archived Sources: {len(archived_sources)}\n"
+                f"Unresolved Source Failures: {unresolved_source_failures}\n"
+                f"Source Identity Conflicts: {source_identity_conflicts}"
+            )
 
         if hasattr(self, "app_status_line"):
             self.app_status_line.setText(
@@ -4591,6 +4745,21 @@ class MusicVaultWindow(QMainWindow):
             self._dark_title_bar_applied = apply_dark_title_bar(self)
 
     def closeEvent(self, event) -> None:
+        controller = getattr(self, "sync_center_controller", None)
+        worker = getattr(controller, "worker", None)
+        if worker is not None and worker.isRunning():
+            controller.stop_after_current()
+            if not self._close_after_sync:
+                self._close_after_sync = True
+                worker.finished.connect(self.close)
+                QMessageBox.information(
+                    self,
+                    "Finishing current source",
+                    "Music Vault will close after the active source finishes safely. "
+                    "No later source will start.",
+                )
+            event.ignore()
+            return
         if self.party_mode_window is not None:
             try:
                 self.party_mode_window.shutdown()

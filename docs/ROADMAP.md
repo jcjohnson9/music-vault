@@ -179,20 +179,24 @@ word-level karaoke, audio-tag writeback, additional provider, queue/playback
 change, database-schema change, or public v1.1.0 release.
 
 **Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0;
-Batch 10 remains next.
+Batch 10 follows on the same development line.
 
 ## Batch 10 — Multiple Source Playlists
 
 **Objective:** Support several authorized source playlists without losing
 identity or membership information.
 
-**Scope:** Persist source definitions, source-item membership, per-source sync
-state and errors, cross-source video identity, and deterministic local mapping.
+**Scope:** Persist source definitions, source-item occurrences, per-source run
+and failure state, cross-source video identity, stable source folders,
+origin-aware managed local playlists, sequential Sync Selected/Sync All,
+Stop After Current, complete-snapshot removal reconciliation, and a premium
+multi-source Sync Center.
 
 **Non-goals:** No private-playlist OAuth requirement and no conversion of Music
 Vault into a hosted service.
 
-**Status:** Next.
+**Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0;
+Batch 11 remains next.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original
 
@@ -206,7 +210,7 @@ metadata behavior for supported formats.
 **Non-goals:** No promise to create fidelity absent from the source and no
 unbounded file-size growth.
 
-**Status:** Planned post-V1.
+**Status:** Next on the v1.1.0 development roadmap.
 
 ## Batch 12 — Selective Library and Playlist Mobile Export
 

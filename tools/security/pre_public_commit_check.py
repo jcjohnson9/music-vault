@@ -29,6 +29,9 @@ FORBIDDEN_DIRECTORY_NAMES = {
     "metadata_reports",
     "metadata_jobs",
     "provider_cache",
+    "source_membership_snapshots",
+    "sync_source_runtime",
+    "sync_source_snapshots",
 }
 LYRIC_CACHE_DIRECTORY_NAMES = {
     "lyric_cache",
@@ -96,6 +99,11 @@ RUNTIME_BASENAMES = {
     "music_vault_config.json",
     "youtube_download_archive.txt",
     "youtube_failed_ids.txt",
+}
+SOURCE_RUNTIME_JSON_MARKERS = {
+    "source_membership_snapshot",
+    "sync_source_run",
+    "sync_source_snapshot",
 }
 
 
@@ -214,6 +222,9 @@ def _path_violations(relative_path: str) -> list[tuple[str, str]]:
 
     if name in RUNTIME_BASENAMES or name.startswith("music_vault_status.json"):
         violations.append(("private Music Vault runtime file", "remove runtime state from the Git index"))
+
+    if suffix == ".json" and any(marker in name for marker in SOURCE_RUNTIME_JSON_MARKERS):
+        violations.append(("private source-sync runtime file", "remove source membership or sync state from the Git index"))
 
     if "api_key" in name or "api-key" in name or "apikey" in name:
         violations.append(("API-key file name", "remove credential files from the Git index"))

@@ -66,6 +66,17 @@ REMEDIATION_SCENES = (
     "remediation_long_values",
 )
 PARTY_SCENES = ("party_mode_smoke",)
+MULTI_SOURCE_SCENES = (
+    "sync_sources_empty",
+    "sync_sources_list",
+    "sync_source_add",
+    "sync_source_edit",
+    "sync_all_running",
+    "sync_complete_issues",
+    "sync_source_failures",
+    "sync_managed_playlist",
+    "sync_source_remove",
+)
 RUNTIME_PREFIX = "MusicVault_Batch7_UI_Runtime_"
 OUTPUT_PREFIX = "MusicVault_UI_Review_Output_"
 REMEDIATION_RESTART_PHASE_ENV = "MUSIC_VAULT_REMEDIATION_RESTART_PHASE"
@@ -141,6 +152,7 @@ def parse_args() -> argparse.Namespace:
             *METADATA_SCENES,
             *REMEDIATION_SCENES,
             *PARTY_SCENES,
+            *MULTI_SOURCE_SCENES,
         ),
         help="Repeatable review scene. Defaults to the standard application matrix.",
     )
@@ -491,7 +503,7 @@ def seed_synthetic_runtime(
         schema = int(db.conn.execute("PRAGMA user_version").fetchone()[0])
         integrity = str(db.conn.execute("PRAGMA integrity_check").fetchone()[0])
         db.close()
-        if schema != 4 or integrity != "ok":
+        if schema != 5 or integrity != "ok":
             raise RuntimeError("Synthetic database validation failed.")
 
         if include_party:
@@ -767,6 +779,44 @@ def validate_output(
             raise RuntimeError("Synthetic Party Mode audio outcome is invalid.")
         if int(party_behaviors.get("network_attempt_count", -1)) != 0:
             raise RuntimeError("Synthetic Party Mode attempted network access.")
+    if captured_scenes.intersection(MULTI_SOURCE_SCENES):
+        runtime_checks = payload.get("runtime_checks") or {}
+        behaviors = runtime_checks.get("multi_source_behaviors") or {}
+        required_behaviors = {
+            "scenario_completed",
+            "api_key_absent",
+            "add_source_persisted",
+            "edit_source_persisted",
+            "edit_identity_stable",
+            "edit_storage_key_stable",
+            "source_crud",
+            "source_order_persisted",
+            "sequential_execution",
+            "source_a_duplicate_occurrences",
+            "cross_source_single_download",
+            "first_playlist_a_order",
+            "first_playlist_b_order",
+            "library_only_source",
+            "unavailable_item_truthful",
+            "aggregate_complete_with_issues",
+            "second_snapshot_order",
+            "remote_removal_preserves_media",
+            "remote_removal_recorded",
+            "failed_enumeration_preserves_playlist",
+            "archive_preserves_playlist",
+            "source_specific_failures",
+            "aggregate_only_app_status",
+            "playback_preserved",
+            "queue_preserved",
+            "base_context_preserved",
+            "party_mode_preserved",
+            "lyrics_preserved",
+            "same_media_player",
+        }
+        if any(behaviors.get(name) is not True for name in required_behaviors):
+            raise RuntimeError("Synthetic packaged multi-source behavior validation failed.")
+        if int(behaviors.get("network_attempt_count", -1)) != 0:
+            raise RuntimeError("Synthetic multi-source smoke attempted network access.")
 
     from PySide6.QtGui import QImage
 
@@ -965,6 +1015,53 @@ def validate_output(
                 raise RuntimeError("Synthetic Party Mode capture lacks an audio outcome.")
             if metrics.get("ambient_fallback_verified") is not True:
                 raise RuntimeError("Synthetic Party Mode fallback was not verified.")
+        if scene in MULTI_SOURCE_SCENES:
+            metrics = capture.get("multi_source_metrics")
+            if not isinstance(metrics, dict):
+                raise RuntimeError("Synthetic Sync Center capture lacks aggregate metrics.")
+            if int(metrics.get("per_source_widget_count", -1)) != 0:
+                raise RuntimeError("Sync Center allocated a QWidget per source row.")
+            if int(metrics.get("clipped_action_count", -1)) != 0:
+                raise RuntimeError("Sync Center actions are clipped at a review size.")
+            if metrics.get("private_path_visible"):
+                raise RuntimeError("Sync Center exposed a private absolute path.")
+            if metrics.get("api_key_field_visible"):
+                raise RuntimeError("Sync Center exposed an API-key field.")
+            if metrics.get("preservation_message_present") is not True:
+                raise RuntimeError("Source-removal preservation messaging is incomplete.")
+            if scene == "sync_sources_empty":
+                if int(metrics.get("source_row_count", -1)) != 0:
+                    raise RuntimeError("Empty Sync Center unexpectedly contains a source.")
+            elif scene == "sync_managed_playlist":
+                if not metrics.get("managed_badge_visible") or not metrics.get(
+                    "managed_explanation_present"
+                ):
+                    raise RuntimeError("Managed playlist presentation is incomplete.")
+                if int(metrics.get("playlist_track_count", 0)) <= 0:
+                    raise RuntimeError("Managed playlist review has no tracks.")
+            else:
+                if int(metrics.get("source_row_count", 0)) != 3:
+                    raise RuntimeError("Sync Center did not render all three sources.")
+                if int(metrics.get("selected_source_count", 0)) <= 0:
+                    raise RuntimeError("Sync Center lacks a clear selected source.")
+                if int(metrics.get("disabled_source_count", 0)) != 1:
+                    raise RuntimeError("Sync Center lacks a clear disabled source.")
+            expected_dialog = {
+                "sync_source_add": "source_editor",
+                "sync_source_edit": "source_editor",
+                "sync_source_remove": "remove_confirmation",
+            }.get(scene)
+            if expected_dialog is not None and (
+                metrics.get("dialog_visible") is not True
+                or metrics.get("dialog_kind") != expected_dialog
+            ):
+                raise RuntimeError("Synthetic Sync Center dialog is unavailable.")
+            if scene == "sync_all_running" and metrics.get("batch_active") is not True:
+                raise RuntimeError("Sync All running state is not active.")
+            if scene == "sync_complete_issues" and metrics.get(
+                "status_property"
+            ) != "complete_with_issues":
+                raise RuntimeError("Complete-with-issues status treatment is missing.")
 
     database = runtime / "data" / "music_vault.sqlite3"
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
@@ -973,7 +1070,7 @@ def validate_output(
         integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
     finally:
         connection.close()
-    if schema != 4 or integrity != "ok":
+    if schema != 5 or integrity != "ok":
         raise RuntimeError("Synthetic database failed final validation.")
     if (runtime / "data" / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
@@ -1276,6 +1373,16 @@ def main() -> int:
             )
             if party_behaviors.get("packaged_process") is not True:
                 raise RuntimeError("Party Mode smoke did not run inside the packaged EXE.")
+        if args.exe is not None and set(scenes).intersection(MULTI_SOURCE_SCENES):
+            multi_source_behaviors = (
+                (manifest.get("runtime_checks") or {}).get(
+                    "multi_source_behaviors", {}
+                )
+            )
+            if multi_source_behaviors.get("packaged_process") is not True:
+                raise RuntimeError(
+                    "Multi-source smoke did not run inside the packaged EXE."
+                )
         wrong_data = project_root / "dist" / "MusicVault" / "data"
         if wrong_data.exists():
             raise RuntimeError("dist/MusicVault/data was created during UI review.")
@@ -1291,7 +1398,7 @@ def main() -> int:
                     "sizes": manifest["sizes"],
                     "pages": manifest["pages"],
                     "dark_title_bar_applied": manifest.get("dark_title_bar_applied"),
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "config_volume_percent": 23,
                     "api_key_present": False,
                     "artist_provider": "synthetic_no_network",

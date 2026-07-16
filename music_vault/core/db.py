@@ -7,7 +7,16 @@ from pathlib import Path
 from typing import Optional
 
 from .paths import database_path
+from .playlist_membership import PlaylistMembershipService, PlaylistRemovalResult
 from .safety import extract_source_video_id, normalize_source_upload_date, sanitize_error_text
+from .sync_schema import (
+    SOURCE_IDENTITY_CONFLICTS_TABLE,
+    SOURCE_TRACK_IDENTITIES_TABLE,
+    backfill_source_track_identities,
+    create_sync_schema,
+    seed_existing_playlist_origins,
+    utc_now as sync_utc_now,
+)
 from music_vault.metadata.schema import (
     create_metadata_schema,
     normalize_release_date,
@@ -16,7 +25,7 @@ from music_vault.metadata.schema import (
 from music_vault.metadata.remediation_schema import create_remediation_schema
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -283,6 +292,16 @@ class MusicVaultDB:
                     [*updates.values(), row["id"]],
                 )
 
+    def _verify_database_integrity(self) -> None:
+        if int(self.conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+            raise RuntimeError("SQLite foreign-key enforcement is not enabled.")
+        foreign_key_issues = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_issues:
+            raise RuntimeError("The database migration produced a foreign-key violation.")
+        integrity = self.conn.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or str(integrity[0]).casefold() != "ok":
+            raise RuntimeError("The database failed its post-migration integrity check.")
+
     def migrate(self) -> None:
         version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
         if version > CURRENT_SCHEMA_VERSION:
@@ -300,7 +319,9 @@ class MusicVaultDB:
                 self._create_support_tables_and_indexes()
                 create_metadata_schema(self.conn)
                 create_remediation_schema(self.conn)
+                create_sync_schema(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+                self._verify_database_integrity()
             return
 
         if version < CURRENT_SCHEMA_VERSION:
@@ -311,18 +332,28 @@ class MusicVaultDB:
                 self._create_base_tables()
                 self._add_track_source_columns()
                 self._create_support_tables_and_indexes()
-                self._backfill_youtube_source_fields()
                 create_metadata_schema(self.conn)
-                seed_existing_metadata(self.conn)
+                # Schema-v4 databases already carry the trustworthy metadata
+                # state. Avoid rewriting its observation timestamps merely to
+                # install the additive Batch 10 structures.
+                if version < 4:
+                    self._backfill_youtube_source_fields()
+                    seed_existing_metadata(self.conn)
                 create_remediation_schema(self.conn)
+                create_sync_schema(self.conn)
+                seed_existing_playlist_origins(self.conn)
+                backfill_source_track_identities(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+                self._verify_database_integrity()
             return
 
-        # Batch 7 schema additions remain idempotent within schema version 4 so
-        # prerelease v4 databases can acquire recovery-only columns safely.
+        # Additive structures remain idempotent at the current schema so a
+        # prerelease database can acquire recovery-only columns and indexes.
         if version == CURRENT_SCHEMA_VERSION:
             with self.conn:
                 create_remediation_schema(self.conn)
+                create_sync_schema(self.conn)
+                self._verify_database_integrity()
 
     def upsert_track(
         self,
@@ -411,6 +442,14 @@ class MusicVaultDB:
                         "track_upsert" if track_was_present else "initial_track_upsert"
                     ),
                     commit=False,
+                )
+            effective_kind = str(normalized_source_kind or row["source_kind"] or "").strip()
+            effective_external_id = str(
+                source_video_id or row["source_video_id"] or ""
+            ).strip()
+            if effective_kind.casefold() == "youtube" and effective_external_id:
+                self.register_source_identity(
+                    "youtube", effective_external_id, track_id, commit=False
                 )
             return track_id
 
@@ -507,17 +546,183 @@ class MusicVaultDB:
     def get_track(self, track_id: int) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
 
-    def get_track_by_source_video_id(self, video_id: str) -> Optional[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM tracks WHERE source_kind='youtube' AND source_video_id=? LIMIT 1",
-            (video_id,),
+    def canonical_track_id(
+        self,
+        source_kind: str,
+        external_track_id: str,
+        *,
+        require_existing_file: bool = False,
+    ) -> int | None:
+        normalized_kind = str(source_kind or "").strip().casefold()
+        normalized_external_id = str(external_track_id or "").strip()
+        if not normalized_kind or not normalized_external_id:
+            return None
+        row = self.conn.execute(
+            f"""
+            SELECT identities.track_id, tracks.path
+            FROM {SOURCE_TRACK_IDENTITIES_TABLE} AS identities
+            JOIN tracks ON tracks.id=identities.track_id
+            WHERE identities.source_kind=? AND identities.external_track_id=?
+            """,
+            (normalized_kind, normalized_external_id),
         ).fetchone()
+        if row is None:
+            return None
+        if require_existing_file and not Path(str(row["path"])).is_file():
+            return None
+        return int(row["track_id"])
+
+    @staticmethod
+    def _identity_claim_key(row: sqlite3.Row) -> tuple[int, int]:
+        try:
+            exists_rank = 0 if Path(str(row["path"])).is_file() else 1
+        except (OSError, TypeError, ValueError):
+            exists_rank = 1
+        return exists_rank, int(row["id"])
+
+    def register_source_identity(
+        self,
+        source_kind: str,
+        external_track_id: str,
+        track_id: int,
+        *,
+        commit: bool = True,
+    ) -> int:
+        normalized_kind = str(source_kind or "").strip().casefold()
+        normalized_external_id = str(external_track_id or "").strip()
+        if not normalized_kind or not normalized_external_id:
+            raise ValueError("A source kind and external track ID are required.")
+
+        def perform() -> int:
+            candidate = self.conn.execute(
+                "SELECT id, path FROM tracks WHERE id=?", (int(track_id),)
+            ).fetchone()
+            if candidate is None:
+                raise KeyError(f"Track {int(track_id)} does not exist.")
+            existing = self.conn.execute(
+                f"""
+                SELECT identities.track_id, tracks.id, tracks.path
+                FROM {SOURCE_TRACK_IDENTITIES_TABLE} AS identities
+                JOIN tracks ON tracks.id=identities.track_id
+                WHERE identities.source_kind=? AND identities.external_track_id=?
+                """,
+                (normalized_kind, normalized_external_id),
+            ).fetchone()
+            timestamp = sync_utc_now()
+            if existing is None:
+                self.conn.execute(
+                    f"""
+                    INSERT INTO {SOURCE_TRACK_IDENTITIES_TABLE} (
+                        source_kind, external_track_id, track_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_kind,
+                        normalized_external_id,
+                        int(track_id),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                return int(track_id)
+
+            existing_id = int(existing["track_id"])
+            if existing_id == int(track_id):
+                self.conn.execute(
+                    f"""
+                    UPDATE {SOURCE_TRACK_IDENTITIES_TABLE}
+                    SET updated_at=?
+                    WHERE source_kind=? AND external_track_id=?
+                    """,
+                    (timestamp, normalized_kind, normalized_external_id),
+                )
+                return existing_id
+
+            winner = min((existing, candidate), key=self._identity_claim_key)
+            canonical_id = int(winner["id"])
+            conflicting_id = int(track_id) if canonical_id == existing_id else existing_id
+            self.conn.execute(
+                f"""
+                UPDATE {SOURCE_TRACK_IDENTITIES_TABLE}
+                SET track_id=?, updated_at=?
+                WHERE source_kind=? AND external_track_id=?
+                """,
+                (
+                    canonical_id,
+                    timestamp,
+                    normalized_kind,
+                    normalized_external_id,
+                ),
+            )
+            self.conn.execute(
+                f"""
+                UPDATE {SOURCE_IDENTITY_CONFLICTS_TABLE}
+                SET resolved_at=?
+                WHERE source_kind=? AND external_track_id=?
+                  AND conflicting_track_id=? AND resolved_at IS NULL
+                """,
+                (
+                    timestamp,
+                    normalized_kind,
+                    normalized_external_id,
+                    canonical_id,
+                ),
+            )
+            self.conn.execute(
+                f"""
+                INSERT INTO {SOURCE_IDENTITY_CONFLICTS_TABLE} (
+                    source_kind, external_track_id, canonical_track_id,
+                    conflicting_track_id, reason, created_at, resolved_at
+                ) VALUES (?, ?, ?, ?, 'duplicate_source_identity', ?, NULL)
+                ON CONFLICT(source_kind, external_track_id, conflicting_track_id)
+                DO UPDATE SET
+                    canonical_track_id=excluded.canonical_track_id,
+                    reason=excluded.reason,
+                    resolved_at=NULL
+                """,
+                (
+                    normalized_kind,
+                    normalized_external_id,
+                    canonical_id,
+                    conflicting_id,
+                    timestamp,
+                ),
+            )
+            return canonical_id
+
+        if commit:
+            with self.conn:
+                return perform()
+        return perform()
+
+    def source_identity_conflict_count(self) -> int:
+        row = self.conn.execute(
+            f"SELECT COUNT(*) FROM {SOURCE_IDENTITY_CONFLICTS_TABLE} "
+            "WHERE resolved_at IS NULL"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def get_track_by_source_video_id(self, video_id: str) -> Optional[sqlite3.Row]:
+        track_id = self.canonical_track_id("youtube", video_id)
+        if track_id is not None:
+            return self.get_track(track_id)
+        rows = self.conn.execute(
+            """
+            SELECT * FROM tracks
+            WHERE source_kind='youtube' AND source_video_id=?
+            ORDER BY id
+            """,
+            (video_id,),
+        ).fetchall()
+        return min(rows, key=self._identity_claim_key) if rows else None
 
     def existing_youtube_video_ids(self) -> set[str]:
         rows = self.conn.execute("""
-            SELECT source_video_id, path
-            FROM tracks
-            WHERE source_kind='youtube' AND source_video_id IS NOT NULL
+            SELECT identities.external_track_id AS source_video_id, tracks.path
+            FROM source_track_identities AS identities
+            JOIN tracks ON tracks.id=identities.track_id
+            WHERE identities.source_kind='youtube'
         """).fetchall()
         return {
             row["source_video_id"]
@@ -536,43 +741,88 @@ class MusicVaultDB:
 
     def list_playlists(self) -> list[sqlite3.Row]:
         return list(self.conn.execute("""
-            SELECT id, name FROM playlists ORDER BY name COLLATE NOCASE
+            SELECT playlists.id, playlists.name,
+                   sync_sources.id AS managing_source_id,
+                   CASE WHEN sync_sources.id IS NULL THEN 0 ELSE 1 END AS source_managed
+            FROM playlists
+            LEFT JOIN sync_sources
+              ON sync_sources.destination_playlist_id=playlists.id
+             AND sync_sources.destination_kind='playlist'
+             AND sync_sources.archived_at IS NULL
+            ORDER BY playlists.name COLLATE NOCASE
         """))
+
+    def rename_playlist(self, playlist_id: int, name: str) -> None:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("Playlist name cannot be empty.")
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE playlists SET name=? WHERE id=?",
+                (clean_name, int(playlist_id)),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Playlist {int(playlist_id)} does not exist.")
 
     def get_playlist_tracks(self, playlist_id: int) -> list[sqlite3.Row]:
         return list(self.conn.execute("""
             SELECT t.id, t.title, t.artist, t.album, t.year, t.path, t.cover_path,
                    t.duration_seconds, t.created_at, t.source_kind, t.source_video_id,
-                   t.source_upload_date, pt.position
+                   t.source_upload_date, pt.position,
+                   EXISTS(
+                       SELECT 1
+                       FROM playlist_track_origins origins
+                       JOIN sync_sources sources ON sources.id=origins.sync_source_id
+                       WHERE origins.playlist_id=pt.playlist_id
+                         AND origins.track_id=pt.track_id
+                         AND origins.origin_kind='sync_source'
+                         AND sources.archived_at IS NULL
+                         AND sources.destination_playlist_id=pt.playlist_id
+                   ) AS source_managed,
+                   EXISTS(
+                       SELECT 1
+                       FROM playlist_track_origins origins
+                       WHERE origins.playlist_id=pt.playlist_id
+                         AND origins.track_id=pt.track_id
+                         AND origins.origin_kind='manual'
+                   ) AS manual_origin,
+                   (
+                       SELECT sources.id
+                       FROM sync_sources sources
+                       WHERE sources.destination_playlist_id=pt.playlist_id
+                         AND sources.destination_kind='playlist'
+                         AND sources.archived_at IS NULL
+                       ORDER BY sources.id
+                       LIMIT 1
+                   ) AS managing_source_id
             FROM playlist_tracks pt
             JOIN tracks t ON t.id = pt.track_id
             WHERE pt.playlist_id=?
             ORDER BY pt.position ASC, t.artist COLLATE NOCASE, t.title COLLATE NOCASE
         """, (playlist_id,)))
 
-    def add_track_to_playlist(self, playlist_id: int, track_id: int) -> None:
-        row = self.conn.execute(
-            "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos "
-            "FROM playlist_tracks WHERE playlist_id=?",
-            (playlist_id,),
-        ).fetchone()
-        self.conn.execute("""
-            INSERT OR IGNORE INTO playlist_tracks(playlist_id, track_id, position)
-            VALUES (?, ?, ?)
-        """, (playlist_id, track_id, row["next_pos"]))
-        self.conn.commit()
+    def add_track_to_playlist(self, playlist_id: int, track_id: int) -> bool:
+        return PlaylistMembershipService(self).add_manual_origin(playlist_id, track_id)
 
-    def remove_track_from_playlist(self, playlist_id: int, track_id: int) -> None:
-        self.conn.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?",
-            (playlist_id, track_id),
+    def remove_track_from_playlist(
+        self, playlist_id: int, track_id: int
+    ) -> PlaylistRemovalResult:
+        return PlaylistMembershipService(self).remove_manual_origin(
+            playlist_id, track_id
         )
-        self.conn.commit()
 
     def delete_playlist(self, playlist_id: int) -> None:
-        self.conn.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (playlist_id,))
-        self.conn.execute("DELETE FROM playlists WHERE id=?", (playlist_id,))
-        self.conn.commit()
+        memberships = PlaylistMembershipService(self)
+        memberships.assert_playlist_deletable(playlist_id)
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM playlist_tracks WHERE playlist_id=?", (int(playlist_id),)
+            )
+            cursor = self.conn.execute(
+                "DELETE FROM playlists WHERE id=?", (int(playlist_id),)
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Playlist {int(playlist_id)} does not exist.")
 
     def record_sync_failure(
         self,
@@ -584,15 +834,18 @@ class MusicVaultDB:
         reason: str,
         error_category: str,
         attempted_at: str | None = None,
+        sync_source_id: int | None = None,
+        source_item_id: str | None = None,
     ) -> None:
         timestamp = attempted_at or _utc_now()
         reason = sanitize_error_text(reason)
         self.conn.execute("""
             INSERT INTO sync_failures (
                 playlist_id, playlist_title, video_id, title, reason, error_category,
-                attempt_count, first_attempt_at, last_attempt_at, status, resolved_at
+                attempt_count, first_attempt_at, last_attempt_at, status, resolved_at,
+                sync_source_id, source_item_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'unresolved', NULL)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, 'unresolved', NULL, ?, ?)
             ON CONFLICT(playlist_id, video_id) DO UPDATE SET
                 playlist_title=excluded.playlist_title,
                 title=COALESCE(excluded.title, sync_failures.title),
@@ -601,7 +854,9 @@ class MusicVaultDB:
                 attempt_count=sync_failures.attempt_count + 1,
                 last_attempt_at=excluded.last_attempt_at,
                 status='unresolved',
-                resolved_at=NULL
+                resolved_at=NULL,
+                sync_source_id=COALESCE(excluded.sync_source_id, sync_failures.sync_source_id),
+                source_item_id=COALESCE(excluded.source_item_id, sync_failures.source_item_id)
         """, (
             playlist_id,
             playlist_title,
@@ -611,35 +866,119 @@ class MusicVaultDB:
             error_category,
             timestamp,
             timestamp,
+            sync_source_id,
+            str(source_item_id or "").strip() or None,
         ))
         self.conn.commit()
 
-    def resolve_sync_failure(self, video_id: str, resolved_at: str | None = None) -> None:
-        self.conn.execute("""
-            UPDATE sync_failures
-            SET status='resolved', resolved_at=?
-            WHERE video_id=? AND status='unresolved'
-        """, (resolved_at or _utc_now(), video_id))
+    def resolve_sync_failure(
+        self,
+        video_id: str,
+        resolved_at: str | None = None,
+        *,
+        playlist_id: str | None = None,
+        sync_source_id: int | None = None,
+        source_item_id: str | None = None,
+    ) -> None:
+        clauses = ["video_id=?", "status='unresolved'"]
+        parameters: list[object] = [resolved_at or _utc_now(), video_id]
+        if playlist_id is not None:
+            clauses.append("playlist_id=?")
+            parameters.append(str(playlist_id))
+        if sync_source_id is not None:
+            clauses.append("sync_source_id=?")
+            parameters.append(int(sync_source_id))
+        if source_item_id is not None:
+            clauses.append("source_item_id=?")
+            parameters.append(str(source_item_id))
+        self.conn.execute(
+            "UPDATE sync_failures SET status='resolved', resolved_at=? WHERE "
+            + " AND ".join(clauses),
+            parameters,
+        )
         self.conn.commit()
 
-    def unresolved_failure_count(self) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) FROM sync_failures WHERE status='unresolved'"
-        ).fetchone()
-        return int(row[0]) if row else 0
+    def unresolved_failure_count(self, sync_source_id: int | None = None) -> int:
+        query = "SELECT COUNT(*) FROM sync_failures WHERE status='unresolved'"
+        parameters: tuple[object, ...] = ()
+        if sync_source_id is not None:
+            query += " AND sync_source_id=?"
+            parameters = (int(sync_source_id),)
+        row = self.conn.execute(query, parameters).fetchone()
+        structured_count = int(row[0]) if row else 0
 
-    def list_sync_failures(self, status: str | None = None) -> list[sqlite3.Row]:
-        if status is None:
-            query = "SELECT * FROM sync_failures ORDER BY last_attempt_at DESC, id DESC"
-            return list(self.conn.execute(query))
-        return list(self.conn.execute(
-            "SELECT * FROM sync_failures WHERE status=? ORDER BY last_attempt_at DESC, id DESC",
-            (status,),
-        ))
+        item_query = """
+            SELECT COUNT(*)
+            FROM sync_source_items AS item
+            WHERE item.removed_at IS NULL
+              AND NULLIF(TRIM(item.last_error), '') IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sync_failures AS failure
+                  WHERE failure.status='unresolved'
+                    AND failure.sync_source_id=item.source_id
+                    AND (
+                        (
+                            NULLIF(TRIM(failure.source_item_id), '') IS NOT NULL
+                            AND failure.source_item_id=item.source_item_id
+                        )
+                        OR (
+                            NULLIF(TRIM(failure.source_item_id), '') IS NULL
+                            AND NULLIF(TRIM(failure.video_id), '') IS NOT NULL
+                            AND NULLIF(TRIM(item.video_id), '') IS NOT NULL
+                            AND failure.video_id=item.video_id
+                        )
+                    )
+              )
+        """
+        item_parameters: tuple[object, ...] = ()
+        if sync_source_id is not None:
+            item_query += " AND item.source_id=?"
+            item_parameters = (int(sync_source_id),)
+        item_row = self.conn.execute(item_query, item_parameters).fetchone()
+        item_count = int(item_row[0]) if item_row else 0
+        return structured_count + item_count
 
-    def clear_failure_history(self) -> None:
-        self.conn.execute("DELETE FROM sync_failures")
-        self.conn.commit()
+    def list_sync_failures(
+        self,
+        status: str | None = None,
+        *,
+        sync_source_id: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if status is not None:
+            clauses.append("status=?")
+            parameters.append(status)
+        if sync_source_id is not None:
+            clauses.append("sync_source_id=?")
+            parameters.append(int(sync_source_id))
+        query = "SELECT * FROM sync_failures"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY last_attempt_at DESC, id DESC"
+        return list(self.conn.execute(query, parameters))
+
+    def clear_failure_history(self, sync_source_id: int | None = None) -> None:
+        with self.conn:
+            if sync_source_id is None:
+                self.conn.execute("DELETE FROM sync_failures")
+                self.conn.execute(
+                    "UPDATE sync_source_items SET last_error=NULL "
+                    "WHERE removed_at IS NULL AND last_error IS NOT NULL"
+                )
+            else:
+                source_id = int(sync_source_id)
+                self.conn.execute(
+                    "DELETE FROM sync_failures WHERE sync_source_id=?",
+                    (source_id,),
+                )
+                self.conn.execute(
+                    "UPDATE sync_source_items SET last_error=NULL "
+                    "WHERE source_id=? AND removed_at IS NULL "
+                    "AND last_error IS NOT NULL",
+                    (source_id,),
+                )
 
     def import_legacy_failures(self, failed_file: str | Path) -> int:
         marker = self.conn.execute(

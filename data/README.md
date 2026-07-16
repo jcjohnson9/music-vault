@@ -8,8 +8,9 @@ contain no user library or credentials.
 
 Never commit user databases, API keys, configuration, status files, download
 archives, failed-item records, media, cover art, artist images, metadata reports,
-backups, logs, lyrics, lyric-provider results, or private playlist information
-from this directory.
+backups, logs, lyrics, lyric-provider results, saved source definitions, source
+URLs/labels/titles, source-item memberships, run history, destination mappings,
+or private playlist information from this directory.
 
 Music Vault may create timestamped SQLite migration backups under `backups/`
 and a neutral external App Status document named `music_vault_status.json`.
@@ -34,6 +35,16 @@ content-addressed storage under `covers/manual/`, and explicitly approved
 candidate artwork uses a provider-specific directory under `covers/`. These
 files and schema-migration backups must never be committed or included in a public
 build. Clear, reset, and undo do not automatically delete older cover files.
+
+The current v1.1.0 development line advances new and migrated local databases
+to schema version 5. It adds saved synchronization sources, durable
+playlist-item occurrences, source runs, global video-to-track identities,
+identity-conflict diagnostics, and manual/source playlist origins. These tables
+may reveal private source and library organization and belong only in the local
+database. New source downloads use
+`youtube_downloads/sources/<stable-storage-key>/`; existing media remains where
+it is and is reused rather than moved. Source archive, remote removal, and safe
+detachment do not delete media.
 
 Private remediation reports live under `metadata_reports/<job-id>/`. Provider
 cache rows remain in the SQLite database, and per-job original media backups

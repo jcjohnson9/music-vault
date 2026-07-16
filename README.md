@@ -13,9 +13,10 @@ public or unlisted YouTube playlists into a persistent local library.
 licensing, and known-limit details.
 
 **Current main development line: v1.1.0 Development.** Batch 9 adds
-full-screen audio-reactive Party Mode; Batch 9.1 refines its musical motion and
-adds optional local-first lyrics. No v1.1.0 tag or public v1.1.0 release has
-been created. Music Vault has no Watchtower relationship or runtime dependency.
+full-screen audio-reactive Party Mode, Batch 9.1 refines its musical motion and
+adds optional local-first lyrics, and Batch 10 adds persistent Multiple Source
+Playlists. No v1.1.0 tag or public v1.1.0 release has been created. Music Vault
+has no Watchtower relationship or runtime dependency.
 
 ## Install the portable release
 
@@ -42,8 +43,10 @@ downloaded automatically.
 - Seek, persisted volume, default Windows audio output, autoplay, shuffle,
   repeat, and a FIFO manual queue that resumes its original context
 - Optional authorized public/unlisted YouTube playlist synchronization with
-  full pagination, incremental video-ID reconciliation, structured failures,
-  retry, and truthful completion states
+  persistent saved sources, sequential Sync Selected/Sync All execution,
+  cross-source video deduplication, origin-aware managed local playlists,
+  complete-snapshot reconciliation, structured failures, retry, and truthful
+  per-source/aggregate completion states
 - Local settings for downloads, conversion quality, API readiness, FFmpeg
   readiness, data location, and a non-admin desktop shortcut
 - Trusted Metadata editing with provenance, protected manual/confirmed values,
@@ -79,6 +82,17 @@ visual pipeline records no audio or PCM and performs no networking; only the
 separately enabled lyrics lookup may send the current title, artist, optional
 album, and duration to LRCLIB. See [Party Mode](docs/PARTY_MODE.md) and
 [Lyrics](docs/LYRICS.md).
+
+Multiple Source Playlists replaces the one-URL synchronization form with a
+persistent Sync Center source manager. Each authorized public or unlisted
+playlist retains independent identity, order, destination, membership, history,
+and failure state. A source can target Library Only or one managed local
+playlist; remote tracks appear first while manual additions remain after them.
+Sync All runs enabled sources sequentially so overlapping videos reuse one
+canonical library track and one valid media file. Failed/partial enumeration
+never infers removals, and source removal safely preserves the local playlist,
+library, media, metadata, artwork, lyrics, and history. See
+[Multiple Source Playlists](docs/MULTIPLE_SOURCE_PLAYLISTS.md).
 
 ## First launch and local data
 
@@ -166,11 +180,12 @@ proposing a change.
 ## Product boundaries and roadmap
 
 Music Vault is a standalone application. Neutral Prime interoperability is only
-a possible external future option. Android, multiple source playlists, Best
-Original quality, an installer/updater, an editable queue panel, and personal
-radio are not V1 requirements. Batch 9 Party Mode and Batch 9.1 motion/lyrics
-refinement are complete on the v1.1.0 development line; Batch 10 Multiple
-Source Playlists is next. See the [roadmap](docs/ROADMAP.md).
+a possible external future option. Android, Best Original quality, an
+installer/updater, an editable queue panel, and personal radio are not V1
+requirements. Batch 9 Party Mode, Batch 9.1 motion/lyrics refinement, and Batch
+10 Multiple Source Playlists are complete on the v1.1.0 development line;
+Batch 11 Highest-Practical-Quality / Best Original is next. See the
+[roadmap](docs/ROADMAP.md).
 
 ## Licensing
 

@@ -189,6 +189,59 @@ QLabel#LogoBadge {{
     border-radius: 20px;
 }}
 
+QLabel#ManagedSourceBadge,
+QLabel#SyncStatusBadge {{
+    background: {c['selection']};
+    border: 1px solid {c['accent_pressed']};
+    border-radius: 9px;
+    color: {c['now_playing']};
+    font-size: {t['caption_size']}px;
+    font-weight: 700;
+    padding: 3px 8px;
+}}
+
+QLabel#SyncStatusBadge[syncState="complete_with_issues"] {{
+    background: #2A2112;
+    border-color: {c['warning']};
+    color: {c['warning']};
+}}
+
+QLabel#SyncStatusBadge[syncState="failed"] {{
+    background: #2C1519;
+    border-color: {c['danger']};
+    color: {c['danger']};
+}}
+
+QLabel#SyncStatusBadge[syncState="idle"] {{
+    background: {c['subtle_surface']};
+    border-color: {c['border']};
+    color: {c['text_muted']};
+}}
+
+QLabel#SyncSourceError,
+QLabel#PreservationNotice,
+QLabel#DialogError {{
+    background: {c['subtle_surface']};
+    border: 1px solid {c['border']};
+    border-radius: {r['control']}px;
+    color: {c['text_secondary']};
+    padding: 9px 11px;
+}}
+
+QLabel#SyncSourceError[hasError="true"],
+QLabel#DialogError {{
+    background: #2C1519;
+    border-color: {c['danger']};
+    color: {c['danger_hover']};
+}}
+
+QLabel#PreservationNotice {{
+    background: {c['selection']};
+    border-color: {c['accent_pressed']};
+    color: {c['now_playing']};
+    font-weight: 650;
+}}
+
 QFrame#MainShell,
 QFrame#SectionHeader {{
     background: transparent;
@@ -199,6 +252,10 @@ QWidget#PlayerRegion,
 QFrame#PlayerRegion,
 QWidget#PlayerCenter,
 QFrame#PlayerCenter,
+QScrollArea#SyncScroll,
+QScrollArea#SyncScroll > QWidget,
+QScrollArea#SyncScroll > QWidget > QWidget,
+QScrollArea#SyncScroll QWidget#qt_scrollarea_viewport,
 QScrollArea#SettingsScroll,
 QScrollArea#SettingsScroll > QWidget,
 QScrollArea#SettingsScroll > QWidget > QWidget,
@@ -547,6 +604,60 @@ QListWidget#PlaylistList::item:selected {{
     color: {c['text_primary']};
 }}
 
+QListWidget#SyncSourceList {{
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0;
+}}
+
+QListWidget#SyncSourceList::item {{
+    background: transparent;
+    border: none;
+    padding: 0;
+}}
+
+QListWidget#SyncHistoryList,
+QListWidget#SyncFailureList {{
+    background: {c['subtle_surface']};
+    border: 1px solid {c['border']};
+    border-radius: {r['control']}px;
+    color: {c['text_secondary']};
+    outline: none;
+    padding: 4px;
+}}
+
+QListWidget#SyncHistoryList::item,
+QListWidget#SyncFailureList::item {{
+    min-height: 40px;
+    border-bottom: 1px solid {c['border']};
+    padding: 7px 9px;
+}}
+
+QSplitter#SyncSourceSplitter::handle {{
+    background: transparent;
+    width: 10px;
+}}
+
+QTabWidget#SyncDetailTabs::pane {{
+    border: 1px solid {c['border']};
+    border-radius: 10px;
+    background: {c['subtle_surface']};
+    top: -1px;
+}}
+
+QTabWidget#SyncDetailTabs QTabBar::tab {{
+    background: transparent;
+    color: {c['text_secondary']};
+    padding: 8px 12px;
+    border-bottom: 2px solid transparent;
+}}
+
+QTabWidget#SyncDetailTabs QTabBar::tab:selected {{
+    color: {c['text_primary']};
+    border-bottom-color: {c['accent']};
+}}
+
 QTableWidget#LibraryTable,
 QTableView {{
     background: {c['subtle_surface']};
@@ -865,7 +976,9 @@ QSlider::handle:horizontal:focus {{
     border: 2px solid {c['focus_ring']};
 }}
 
-QDialog#MetadataEditorDialog {{
+QDialog#MetadataEditorDialog,
+QDialog#SyncSourceDialog,
+QDialog#RemoveSyncSourceDialog {{
     background: {c['app_background']};
 }}
 

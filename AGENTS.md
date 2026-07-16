@@ -27,6 +27,9 @@
 - Never run a real YouTube sync unless a future batch explicitly authorizes it.
 - Preserve the existing working queue behavior unless a batch explicitly
   changes it.
+- Preserve canonical cross-source track identity and every source/manual
+  playlist origin; source detach, archive, or remote removal must never delete
+  personal media or silently erase unrelated membership.
 - Treat manual and user-confirmed metadata locks as authoritative; preserve
   provenance/history, and never rewrite audio-file tags without explicit batch
   authorization.

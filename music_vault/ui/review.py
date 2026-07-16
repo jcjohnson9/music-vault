@@ -93,6 +93,20 @@ REMEDIATION_REVIEW_SCENES = (
 
 PARTY_REVIEW_SCENES = ("party_mode_smoke",)
 
+MULTI_SOURCE_REVIEW_SCENES = (
+    "sync_sources_empty",
+    "sync_sources_list",
+    "sync_source_add",
+    "sync_source_edit",
+    "sync_all_running",
+    "sync_complete_issues",
+    "sync_source_failures",
+    "sync_managed_playlist",
+    "sync_source_remove",
+)
+
+_BATCH10_REVIEW_MARKER = "synthetic_batch10_smoke.json"
+
 SCENE_LABELS = {
     "library": "Library",
     "albums": "Albums",
@@ -138,6 +152,15 @@ SCENE_LABELS = {
     "remediation_rolled_back": "Remediation - Rolled Back",
     "remediation_long_values": "Remediation - Long Values",
     "party_mode_smoke": "Party Mode - Packaged Synthetic Smoke",
+    "sync_sources_empty": "Sync Center - Empty Source Manager",
+    "sync_sources_list": "Sync Center - Three Saved Sources",
+    "sync_source_add": "Sync Center - Add Source",
+    "sync_source_edit": "Sync Center - Edit Source",
+    "sync_all_running": "Sync Center - Sync All Running",
+    "sync_complete_issues": "Sync Center - Complete with Issues",
+    "sync_source_failures": "Sync Center - Source Failure History",
+    "sync_managed_playlist": "Managed Local Playlist",
+    "sync_source_remove": "Sync Center - Remove Source Safely",
 }
 
 _DISPLAY_DATA_ROOT = r"<synthetic-runtime>\data"
@@ -320,8 +343,8 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     finally:
         connection.close()
-    if schema_version != 4:
-        raise ReviewPlanError("Synthetic database schema is not version 4.")
+    if schema_version != 5:
+        raise ReviewPlanError("Synthetic database schema is not version 5.")
 
     status_file = Path(resolved_paths["status"])
     try:
@@ -1091,7 +1114,7 @@ def validate_party_review_behaviors(
         "packaged_process": bool(getattr(sys, "frozen", False)),
         "synthetic_fixture_validated": True,
         "network_guard_active": _REVIEW_NETWORK_GUARD_INSTALLED,
-        "network_attempt_count": 0,
+        "network_attempt_count": len(_REVIEW_NETWORK_EVENTS),
         "party_button_present": True,
         "f11_opened": True,
         "f11_closed": True,
@@ -1788,6 +1811,776 @@ def _set_metric(window: object, attribute: str, value: str) -> None:
         value_label.setText(value)
 
 
+def _batch10_review_sources() -> tuple[dict[str, object], ...]:
+    """Return display-only source cards containing no personal identifiers."""
+
+    common = {
+        "source_kind": "youtube_playlist",
+        "last_sync_at": "2026-07-15T18:30:00Z",
+        "last_visible_count": 0,
+        "last_new_count": 0,
+        "last_imported_count": 0,
+        "last_error": None,
+    }
+    return (
+        {
+            **common,
+            "id": 7101,
+            "external_id": "PLSYNTHETIC_SOURCE_A_001",
+            "source_url": "https://www.youtube.com/playlist?list=PLSYNTHETIC_SOURCE_A_001",
+            "label": "Morning Rotation",
+            "remote_title": "Synthetic Source Alpha",
+            "enabled": True,
+            "sort_order": 0,
+            "destination_kind": "playlist",
+            "destination_playlist_id": 8101,
+            "destination_playlist_name": "Morning Rotation Mix",
+            "storage_key": "youtube_source_a_2f2fd3d001",
+            "last_sync_status": "complete",
+            "last_downloaded_count": 4,
+            "last_imported_count": 4,
+            "last_existing_count": 18,
+            "last_failed_count": 0,
+            "unresolved_failure_count": 0,
+        },
+        {
+            **common,
+            "id": 7102,
+            "external_id": "PLSYNTHETIC_SOURCE_B_002",
+            "source_url": "https://www.youtube.com/playlist?list=PLSYNTHETIC_SOURCE_B_002",
+            "label": "Late Night Finds",
+            "remote_title": "Synthetic Source Beta",
+            "enabled": True,
+            "sort_order": 1,
+            "destination_kind": "playlist",
+            "destination_playlist_id": 8102,
+            "destination_playlist_name": "Late Night Finds",
+            "storage_key": "youtube_source_b_5a52ca9202",
+            "last_sync_status": "complete_with_issues",
+            "last_downloaded_count": 2,
+            "last_imported_count": 2,
+            "last_existing_count": 11,
+            "last_failed_count": 1,
+            "unresolved_failure_count": 1,
+            "last_error": "One unavailable playlist item remains recorded for review.",
+        },
+        {
+            **common,
+            "id": 7103,
+            "external_id": "PLSYNTHETIC_SOURCE_C_003",
+            "source_url": "https://www.youtube.com/playlist?list=PLSYNTHETIC_SOURCE_C_003",
+            "label": "Library Discovery",
+            "remote_title": "Synthetic Source Gamma",
+            "enabled": False,
+            "sort_order": 2,
+            "destination_kind": "library",
+            "destination_playlist_id": None,
+            "destination_playlist_name": None,
+            "storage_key": "youtube_source_c_a8e3f17c03",
+            "last_sync_status": "failed",
+            "last_downloaded_count": 0,
+            "last_imported_count": 0,
+            "last_existing_count": 7,
+            "last_failed_count": 1,
+            "unresolved_failure_count": 1,
+            "last_error": "The synthetic provider was temporarily unavailable.",
+        },
+    )
+
+
+def _batch10_review_summary() -> dict[str, int]:
+    return {
+        "enabled_sources": 2,
+        "completed_sources": 1,
+        "issue_sources": 1,
+        "failed_sources": 1,
+        "downloaded": 6,
+        "existing": 36,
+        "failed_items": 2,
+    }
+
+
+def _batch10_review_runs() -> tuple[dict[str, object], ...]:
+    return (
+        {
+            "status": "complete_with_issues",
+            "finished_at": "2026-07-15T18:30:00Z",
+            "downloaded_count": 2,
+            "existing_count": 11,
+            "failed_count": 1,
+        },
+        {
+            "status": "complete",
+            "finished_at": "2026-07-14T18:30:00Z",
+            "downloaded_count": 1,
+            "existing_count": 12,
+            "failed_count": 0,
+        },
+    )
+
+
+def _batch10_review_failures() -> tuple[dict[str, str], ...]:
+    return (
+        {
+            "title": "Unavailable synthetic playlist item",
+            "reason": "This item is unavailable through the supported public/unlisted workflow.",
+        },
+    )
+
+
+def _sync_center_widget(window: object):
+    widget = getattr(window, "sync_center", None)
+    if widget is None or not callable(getattr(widget, "apply_review_state", None)):
+        raise ReviewPlanError("The persistent Sync Center review surface is unavailable.")
+    return widget
+
+
+def _close_review_sync_dialog(window: object) -> None:
+    for attribute in (
+        "_review_sync_source_dialog",
+        "_review_sync_remove_confirmation",
+    ):
+        dialog = getattr(window, attribute, None)
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+        setattr(window, attribute, None)
+
+
+def _batch10_review_normalizer(value: str):
+    from music_vault.core.sync_sources import NormalizedYouTubeSource
+
+    external_id = str(value or "").strip() or "PLSYNTHETIC_NEW_SOURCE_004"
+    return NormalizedYouTubeSource(
+        external_id=external_id,
+        source_url=f"https://www.youtube.com/playlist?list={external_id}",
+    )
+
+
+def _prepare_batch10_sync_scene(window: object, scene: str) -> None:
+    from music_vault.ui.sync_center import RemoveSourceDialog, SourceEditorDialog
+
+    sources = _batch10_review_sources()
+    summary = _batch10_review_summary()
+    _set_page(window, "sync_page")
+    widget = _sync_center_widget(window)
+    if scene == "sync_sources_empty":
+        widget.apply_review_state("empty")
+        return
+
+    state = {
+        "sync_all_running": "syncing",
+        "sync_complete_issues": "complete_with_issues",
+        "sync_source_failures": "source_failures",
+    }.get(scene, "sources")
+    widget.apply_review_state(
+        state,
+        sources=sources,
+        summary=summary,
+        runs=_batch10_review_runs(),
+        failures=(
+            _batch10_review_failures() if scene == "sync_source_failures" else ()
+        ),
+        activity=(
+            "Source 1 complete: 4 downloaded, 18 existing.\n"
+            "Source 2 complete with one unavailable item.\n"
+            "No network request was made by this review fixture."
+        ),
+    )
+    if scene == "sync_source_failures":
+        widget.detail_tabs.setCurrentWidget(widget.failure_history)
+    if scene == "sync_source_add":
+        dialog = SourceEditorDialog(
+            playlists=(
+                {"id": 8201, "name": "Synthetic Destination", "managing_source_id": None},
+            ),
+            normalize_source=_batch10_review_normalizer,
+            parent=window,
+        )
+        dialog.source_value.setText("PLSYNTHETIC_NEW_SOURCE_004")
+        dialog.label.setText("Weekend Discoveries")
+        dialog.destination.setCurrentIndex(1)
+        dialog.new_playlist_name.setText("Weekend Discoveries")
+        setattr(window, "_review_sync_source_dialog", dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+    elif scene == "sync_source_edit":
+        dialog = SourceEditorDialog(
+            source=sources[0],
+            playlists=(
+                {
+                    "id": 8101,
+                    "name": "Morning Rotation Mix",
+                    "managing_source_id": 7101,
+                },
+            ),
+            normalize_source=_batch10_review_normalizer,
+            parent=window,
+        )
+        setattr(window, "_review_sync_source_dialog", dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+    elif scene == "sync_source_remove":
+        dialog = RemoveSourceDialog(sources[0], parent=window)
+        setattr(window, "_review_sync_remove_confirmation", dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+
+def _prepare_batch10_managed_playlist_scene(window: object) -> None:
+    row = window.db.conn.execute(
+        """
+        SELECT sources.destination_playlist_id, playlists.name
+        FROM sync_sources AS sources
+        JOIN playlists ON playlists.id=sources.destination_playlist_id
+        WHERE sources.archived_at IS NULL
+          AND sources.destination_kind='playlist'
+        ORDER BY sources.sort_order, sources.id
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        raise ReviewPlanError("The synthetic managed-playlist scenario is unavailable.")
+    playlist_id = int(row["destination_playlist_id"])
+    playlist_name = str(row["name"])
+    _set_page(window, "library_page")
+    window.current_view_kind = "custom"
+    window.current_playlist_id = playlist_id
+    window.current_playlist_name = playlist_name
+    window.load_library(
+        window.db.get_playlist_tracks(playlist_id),
+        playlist_name,
+        "Managed by a saved source. Manual additions remain after synchronized tracks.",
+    )
+    refresh = getattr(window, "update_managed_playlist_presentation", None)
+    if callable(refresh):
+        refresh()
+
+
+def _batch10_playlist_video_order(db: object, playlist_id: int) -> tuple[str, ...]:
+    rows = db.conn.execute(
+        """
+        SELECT tracks.source_video_id, tracks.title
+        FROM playlist_tracks
+        JOIN tracks ON tracks.id=playlist_tracks.track_id
+        WHERE playlist_tracks.playlist_id=?
+        ORDER BY playlist_tracks.position, tracks.id
+        """,
+        (int(playlist_id),),
+    ).fetchall()
+    return tuple(
+        str(row["source_video_id"] or row["title"] or "manual") for row in rows
+    )
+
+
+def _batch10_playback_snapshot(window: object) -> dict[str, object]:
+    player = getattr(window, "player", None)
+    return {
+        "player": player,
+        "player_state": player.playbackState() if player is not None else None,
+        "player_source": player.source() if player is not None else None,
+        "current_track_id": getattr(window, "current_track_id", None),
+        "manual_queue": tuple(getattr(window, "manual_queue", ())),
+        "base_playback_context": copy.deepcopy(
+            getattr(window, "base_playback_context", None)
+        ),
+        "party_mode_window": getattr(window, "party_mode_window", None),
+        "party_mode_active": bool(getattr(window, "party_mode_active", False)),
+        "party_mode_preset": (
+            getattr(window, "config", {}).get("party_mode_preset")
+            if isinstance(getattr(window, "config", None), dict)
+            else None
+        ),
+        "party_lyrics_enabled": (
+            getattr(window, "config", {}).get("party_mode_lyrics_enabled")
+            if isinstance(getattr(window, "config", None), dict)
+            else None
+        ),
+        "lyrics_online_enabled": (
+            getattr(window, "config", {}).get("lyrics_online_lookup_enabled")
+            if isinstance(getattr(window, "config", None), dict)
+            else None
+        ),
+    }
+
+
+def _batch10_playback_unchanged(window: object, before: dict[str, object]) -> bool:
+    after = _batch10_playback_snapshot(window)
+    return all(
+        (
+            after[name] is before[name]
+            if name in {"player", "party_mode_window"}
+            else after[name] == before[name]
+        )
+        for name in before
+    )
+
+
+def validate_batch10_multi_source_behaviors(
+    window: object,
+    plan: ReviewPlan,
+) -> dict[str, object]:
+    """Exercise the complete Batch 10 scenario with injected offline providers.
+
+    This hook runs only for an explicit, isolated UI-review plan. It writes no
+    production fixture, opens no network connection, and never reads a key.
+    A marker lets the harness launch one fresh process per capture without
+    repeating the database scenario against the same disposable runtime.
+    """
+
+    marker = plan.runtime_root / "data" / _BATCH10_REVIEW_MARKER
+    _ensure_under_runtime(marker, plan.runtime_root, "batch10_review_marker")
+    if marker.is_file():
+        try:
+            cached = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ReviewPlanError("The Batch 10 synthetic smoke marker is invalid.") from exc
+        if not isinstance(cached, dict) or cached.get("scenario_completed") is not True:
+            raise ReviewPlanError("The Batch 10 synthetic smoke marker is incomplete.")
+        return cached
+
+    if os.environ.get("MUSIC_VAULT_DISABLE_NETWORK") != "1":
+        raise ReviewPlanError("Batch 10 smoke requires the explicit network-disabled runtime.")
+    if (plan.runtime_root / "data" / "youtube_api_key.txt").exists():
+        raise ReviewPlanError("Batch 10 smoke found an unexpected API-key file.")
+
+    from PySide6.QtMultimedia import QMediaPlayer
+
+    from music_vault.core.multi_source_sync import MultiSourceSyncOrchestrator
+    from music_vault.core.playlist_membership import PlaylistMembershipService
+    from music_vault.core.sync_result import (
+        PlaylistSnapshot,
+        PlaylistSnapshotItem,
+        SyncFailure,
+        SyncImportItem,
+        SyncResult,
+        utc_now,
+    )
+    from music_vault.core.sync_sources import SyncSourceService
+    from music_vault.ui.sync_center import multi_source_status_payload
+
+    db = window.db
+    playback_before = _batch10_playback_snapshot(window)
+    media_players_before = tuple(window.findChildren(QMediaPlayer))
+    data_root = plan.runtime_root / "data"
+    downloads = data_root / "youtube_downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    membership = PlaylistMembershipService(db)
+    source_service = SyncSourceService(db, membership_service=membership)
+
+    manual_path = data_root / "synthetic_sentinels" / "batch10_manual_x.synthetic-audio"
+    manual_path.parent.mkdir(parents=True, exist_ok=True)
+    manual_path.write_bytes(b"synthetic-batch10-manual-track\n")
+    manual_track_id = db.upsert_track(
+        manual_path,
+        title="Manual Track X",
+        artist="Synthetic Review",
+        album="Batch 10 Offline Fixture",
+        source_kind="local",
+    )
+    playlist_a = db.create_playlist("Batch 10 Managed A")
+    playlist_b = db.create_playlist("Batch 10 Managed B")
+    db.add_track_to_playlist(playlist_a, manual_track_id)
+
+    source_a = source_service.create_source(
+        "PLSYNTHETIC_SOURCE_A_001",
+        label="Synthetic Source A",
+        destination_kind="playlist",
+        destination_playlist_id=playlist_a,
+    )
+    source_b = source_service.create_source(
+        "PLSYNTHETIC_SOURCE_B_002",
+        label="Synthetic Source B",
+        destination_kind="playlist",
+        destination_playlist_id=playlist_b,
+    )
+    source_c = source_service.create_source(
+        "PLSYNTHETIC_SOURCE_C_003",
+        label="Synthetic Source C",
+        destination_kind="library",
+    )
+    source_service.reorder((source_a.id, source_b.id, source_c.id))
+    added_source = source_service.get(source_a.id)
+    stable_external_id = added_source.external_id
+    stable_storage_key = added_source.storage_key
+    edited_library = source_service.update_source(
+        source_a.id,
+        label="Synthetic Source A Edited",
+        enabled=False,
+        destination_kind="library",
+    )
+    edited_managed = source_service.update_source(
+        source_a.id,
+        label="Synthetic Source A",
+        enabled=True,
+        destination_kind="playlist",
+        destination_playlist_id=playlist_a,
+    )
+    source_service.reorder((source_c.id, source_b.id, source_a.id))
+    reordered_ids = tuple(source.id for source in source_service.list_active())
+    source_service.reorder((source_a.id, source_b.id, source_c.id))
+    restored_ids = tuple(source.id for source in source_service.list_active())
+    add_source_persisted = bool(
+        len(restored_ids) == 3
+        and added_source.destination_playlist_id == playlist_a
+        and added_source.destination_kind == "playlist"
+    )
+    edit_source_persisted = bool(
+        edited_library.label == "Synthetic Source A Edited"
+        and edited_library.enabled is False
+        and edited_library.destination_kind == "library"
+        and edited_library.destination_playlist_id is None
+        and edited_managed.label == "Synthetic Source A"
+        and edited_managed.enabled is True
+        and edited_managed.destination_kind == "playlist"
+        and edited_managed.destination_playlist_id == playlist_a
+        and reordered_ids == (source_c.id, source_b.id, source_a.id)
+        and restored_ids == (source_a.id, source_b.id, source_c.id)
+    )
+    edit_identity_stable = bool(
+        edited_library.external_id
+        == edited_managed.external_id
+        == stable_external_id
+    )
+    edit_storage_key_stable = bool(
+        edited_library.storage_key
+        == edited_managed.storage_key
+        == stable_storage_key
+    )
+
+    videos = {
+        "A": "synvideoA01",
+        "B": "synvideoB01",
+        "C": "synvideoC01",
+        "D": "synvideoD01",
+        "E": "synvideoE01",
+        "F": "synvideoF01",
+        "U": "unavail0001",
+    }
+    snapshots: dict[int, tuple[tuple[str, str | None, str | None], ...]] = {
+        source_a.id: (
+            ("a-item-a", videos["A"], None),
+            ("a-item-b-first", videos["B"], None),
+            ("a-item-b-duplicate", videos["B"], None),
+            ("a-item-c", videos["C"], None),
+        ),
+        source_b.id: (
+            ("b-item-b", videos["B"], None),
+            ("b-item-d", videos["D"], None),
+            ("b-item-unavailable", videos["U"], "Unavailable synthetic item."),
+        ),
+        source_c.id: (("c-item-e", videos["E"], None),),
+    }
+    second_a_snapshot = (
+        ("a-item-c", videos["C"], None),
+        ("a-item-b-first", videos["B"], None),
+        ("a-item-f", videos["F"], None),
+    )
+    source_calls: dict[int, int] = {}
+    download_counts: dict[str, int] = {}
+    provider_calls: list[int] = []
+
+    class _OfflineSyncer:
+        def __init__(self, config, _progress) -> None:
+            self.config = config
+
+        def sync(self) -> SyncResult:
+            source_id = int(self.config.saved_source_id)
+            provider_calls.append(source_id)
+            call = source_calls.get(source_id, 0) + 1
+            source_calls[source_id] = call
+            if source_id == source_b.id and call >= 2:
+                return SyncResult.failed_result(
+                    "Synthetic top-level provider failure.",
+                    playlist_id=source_b.external_id,
+                    playlist_title="Synthetic Source B",
+                    saved_source_id=source_id,
+                    snapshot=PlaylistSnapshot.failed(
+                        "Synthetic top-level provider failure.",
+                        playlist_id=source_b.external_id,
+                    ),
+                )
+
+            definitions = (
+                second_a_snapshot
+                if source_id == source_a.id and call >= 2
+                else snapshots[source_id]
+            )
+            source = source_service.get(source_id)
+            snapshot_items = tuple(
+                PlaylistSnapshotItem(
+                    source_item_id=item_id,
+                    video_id=video_id,
+                    source_position=position,
+                    title=f"Synthetic Item {position + 1}",
+                    availability_reason=unavailable,
+                )
+                for position, (item_id, video_id, unavailable) in enumerate(definitions)
+            )
+            snapshot = PlaylistSnapshot.completed(
+                source.external_id,
+                f"Synthetic Remote {source_id}",
+                snapshot_items,
+            )
+            result = SyncResult(
+                status="complete",
+                playlist_id=source.external_id,
+                playlist_title=f"Synthetic Remote {source_id}",
+                visible_item_count=len(snapshot_items),
+                saved_source_id=source_id,
+                source_label=source.display_label,
+                snapshot=snapshot,
+                duplicate_occurrence_count=snapshot.duplicate_occurrence_count,
+            )
+            known = set(self.config.existing_video_ids)
+            known.update(
+                video_id
+                for video_id, path in self.config.known_downloads or ()
+                if Path(path).is_file()
+            )
+            occurrence_ids: dict[str, list[str]] = {}
+            for item in snapshot.items:
+                if item.video_id:
+                    occurrence_ids.setdefault(item.video_id, []).append(item.source_item_id)
+            processed: set[str] = set()
+            for item in snapshot.items:
+                if item.availability_reason:
+                    result.add_failure(
+                        SyncFailure(
+                            item.video_id,
+                            item.title,
+                            item.availability_reason,
+                            "unavailable",
+                            item.source_item_id,
+                        )
+                    )
+                    continue
+                if not item.video_id or item.video_id in processed:
+                    continue
+                processed.add(item.video_id)
+                if item.video_id in known:
+                    result.existing_count += 1
+                    result.successful_video_ids.add(item.video_id)
+                    continue
+                destination = Path(self.config.source_destination_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                media = destination / f"{item.video_id}.synthetic-audio"
+                media.write_bytes(b"synthetic-batch10-source-track\n")
+                result.new_item_count += 1
+                result.downloaded_count += 1
+                result.downloaded_paths.append(str(media))
+                result.import_items.append(
+                    SyncImportItem(
+                        str(media),
+                        item.video_id,
+                        source_item_ids=tuple(occurrence_ids[item.video_id]),
+                    )
+                )
+                result.successful_video_ids.add(item.video_id)
+                download_counts[item.video_id] = download_counts.get(item.video_id, 0) + 1
+                known.add(item.video_id)
+            result.finished_at = utc_now()
+            result.refresh_status()
+            return result
+
+    def syncer_factory(config, progress):
+        return _OfflineSyncer(config, progress)
+
+    def importer(target_db, item: SyncImportItem) -> int:
+        return target_db.upsert_track(
+            item.path,
+            title=f"Synthetic Track {item.video_id}",
+            artist="Synthetic Review",
+            album="Batch 10 Offline Fixture",
+            source_kind="youtube",
+            source_video_id=item.video_id,
+        )
+
+    transitions: list[dict[str, object]] = []
+
+    def orchestrator() -> MultiSourceSyncOrchestrator:
+        return MultiSourceSyncOrchestrator(
+            db,
+            downloads,
+            archive_file=data_root / "synthetic_batch10_archive.txt",
+            source_service=source_service,
+            membership_service=membership,
+            syncer_factory=syncer_factory,
+            importer=importer,
+            transition_callback=lambda values: transitions.append(dict(values)),
+        )
+
+    first = orchestrator().sync_all_enabled()
+    first_a_order = _batch10_playlist_video_order(db, playlist_a)
+    first_b_order = _batch10_playlist_video_order(db, playlist_b)
+    duplicate_rows = int(
+        db.conn.execute(
+            "SELECT COUNT(*) FROM sync_source_items "
+            "WHERE source_id=? AND video_id=? AND removed_at IS NULL",
+            (source_a.id, videos["B"]),
+        ).fetchone()[0]
+    )
+
+    second = orchestrator().sync_selected((source_a.id,))
+    second_a_order = _batch10_playlist_video_order(db, playlist_a)
+    track_a = db.get_track_by_source_video_id(videos["A"])
+    track_a_preserved = bool(track_a and Path(str(track_a["path"])).is_file())
+
+    before_failure_b = _batch10_playlist_video_order(db, playlist_b)
+    failed_b = orchestrator().sync_selected((source_b.id,))
+    after_failure_b = _batch10_playlist_video_order(db, playlist_b)
+
+    source_failure_counts = {
+        int(row["sync_source_id"]): int(row["failure_count"])
+        for row in db.conn.execute(
+            """
+            SELECT sync_source_id, COUNT(*) AS failure_count
+            FROM sync_failures
+            WHERE sync_source_id IS NOT NULL AND status='unresolved'
+            GROUP BY sync_source_id
+            """
+        )
+    }
+    before_archive_a = _batch10_playlist_video_order(db, playlist_a)
+    source_service.archive(source_a.id)
+    after_archive_a = _batch10_playlist_video_order(db, playlist_a)
+
+    status_sync = multi_source_status_payload(
+        first,
+        sync_source_count=3,
+        enabled_sync_source_count=3,
+    )
+    write_status = getattr(window, "write_app_status", None)
+    if not callable(write_status):
+        raise ReviewPlanError("The App Status writer is unavailable during Batch 10 smoke.")
+    write_status({"sync": status_sync})
+    status_path = data_root / "music_vault_status.json"
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Batch 10 smoke did not produce valid App Status.") from exc
+    status_sync_written = status.get("sync") if isinstance(status, dict) else None
+    serialized_status = json.dumps(status_sync_written, sort_keys=True)
+    forbidden_values = {
+        source_a.external_id,
+        source_b.external_id,
+        source_c.external_id,
+        source_a.display_label,
+        source_b.display_label,
+        source_c.display_label,
+        *videos.values(),
+    }
+    aggregate_only_status = bool(
+        isinstance(status_sync_written, dict)
+        and status_sync_written.get("last_sync_batch_status")
+        == "complete_with_issues"
+        and status_sync_written.get("last_sync_playlist_title") is None
+        and status_sync_written.get("last_sync_playlist_id") is None
+        and status_sync_written.get("last_sync_failures") == []
+        and all(value not in serialized_status for value in forbidden_values)
+    )
+
+    expected_first_a = (
+        videos["A"],
+        videos["B"],
+        videos["C"],
+        "Manual Track X",
+    )
+    expected_b = (videos["B"], videos["D"])
+    expected_second_a = (
+        videos["C"],
+        videos["B"],
+        videos["F"],
+        "Manual Track X",
+    )
+    media_players_after = tuple(window.findChildren(QMediaPlayer))
+    playback_preserved = _batch10_playback_unchanged(window, playback_before)
+    required_order = [source_a.id, source_b.id, source_c.id, source_a.id, source_b.id]
+    behaviors: dict[str, object] = {
+        "schema_version": 1,
+        "scenario_completed": True,
+        "packaged_process": bool(getattr(sys, "frozen", False)),
+        "network_attempt_count": len(_REVIEW_NETWORK_EVENTS),
+        "api_key_absent": True,
+        "add_source_persisted": add_source_persisted,
+        "edit_source_persisted": edit_source_persisted,
+        "edit_identity_stable": edit_identity_stable,
+        "edit_storage_key_stable": edit_storage_key_stable,
+        "source_crud": len(source_service.list_active()) == 2,
+        "source_order_persisted": provider_calls == required_order,
+        "sequential_execution": provider_calls == required_order,
+        "source_a_duplicate_occurrences": duplicate_rows == 2,
+        "cross_source_single_download": download_counts.get(videos["B"], 0) == 1,
+        "first_playlist_a_order": first_a_order == expected_first_a,
+        "first_playlist_b_order": first_b_order == expected_b,
+        "library_only_source": source_c.destination_kind == "library",
+        "unavailable_item_truthful": first.total_failed_items == 1,
+        "aggregate_complete_with_issues": first.status == "complete_with_issues",
+        "second_snapshot_order": second_a_order == expected_second_a,
+        "remote_removal_preserves_media": track_a_preserved,
+        "remote_removal_recorded": second.total_removed_occurrences == 2,
+        "failed_enumeration_preserves_playlist": (
+            failed_b.status == "failed"
+            and before_failure_b == expected_b
+            and after_failure_b == expected_b
+        ),
+        "archive_preserves_playlist": (
+            before_archive_a == expected_second_a
+            and after_archive_a == expected_second_a
+        ),
+        "source_specific_failures": (
+            source_failure_counts.get(source_b.id, 0) == 1
+            and source_failure_counts.get(source_a.id, 0) == 0
+            and source_failure_counts.get(source_c.id, 0) == 0
+        ),
+        "aggregate_only_app_status": aggregate_only_status,
+        "playback_preserved": playback_preserved,
+        "queue_preserved": playback_preserved,
+        "base_context_preserved": playback_preserved,
+        "party_mode_preserved": (
+            playback_preserved
+            and callable(getattr(window, "toggle_party_mode", None))
+            and getattr(window, "party_mode_btn", None) is not None
+        ),
+        "lyrics_preserved": playback_preserved,
+        "same_media_player": (
+            media_players_before == media_players_after
+            and len(media_players_after) == 1
+            and media_players_after[0] is getattr(window, "player", None)
+        ),
+        "downloaded_unique_count": len(download_counts),
+        "source_run_count": int(
+            db.conn.execute("SELECT COUNT(*) FROM sync_source_runs").fetchone()[0]
+        ),
+        "transition_count": len(transitions),
+    }
+    required_true = {
+        key
+        for key in behaviors
+        if key
+        not in {
+            "schema_version",
+            "packaged_process",
+            "network_attempt_count",
+            "downloaded_unique_count",
+            "source_run_count",
+            "transition_count",
+        }
+    }
+    if any(behaviors.get(key) is not True for key in required_true):
+        failed = sorted(key for key in required_true if behaviors.get(key) is not True)
+        raise ReviewPlanError(
+            "Batch 10 synthetic multi-source behavior failed: " + ", ".join(failed)
+        )
+    temporary = marker.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(behaviors, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(marker)
+    return behaviors
+
+
 def _prepare_sync_issue_scene(window: object) -> None:
     visual_helper = getattr(window, "set_sync_visual_state", None)
     if callable(visual_helper):
@@ -2466,10 +3259,15 @@ def _prepare_metadata_scene(window: object, scene: str) -> None:
 def prepare_review_scene(window: object, scene: str) -> None:
     _close_review_metadata_dialog(window)
     _close_review_remediation_dialog(window)
+    _close_review_sync_dialog(window)
     if scene in METADATA_REVIEW_SCENES:
         _prepare_metadata_scene(window, scene)
     elif scene in REMEDIATION_REVIEW_SCENES:
         _prepare_remediation_scene(window, scene)
+    elif scene == "sync_managed_playlist":
+        _prepare_batch10_managed_playlist_scene(window)
+    elif scene in MULTI_SOURCE_REVIEW_SCENES:
+        _prepare_batch10_sync_scene(window, scene)
     elif scene == "library":
         _set_page(window, "library_page")
         search = getattr(window, "search_box", None)
@@ -2569,6 +3367,13 @@ def review_scene_ready(window: object, scene: str) -> bool:
     if scene in PARTY_REVIEW_SCENES:
         return True
 
+    if scene in {"sync_source_add", "sync_source_edit"}:
+        dialog = getattr(window, "_review_sync_source_dialog", None)
+        return bool(dialog is not None and dialog.isVisible())
+    if scene == "sync_source_remove":
+        dialog = getattr(window, "_review_sync_remove_confirmation", None)
+        return bool(dialog is not None and dialog.isVisible())
+
     if scene in METADATA_REVIEW_SCENES:
         dialog = getattr(window, "_review_metadata_dialog", None)
         if dialog is None or not dialog.isVisible():
@@ -2631,6 +3436,16 @@ def finalize_review_scene(window: object, scene: str) -> None:
         return
     if scene in REMEDIATION_REVIEW_SCENES:
         dialog = getattr(window, "_review_remediation_dialog", None)
+        if dialog is not None:
+            dialog.setFocus(Qt.FocusReason.OtherFocusReason)
+        return
+    if scene in {"sync_source_add", "sync_source_edit"}:
+        dialog = getattr(window, "_review_sync_source_dialog", None)
+        if dialog is not None:
+            dialog.setFocus(Qt.FocusReason.OtherFocusReason)
+        return
+    if scene == "sync_source_remove":
+        dialog = getattr(window, "_review_sync_remove_confirmation", None)
         if dialog is not None:
             dialog.setFocus(Qt.FocusReason.OtherFocusReason)
         return
@@ -2899,6 +3714,122 @@ def remediation_review_metrics(window: object, scene: str) -> dict[str, Any] | N
     }
 
 
+def multi_source_review_metrics(
+    window: object,
+    scene: str,
+) -> dict[str, object] | None:
+    if scene not in MULTI_SOURCE_REVIEW_SCENES:
+        return None
+
+    from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton
+
+    dialog = getattr(window, "_review_sync_source_dialog", None) or getattr(
+        window, "_review_sync_remove_confirmation", None
+    )
+    if scene == "sync_managed_playlist":
+        badge = getattr(window, "playlist_managed_badge", None)
+        table = getattr(window, "library_table", None)
+        rendered = "\n".join(
+            widget.text()
+            for widget in window.findChildren(QLabel)
+            if widget.isVisible()
+        )
+        return {
+            "state": scene,
+            "source_row_count": 0,
+            "per_source_widget_count": 0,
+            "selected_source_count": 0,
+            "enabled_source_count": 0,
+            "disabled_source_count": 0,
+            "action_button_count": 0,
+            "clipped_action_count": 0,
+            "dialog_visible": False,
+            "dialog_kind": None,
+            "private_path_visible": bool(_WINDOWS_PATH_RE.search(rendered)),
+            "api_key_field_visible": False,
+            "managed_badge_visible": bool(badge is not None and badge.isVisible()),
+            "managed_explanation_present": bool(
+                badge is not None
+                and "managed" in str(badge.text()).casefold()
+                and "source" in rendered.casefold()
+            ),
+            "playlist_track_count": int(table.rowCount()) if table is not None else 0,
+            "preservation_message_present": True,
+        }
+
+    widget = _sync_center_widget(window)
+    source_list = widget.source_list
+    buttons = [button for button in widget.findChildren(QPushButton) if button.isVisible()]
+    clipped = 0
+    for button in buttons:
+        top_left = button.mapTo(widget, QPoint(0, 0))
+        bounds = QRect(top_left, button.size())
+        if not widget.rect().contains(bounds):
+            clipped += 1
+    per_source_widgets = sum(
+        source_list.indexWidget(source_list.model().index(row, 0)) is not None
+        for row in range(source_list.count())
+    )
+    enabled = sum(
+        source_list.item(row).checkState() == Qt.CheckState.Checked
+        for row in range(source_list.count())
+    )
+    visible_labels = [
+        label.text()
+        for label in widget.findChildren(QLabel)
+        if label.isVisible()
+    ]
+    if dialog is not None:
+        visible_labels.extend(
+            label.text()
+            for label in dialog.findChildren(QLabel)
+            if label.isVisible()
+        )
+    rendered = "\n".join(visible_labels)
+    api_fields = [
+        field
+        for owner in (widget, dialog)
+        if owner is not None
+        for field in owner.findChildren(QLineEdit)
+        if field.isVisible()
+        and "api key" in str(field.accessibleName() or field.placeholderText()).casefold()
+    ]
+    preservation = (
+        scene != "sync_source_remove"
+        or (
+            "never deleted" in rendered.casefold()
+            and "remain" in rendered.casefold()
+        )
+    )
+    dialog_kind = None
+    if dialog is not None and dialog is getattr(window, "_review_sync_source_dialog", None):
+        dialog_kind = "source_editor"
+    elif dialog is not None and dialog is getattr(
+        window, "_review_sync_remove_confirmation", None
+    ):
+        dialog_kind = "remove_confirmation"
+    return {
+        "state": scene,
+        "source_row_count": int(source_list.count()),
+        "per_source_widget_count": int(per_source_widgets),
+        "selected_source_count": len(source_list.selectedItems()),
+        "enabled_source_count": int(enabled),
+        "disabled_source_count": int(source_list.count() - enabled),
+        "action_button_count": len(buttons),
+        "clipped_action_count": clipped,
+        "dialog_visible": bool(dialog is not None and dialog.isVisible()),
+        "dialog_kind": dialog_kind,
+        "private_path_visible": bool(_WINDOWS_PATH_RE.search(rendered)),
+        "api_key_field_visible": bool(api_fields),
+        "managed_badge_visible": False,
+        "managed_explanation_present": False,
+        "playlist_track_count": 0,
+        "preservation_message_present": preservation,
+        "batch_active": bool(getattr(widget, "_batch_active", False)),
+        "status_property": str(widget.progress.property("syncState") or ""),
+    }
+
+
 def party_review_metrics(window: object, scene: str) -> dict[str, object] | None:
     if scene not in PARTY_REVIEW_SCENES:
         return None
@@ -2908,19 +3839,38 @@ def party_review_metrics(window: object, scene: str) -> dict[str, object] | None
     return dict(metrics)
 
 
-def _grab_review_window(window: object):
-    from PySide6.QtGui import QColor, QPainter
-    from PySide6.QtWidgets import QApplication
-
-    pixmap = window.grab()
-    dialog = getattr(window, "_review_metadata_dialog", None) or getattr(
-        window, "_review_remediation_dialog", None
+def _active_review_dialog(window: object):
+    return (
+        getattr(window, "_review_metadata_dialog", None)
+        or getattr(window, "_review_remediation_dialog", None)
+        or getattr(window, "_review_sync_source_dialog", None)
+        or getattr(window, "_review_sync_remove_confirmation", None)
     )
-    if dialog is None or not dialog.isVisible():
-        return pixmap
-    confirmation = getattr(window, "_review_metadata_confirmation", None) or getattr(
+
+
+def _active_review_confirmation(window: object):
+    return getattr(window, "_review_metadata_confirmation", None) or getattr(
         window, "_review_remediation_confirmation", None
     )
+
+
+def _grab_review_window(window: object, *, direct_render: bool = False):
+    from PySide6.QtGui import QColor, QPainter, QPixmap
+    from PySide6.QtWidgets import QApplication
+
+    if direct_render:
+        ratio = max(1.0, float(window.devicePixelRatioF()))
+        physical = window.size() * ratio
+        pixmap = QPixmap(physical)
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(QColor("#06090E"))
+        window.render(pixmap)
+    else:
+        pixmap = window.grab()
+    dialog = _active_review_dialog(window)
+    if dialog is None or not dialog.isVisible():
+        return pixmap
+    confirmation = _active_review_confirmation(window)
     confirmation_visible = bool(
         confirmation is not None and confirmation.isVisible()
     )
@@ -2987,7 +3937,10 @@ class UIReviewController(QObject):
     def start(self) -> None:
         try:
             self.plan.output_dir.mkdir(parents=True, exist_ok=True)
-            if any(scene in PARTY_REVIEW_SCENES for scene in self.plan.scenes):
+            if any(
+                scene in PARTY_REVIEW_SCENES or scene in MULTI_SOURCE_REVIEW_SCENES
+                for scene in self.plan.scenes
+            ):
                 _install_review_network_guard()
             self.runtime_checks = validate_review_runtime(self.plan)
             if any(scene in METADATA_REVIEW_SCENES for scene in self.plan.scenes):
@@ -2998,6 +3951,10 @@ class UIReviewController(QObject):
             if any(scene in REMEDIATION_REVIEW_SCENES for scene in self.plan.scenes):
                 self.runtime_checks["remediation_behaviors"] = (
                     validate_remediation_review_behaviors(self.window, self.plan)
+                )
+            if any(scene in MULTI_SOURCE_REVIEW_SCENES for scene in self.plan.scenes):
+                self.runtime_checks["multi_source_behaviors"] = (
+                    validate_batch10_multi_source_behaviors(self.window, self.plan)
                 )
             self.window.showNormal()
             self.window.raise_()
@@ -3029,9 +3986,7 @@ class UIReviewController(QObject):
             self.window.updateGeometry()
             self.window.repaint()
             self.app.processEvents()
-            review_dialog = getattr(self.window, "_review_metadata_dialog", None) or getattr(
-                self.window, "_review_remediation_dialog", None
-            )
+            review_dialog = _active_review_dialog(self.window)
             if review_dialog is not None:
                 review_dialog.hide()
                 self.app.processEvents()
@@ -3040,9 +3995,7 @@ class UIReviewController(QObject):
                 review_dialog.updateGeometry()
                 review_dialog.repaint()
                 self.app.processEvents()
-                confirmation = getattr(
-                    self.window, "_review_metadata_confirmation", None
-                ) or getattr(self.window, "_review_remediation_confirmation", None)
+                confirmation = _active_review_confirmation(self.window)
                 if confirmation is not None:
                     confirmation.show()
                     confirmation.ensurePolished()
@@ -3097,17 +4050,13 @@ class UIReviewController(QObject):
             warmup = QPixmap(capture_window.size())
             warmup.fill(QColor("#06090E"))
             capture_window.render(warmup)
-            review_dialog = getattr(self.window, "_review_metadata_dialog", None) or getattr(
-                self.window, "_review_remediation_dialog", None
-            )
+            review_dialog = _active_review_dialog(self.window)
             if review_dialog is not None:
                 dialog_warmup = QPixmap(review_dialog.size())
                 dialog_warmup.fill(QColor("#06090E"))
                 review_dialog.render(dialog_warmup)
                 review_dialog.repaint()
-                confirmation = getattr(
-                    self.window, "_review_metadata_confirmation", None
-                ) or getattr(self.window, "_review_remediation_confirmation", None)
+                confirmation = _active_review_confirmation(self.window)
                 if confirmation is not None:
                     confirmation_warmup = QPixmap(confirmation.size())
                     confirmation_warmup.fill(QColor("#06090E"))
@@ -3137,7 +4086,10 @@ class UIReviewController(QObject):
                 capture_window = getattr(self.window, "party_mode_window", None)
                 if capture_window is None or not capture_window.isVisible():
                     raise ReviewPlanError("Party Mode capture surface is unavailable.")
-            pixmap = _grab_review_window(capture_window)
+            pixmap = _grab_review_window(
+                capture_window,
+                direct_render=scene == "sync_source_failures",
+            )
             if pixmap.isNull():
                 raise ReviewPlanError("Qt returned an empty screenshot.")
 
@@ -3168,6 +4120,9 @@ class UIReviewController(QObject):
             party_metrics = party_review_metrics(self.window, scene)
             if party_metrics is not None:
                 capture["party_metrics"] = party_metrics
+            sync_metrics = multi_source_review_metrics(self.window, scene)
+            if sync_metrics is not None:
+                capture["multi_source_metrics"] = sync_metrics
             self.captures.append(capture)
         except Exception as exc:
             self._fail(exc)
@@ -3214,6 +4169,7 @@ class UIReviewController(QObject):
             metadata_behaviors = self.runtime_checks.get("metadata_behaviors")
             remediation_behaviors = self.runtime_checks.get("remediation_behaviors")
             party_mode_behaviors = self.runtime_checks.get("party_mode_behaviors")
+            multi_source_behaviors = self.runtime_checks.get("multi_source_behaviors")
             self.runtime_checks = validate_review_runtime(self.plan)
             if metadata_behaviors is not None:
                 self.runtime_checks["metadata_behaviors"] = metadata_behaviors
@@ -3221,6 +4177,8 @@ class UIReviewController(QObject):
                 self.runtime_checks["remediation_behaviors"] = remediation_behaviors
             if party_mode_behaviors is not None:
                 self.runtime_checks["party_mode_behaviors"] = party_mode_behaviors
+            if multi_source_behaviors is not None:
+                self.runtime_checks["multi_source_behaviors"] = multi_source_behaviors
             if len(self.captures) != self.plan.capture_count:
                 raise ReviewPlanError("The review capture matrix is incomplete.")
             self._write_manifest(self._manifest("complete"))

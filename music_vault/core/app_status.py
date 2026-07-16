@@ -38,7 +38,21 @@ OPTIONAL_SYNC_FIELDS = (
     "last_sync_failed_count",
     "last_sync_failures",
 )
-SYNC_FIELDS = LEGACY_SYNC_FIELDS + OPTIONAL_SYNC_FIELDS
+MULTI_SOURCE_SYNC_FIELDS = (
+    "sync_source_count",
+    "enabled_sync_source_count",
+    "active_sync_batch",
+    "active_sync_source_index",
+    "last_sync_batch_status",
+    "last_sync_batch_source_count",
+    "last_sync_batch_complete_count",
+    "last_sync_batch_issue_count",
+    "last_sync_batch_failed_count",
+    "last_sync_batch_downloaded_count",
+    "last_sync_batch_imported_count",
+    "last_sync_batch_item_failure_count",
+)
+SYNC_FIELDS = LEGACY_SYNC_FIELDS + OPTIONAL_SYNC_FIELDS + MULTI_SOURCE_SYNC_FIELDS
 
 
 def _utc_now() -> str:
@@ -88,7 +102,9 @@ def _previous_sync(status_file: Path) -> dict:
         payload = json.loads(status_file.read_text(encoding="utf-8"))
         sync = payload.get("sync") if isinstance(payload, dict) else None
         if isinstance(sync, dict):
-            return {field: sync.get(field) for field in SYNC_FIELDS}
+            return _sanitize_sync_values(
+                {field: sync.get(field) for field in SYNC_FIELDS}
+            )
     except Exception:
         pass
     return empty
@@ -102,7 +118,10 @@ def _merge_section(payload: dict, section: str, values) -> None:
 
 
 def _sanitize_sync_values(values: dict) -> dict:
-    sanitized = dict(values)
+    # App Status accepts only stable aggregate/legacy keys. This prevents a
+    # future source view model from accidentally exporting a URL, label,
+    # playlist identity, membership snapshot, folder, or per-item detail.
+    sanitized = {key: value for key, value in values.items() if key in SYNC_FIELDS}
     if sanitized.get("last_sync_error") is not None:
         sanitized["last_sync_error"] = sanitize_error_text(sanitized["last_sync_error"])
     failures = sanitized.get("last_sync_failures")
@@ -114,6 +133,12 @@ def _sanitize_sync_values(values: dict) -> dict:
                 failure["reason"] = sanitize_error_text(failure.get("reason"))
             cleaned.append(failure)
         sanitized["last_sync_failures"] = cleaned
+    # Batch 10 keeps these legacy keys for schema compatibility but no longer
+    # exports source identities or item-level failure detail.
+    sanitized["last_sync_playlist_title"] = None
+    sanitized["last_sync_playlist_id"] = None
+    sanitized["last_sync_error"] = None
+    sanitized["last_sync_failures"] = []
     return sanitized
 
 

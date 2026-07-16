@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,75 @@ def test_existing_unimported_file_is_returned_for_targeted_import(tmp_path):
     result = FakeSyncer(config, [_entry()]).sync()
     assert result.existing_count == 1
     assert result.import_items == [SyncImportItem(str(media.resolve()), "abcdefghijk")]
+
+
+def test_shared_download_index_is_borrowed_without_iteration_or_revalidation(tmp_path):
+    media = tmp_path / "prevalidated.mp3"
+    media.write_bytes(b"synthetic")
+
+    class NoRestatPath:
+        def __str__(self):
+            return str(media.resolve())
+
+        def is_file(self):
+            raise AssertionError("A prevalidated shared path must not be stated again.")
+
+    class TrackingIndex(Mapping[str, Path]):
+        def __init__(self):
+            self.iterations = 0
+            self.lookups = 0
+            self._value = NoRestatPath()
+
+        def __getitem__(self, key):
+            self.lookups += 1
+            if key != "abcdefghijk":
+                raise KeyError(key)
+            return self._value
+
+        def __iter__(self) -> Iterator[str]:
+            self.iterations += 1
+            raise AssertionError("The shared index must not be copied or traversed in full.")
+
+        def __len__(self):
+            return 1
+
+    shared = TrackingIndex()
+    config = YouTubeSyncConfig(
+        "https://www.youtube.com/playlist?list=playlist-id",
+        tmp_path / "downloads",
+        tmp_path / "archive.txt",
+        shared_download_index=shared,
+    )
+    syncer = FakeSyncer(config, [_entry()])
+
+    assert syncer._existing_downloads() is shared
+    result = syncer.sync()
+
+    assert result.existing_count == 1
+    assert result.import_items == [SyncImportItem(str(media.resolve()), "abcdefghijk")]
+    assert syncer.download_calls == []
+    assert shared.iterations == 0
+    assert shared.lookups > 0
+
+
+def test_legacy_known_download_tuple_still_validates_entries(tmp_path):
+    media = tmp_path / "legacy.mp3"
+    media.write_bytes(b"synthetic")
+    missing = tmp_path / "missing.mp3"
+    config = YouTubeSyncConfig(
+        "https://www.youtube.com/playlist?list=playlist-id",
+        tmp_path / "downloads",
+        tmp_path / "archive.txt",
+        known_downloads=(
+            ("abcdefghijk", str(media)),
+            ("bcdefghijkl", str(missing)),
+            ("invalid", str(media)),
+        ),
+    )
+
+    assert FakeSyncer(config, [])._existing_downloads() == {
+        "abcdefghijk": media.resolve()
+    }
 
 
 def test_deleted_file_and_stale_archive_are_retry_eligible(tmp_path):

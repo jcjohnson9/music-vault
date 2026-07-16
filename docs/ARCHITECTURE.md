@@ -12,8 +12,12 @@ provides the user interface, Qt Multimedia provides playback through
 | --- | --- |
 | `run.py` | Source entry point that creates and starts the application. |
 | `music_vault/version.py` | Authoritative application name, current-tree version, release channel, public user agent, and Windows resource values. |
-| `music_vault/app.py` | Main PySide6 window, view orchestration, playback, queue, settings, synchronization orchestration, and status updates. |
-| `music_vault/core/db.py` | Versioned additive SQLite migrations, source identity, failure history, and library/playlist persistence. |
+| `music_vault/app.py` | Main PySide6 window, view orchestration, playback, queue, settings, Sync Center integration, and status updates. |
+| `music_vault/core/db.py` | Versioned additive SQLite migrations, failure history, and compatibility library/playlist APIs. |
+| `music_vault/core/sync_schema.py` | Schema-v5 saved-source, source-item/run, global source identity/conflict, playlist-origin, index, and additive backfill definitions. |
+| `music_vault/core/sync_sources.py` | YouTube playlist identity normalization, stable storage keys, persistent source CRUD/order/destination/archive operations, and source-card projections. |
+| `music_vault/core/playlist_membership.py` | Central origin-aware materialization of source-managed and manual playlist membership into the compatibility `playlist_tracks` table. |
+| `music_vault/core/multi_source_sync.py` | Sequential selected/enabled-source execution, per-source import/reconciliation, bounded batch aggregation, and Stop After Current coordination. |
 | `music_vault/core/importer.py` | Source-aware Mutagen metadata and embedded-artwork import. |
 | `music_vault/core/youtube_sync.py` | Public/unlisted API enumeration, authoritative video-ID reconciliation, and anonymous yt-dlp/FFmpeg acquisition. |
 | `music_vault/core/sync_result.py` | Typed synchronization outcome shared by engine, UI, status, logging, and tests. |
@@ -41,6 +45,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/party_visuals.py` | Shared PartyCanvas renderer, six bounded visual presets, centralized album transform, frame timing, and adaptive quality. |
 | `music_vault/ui/party_palette.py` | Deterministic artwork palette extraction, contrast handling, caching, and color interpolation. |
 | `music_vault/ui/party_lyrics.py` | Independent synchronized/plain lyrics overlay, loading/empty states, position lookup, scrolling, and provider attribution. |
+| `music_vault/ui/sync_center.py` | Persistent source-list/detail manager, aggregate synchronization dashboard, source dialogs, ordering, destination, and safe-removal controls. |
 | `music_vault/lyrics/` | Bounded lyric models/parser/cache/service, read-only local/embedded/sidecar discovery, and the provider-neutral lookup boundary. |
 | `music_vault/lyrics/providers/lrclib.py` | Consent-gated, read-only LRCLIB client with HTTPS destination controls, bounded responses, and strict result matching. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
@@ -66,22 +71,26 @@ The `data/music_vault_status.json` filename and schema version remain compatible
 ## Primary data flow
 
 ```text
-source playlist
-  -> YouTube Data API enumeration
-  -> stable video-ID comparison
-  -> valid database/local-file reconciliation
-  -> authorized yt-dlp and FFmpeg processing
-  -> local media files
+saved source selection in Sync Center
+  -> sequential source orchestrator in persisted order
+  -> complete YouTube playlist-item snapshot
+  -> global video-to-track identity and valid-file reconciliation
+  -> authorized yt-dlp and FFmpeg processing when genuinely needed
+  -> per-source import, occurrence reconciliation, and truthful run/failure state
+  -> origin-aware managed-playlist materialization
   -> targeted Mutagen/source observations
   -> metadata precedence and effective field materialization
-  -> schema-v4 SQLite library, provenance, history, and remediation state
-  -> PySide6 browsing and QMediaPlayer playback
+  -> schema-v5 SQLite library, source, provenance, history, and remediation state
+  -> PySide6 browsing and the existing QMediaPlayer playback pipeline
 ```
 
-The YouTube Data API supplies playlist enumeration. yt-dlp operates anonymously
-for the supported public/unlisted workflow and does not inspect browser cookie
-profiles. yt-dlp and FFmpeg perform
-authorized acquisition and audio processing. Mutagen reads media metadata and
+The YouTube Data API supplies complete public/unlisted playlist-item snapshots.
+yt-dlp operates anonymously and does not inspect browser cookie profiles.
+Enabled sources run sequentially; every source is imported and reconciled
+before the next starts, allowing overlapping video identities to reuse one
+canonical track and valid media file. Only complete enumeration can remove a
+source occurrence. yt-dlp and FFmpeg perform authorized acquisition and audio
+processing. Mutagen reads media metadata and
 embedded artwork. MusicBrainz and Cover Art Archive are optional enrichment
 services. When separately enabled by the user, artist-photo lookup uses
 MusicBrainz identity followed by public Wikidata, Wikipedia, or Wikimedia
@@ -346,7 +355,8 @@ rewrite. Known areas for incremental improvement are:
 - `music_vault/app.py` has broad responsibilities and is large;
 - broader audio-format writeback beyond the currently audited MP3 path remains
   future work;
-- synchronization assumes a single configured source workflow;
+- private-playlist OAuth, automatic startup synchronization, and parallel
+  source downloads are intentionally unsupported;
 - there is no portable manifest for selective mobile transfer; and
 - there is no station, program-timeline, or mixed audio-segment model for the
   future personal-radio branch.

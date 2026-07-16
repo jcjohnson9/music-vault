@@ -11,7 +11,9 @@ Depending on which features are used, local runtime data can include:
 - a YouTube Data API key;
 - the SQLite library database and its sidecar files;
 - local configuration and status files;
-- synchronization archive history and structured failed-item records;
+- saved source URLs/labels/titles, source-item membership snapshots,
+  source-run history, synchronization archive history, and structured
+  failed-item records;
 - downloaded audio and other media;
 - extracted or downloaded cover and artist artwork;
 - manually imported or provider-cached lyrics and negative-cache records;
@@ -41,9 +43,42 @@ content. It also never contains lyric lines, provider queries/results, cached
 lyric paths, raw lyric errors, or the YouTube API key. Music Vault has no
 Watchtower relationship or integration.
 
+Batch 10 adds only aggregate source and batch counts to App Status. It never
+exports a saved source URL, label, remote title, playlist ID, playlist-item or
+video ID, destination playlist, source folder, membership snapshot, or per-item
+error. App Status is updated at meaningful source/batch transitions rather than
+for every progress line.
+
 Synchronization supports public and unlisted playlists and performs anonymous
 media extraction. It does not silently read Firefox, Chrome, Edge, or other
 browser cookie profiles.
+
+## Multiple source playlists
+
+Schema version 5 stores saved source definitions, every remote playlist-item
+occurrence, recent source runs, source-specific failure links, global
+video-to-track identities, non-destructive identity-conflict diagnostics, and
+manual/source playlist origins inside the private SQLite database. None of
+these records is telemetry or hosted state.
+
+Sources synchronize only after an explicit Sync Selected or Sync All Enabled
+action and run sequentially in persisted order. Saving or editing a source does
+not contact YouTube. The supported boundary remains authorized public/unlisted
+playlists; there is no private-playlist OAuth, Google login, browser-cookie
+access, automatic startup sync, or background schedule.
+
+New source downloads use an identity-derived Windows-safe directory under the
+configured download root. Existing media is never moved or renamed, and valid
+database/file identity anywhere in the configured Music Vault tree is reused
+across sources. A duplicate pre-existing identity is retained and recorded as
+a private conflict rather than silently merged.
+
+Only a complete multi-page source snapshot may mark an old occurrence removed.
+Failed or partial enumeration preserves last-known membership and playlist
+order. Remote removal, source detachment, destination changes, and source
+archive never delete global tracks, media, metadata, artwork, lyrics, or
+history. Managed playlist contents are preserved as manual origins when a
+source is detached. See [Multiple Source Playlists](MULTIPLE_SOURCE_PLAYLISTS.md).
 
 These categories can contain credentials, private library information,
 personal playlist information, local paths, and copyrighted media. They are

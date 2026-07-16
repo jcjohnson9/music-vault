@@ -49,6 +49,9 @@ HISTORY_FORBIDDEN_DIRECTORIES = {
     "provider_fixtures",
     "provider_lyrics_fixtures",
     "release_artifacts",
+    "source_membership_snapshots",
+    "sync_source_runtime",
+    "sync_source_snapshots",
     "youtube_downloads",
 }
 HISTORY_MEDIA_SUFFIXES = AUDIO_SUFFIXES | {

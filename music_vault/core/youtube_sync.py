@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -18,7 +19,14 @@ from .safety import (
     playlist_output_directory,
     sanitize_error_text,
 )
-from .sync_result import SyncFailure, SyncImportItem, SyncResult, utc_now
+from .sync_result import (
+    PlaylistSnapshot,
+    PlaylistSnapshotItem,
+    SyncFailure,
+    SyncImportItem,
+    SyncResult,
+    utc_now,
+)
 
 
 ProgressCallback = Callable[[str], None]
@@ -50,6 +58,36 @@ class YouTubeSyncConfig:
     audio_quality: str = "320"
     existing_video_ids: frozenset[str] = field(default_factory=frozenset)
     ffmpeg_location: str | Path | None = None
+    source_destination_dir: Path | None = None
+    saved_source_id: int | None = None
+    source_label: str | None = None
+    # None preserves the legacy self-scan. An explicitly supplied tuple,
+    # including an empty tuple, is an already-built batch-wide index.
+    known_downloads: tuple[tuple[str, str], ...] | None = None
+    # A multi-source batch supplies one prevalidated, read-only view over its
+    # mutable media index. The view is borrowed rather than copied: the
+    # sequential orchestrator may add a completed download between sources,
+    # while an individual provider only performs keyed reads.
+    shared_download_index: Mapping[str, Path] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+def scan_existing_downloads(output_root: str | Path) -> dict[str, Path]:
+    """Build one bounded source-ID index for a complete configured download tree."""
+
+    root = Path(output_root).expanduser().resolve()
+    found: dict[str, Path] = {}
+    if not root.exists():
+        return found
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in AuthorizedYouTubePlaylistSyncer.AUDIO_SUFFIXES:
+            video_id = extract_source_video_id(path)
+            if video_id:
+                found.setdefault(video_id, path.resolve())
+    return found
 
 
 class AuthorizedYouTubePlaylistSyncer:
@@ -122,16 +160,35 @@ class AuthorizedYouTubePlaylistSyncer:
         temporary.write_text(body, encoding="utf-8")
         os.replace(temporary, target)
 
-    def _existing_downloads(self) -> dict[str, Path]:
-        found: dict[str, Path] = {}
-        if not self.config.output_dir.exists():
+    def _existing_downloads(self) -> Mapping[str, Path]:
+        if self.config.shared_download_index is not None:
+            # The orchestrator built and validated this index once for the
+            # whole batch. Do not reconstruct it or repeat filesystem stats
+            # for every source.
+            return self.config.shared_download_index
+        found = {
+            video_id: Path(path).expanduser().resolve()
+            for video_id, path in (self.config.known_downloads or ())
+            if _VIDEO_ID_RE.fullmatch(str(video_id)) and Path(path).is_file()
+        }
+        if self.config.known_downloads is not None:
             return found
-        for path in self.config.output_dir.rglob("*"):
-            if path.is_file() and path.suffix.lower() in self.AUDIO_SUFFIXES:
-                video_id = extract_source_video_id(path)
-                if video_id:
-                    found.setdefault(video_id, path.resolve())
+        found.update(scan_existing_downloads(self.config.output_dir))
         return found
+
+    def _download_destination(self, playlist_title: str, playlist_id: str) -> Path:
+        configured = self.config.source_destination_dir
+        if configured is None:
+            return playlist_output_directory(
+                self.config.output_dir, playlist_title, playlist_id
+            )
+        root = self.config.output_dir.expanduser().resolve()
+        destination = Path(configured).expanduser().resolve()
+        if not destination.is_relative_to(root):
+            raise RuntimeError(
+                "The saved source download folder must remain inside the configured download root."
+            )
+        return destination
 
     def _api_json(self, endpoint: str, params: dict) -> dict:
         try:
@@ -177,10 +234,22 @@ class AuthorizedYouTubePlaylistSyncer:
                 "https://www.googleapis.com/youtube/v3/playlistItems", params
             )
             for item in data.get("items", []):
+                source_item_id = str(item.get("id") or "").strip()
+                if not source_item_id:
+                    raise RuntimeError(
+                        "YouTube returned a playlist item without a stable occurrence ID."
+                    )
                 snippet = item.get("snippet") or {}
                 content = item.get("contentDetails") or {}
                 video_id = str(content.get("videoId") or "").strip()
                 title = str(snippet.get("title") or video_id or "Unavailable item")
+                raw_position = snippet.get("position")
+                try:
+                    position = int(raw_position)
+                    if position < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    position = len(entries)
                 unavailable_reason = None
                 if not _VIDEO_ID_RE.fullmatch(video_id):
                     unavailable_reason = "Playlist item has no usable video ID."
@@ -191,6 +260,8 @@ class AuthorizedYouTubePlaylistSyncer:
                 entries.append(
                     {
                         "id": video_id or None,
+                        "source_item_id": source_item_id,
+                        "position": position,
                         "title": title,
                         "unavailable_reason": unavailable_reason,
                     }
@@ -205,9 +276,7 @@ class AuthorizedYouTubePlaylistSyncer:
     def _download_one(
         self, video_id: str, playlist_id: str, playlist_title: str
     ) -> SyncImportItem:
-        destination = playlist_output_directory(
-            self.config.output_dir, playlist_title, playlist_id
-        )
+        destination = self._download_destination(playlist_title, playlist_id)
         destination.mkdir(parents=True, exist_ok=True)
         opts = {
             "format": "bestaudio/best",
@@ -280,15 +349,60 @@ class AuthorizedYouTubePlaylistSyncer:
         elif state == "error":
             self._report("Download error. The item will be recorded for retry.")
 
+    @staticmethod
+    def _snapshot_from_entries(
+        playlist_id: str,
+        playlist_title: str,
+        entries: list[dict],
+    ) -> PlaylistSnapshot:
+        items: list[PlaylistSnapshotItem] = []
+        for index, entry in enumerate(entries):
+            # The fallback keeps old test/provider subclasses compatible. The
+            # production API path rejects missing top-level playlist-item IDs.
+            source_item_id = str(entry.get("source_item_id") or "").strip()
+            if not source_item_id:
+                source_item_id = f"legacy-occurrence-{index}"
+            raw_position = entry.get("position", index)
+            try:
+                position = int(raw_position)
+                if position < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                position = index
+            video_id = str(entry.get("id") or "").strip() or None
+            items.append(
+                PlaylistSnapshotItem(
+                    source_item_id=source_item_id,
+                    video_id=video_id,
+                    source_position=position,
+                    title=str(entry.get("title") or "").strip() or None,
+                    availability_reason=(
+                        str(entry.get("unavailable_reason") or "").strip() or None
+                    ),
+                )
+            )
+        return PlaylistSnapshot.completed(playlist_id, playlist_title, items)
+
     def sync(self) -> SyncResult:
         started_at = utc_now()
+        playlist_id: str | None = None
         try:
             # Resolve once for the whole worker. In particular, a configured
             # but invalid location must fail before yt-dlp can search elsewhere.
             self._resolve_ffmpeg_once()
+            playlist_id = self._playlist_id()
             playlist_id, playlist_title, entries = self._extract_playlist_entries_via_api()
+            snapshot = self._snapshot_from_entries(playlist_id, playlist_title, entries)
         except Exception as exc:
-            return SyncResult.failed_result(exc, started_at=started_at)
+            failed_snapshot = PlaylistSnapshot.failed(exc, playlist_id=playlist_id)
+            return SyncResult.failed_result(
+                exc,
+                playlist_id=playlist_id,
+                started_at=started_at,
+                saved_source_id=self.config.saved_source_id,
+                source_label=self.config.source_label,
+                snapshot=failed_snapshot,
+            )
 
         result = SyncResult(
             status="complete",
@@ -296,52 +410,114 @@ class AuthorizedYouTubePlaylistSyncer:
             playlist_title=playlist_title,
             visible_item_count=len(entries),
             started_at=started_at,
+            saved_source_id=self.config.saved_source_id,
+            source_label=self.config.source_label,
+            snapshot=snapshot,
+            duplicate_occurrence_count=snapshot.duplicate_occurrence_count,
         )
         local_files = self._existing_downloads()
         database_ids = set(self.config.existing_video_ids)
-        reliable_ids = database_ids | set(local_files)
-        stale_archive_ids = self._archive_ids() - reliable_ids
+        archive_ids = self._archive_ids()
+        if self.config.shared_download_index is None:
+            # Preserve the legacy standalone/tuple behavior exactly. Those
+            # paths were already materialized locally, so collecting their IDs
+            # for the compatibility archive adds no new batch-wide cost.
+            reliable_archive_ids = database_ids | set(local_files)
+            stale_archive_ids = archive_ids - reliable_archive_ids
+        else:
+            stale_archive_ids = {
+                video_id
+                for video_id in archive_ids
+                if video_id not in database_ids and local_files.get(video_id) is None
+            }
+            reliable_archive_ids = archive_ids - stale_archive_ids
         if stale_archive_ids:
             self._report(
                 f"Archive reconciliation found {len(stale_archive_ids)} stale entr"
                 f"{'y' if len(stale_archive_ids) == 1 else 'ies'}; they will not suppress downloads."
             )
 
-        for entry in entries:
-            video_id = entry["id"]
-            title = entry["title"]
-            if entry["unavailable_reason"]:
+        processed_video_ids: set[str] = set()
+        occurrence_ids: dict[str, list[str]] = {}
+        for item in snapshot.items:
+            if item.video_id:
+                occurrence_ids.setdefault(item.video_id, []).append(item.source_item_id)
+
+        for item in snapshot.items:
+            video_id = item.video_id
+            title = item.title
+            if item.availability_reason:
                 result.add_failure(
-                    SyncFailure(video_id, title, entry["unavailable_reason"], "unavailable")
+                    SyncFailure(
+                        video_id,
+                        title,
+                        item.availability_reason,
+                        "unavailable",
+                        item.source_item_id,
+                    )
                 )
                 continue
-            if video_id in reliable_ids:
+            if not video_id:
+                result.add_failure(
+                    SyncFailure(
+                        None,
+                        title,
+                        "Playlist item has no usable video ID.",
+                        "unavailable",
+                        item.source_item_id,
+                    )
+                )
+                continue
+            if video_id in processed_video_ids:
+                continue
+            processed_video_ids.add(video_id)
+            local_path = local_files.get(video_id)
+            if video_id in database_ids or local_path is not None:
                 result.existing_count += 1
                 result.successful_video_ids.add(video_id)
-                if video_id in local_files and video_id not in database_ids:
+                reliable_archive_ids.add(video_id)
+                if local_path is not None and video_id not in database_ids:
                     result.import_items.append(
-                        SyncImportItem(str(local_files[video_id]), video_id)
+                        SyncImportItem(
+                            str(local_path),
+                            video_id,
+                            source_item_ids=tuple(occurrence_ids[video_id]),
+                        )
                     )
                 continue
 
             result.new_item_count += 1
             self._report(f"Downloading: {title}")
             try:
-                item = self._download_one(video_id, playlist_id, playlist_title)
+                import_item = self._download_one(video_id, playlist_id, playlist_title)
             except Exception as exc:
                 result.add_failure(
-                    SyncFailure(video_id, title, sanitize_error_text(exc), "download")
+                    SyncFailure(
+                        video_id,
+                        title,
+                        sanitize_error_text(exc),
+                        "download",
+                        item.source_item_id,
+                    )
                 )
                 continue
+            import_item = SyncImportItem(
+                import_item.path,
+                import_item.video_id,
+                import_item.source_upload_date,
+                tuple(occurrence_ids[video_id]),
+            )
             result.downloaded_count += 1
-            result.downloaded_paths.append(item.path)
-            result.import_items.append(item)
+            result.downloaded_paths.append(import_item.path)
+            result.import_items.append(import_item)
             result.successful_video_ids.add(video_id)
-            reliable_ids.add(video_id)
+            reliable_archive_ids.add(video_id)
 
         # The archive is compatibility history only. Rewrite it atomically from
-        # evidence backed by an existing DB/file source ID or this run's success.
-        self._write_archive_ids_atomic(reliable_ids)
+        # prior entries still backed by a DB/file source ID plus this source's
+        # observed successes. The shared media index is intentionally not
+        # copied or traversed in full for each source.
+        self._write_archive_ids_atomic(reliable_archive_ids)
         result.finished_at = utc_now()
         result.refresh_status()
         self._report(
