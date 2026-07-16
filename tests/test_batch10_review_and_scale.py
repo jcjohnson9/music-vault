@@ -181,7 +181,7 @@ def test_multiple_source_profiler_small_case_is_indexed_and_widget_free(
         unique_video_count=100,
         membership_count=100,
     )
-    assert result["schema_version"] == 5
+    assert result["schema_version"] == 6
     assert result["integrity"] == "ok"
     assert result["membership_row_count"] == 100
     assert result["unique_video_count"] == 100

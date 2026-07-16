@@ -323,6 +323,7 @@ def backfill_source_track_identities(conn: sqlite3.Connection) -> tuple[int, int
             ON CONFLICT(source_kind, external_track_id) DO UPDATE SET
                 track_id=excluded.track_id,
                 updated_at=excluded.updated_at
+            WHERE source_track_identities.track_id <> excluded.track_id
             """,
             (external_id, canonical_id, timestamp, timestamp),
         )
@@ -340,6 +341,8 @@ def backfill_source_track_identities(conn: sqlite3.Connection) -> tuple[int, int
                 ) VALUES ('youtube', ?, ?, ?, 'duplicate_existing_source_identity', ?, NULL)
                 ON CONFLICT(source_kind, external_track_id, conflicting_track_id)
                 DO UPDATE SET canonical_track_id=excluded.canonical_track_id
+                WHERE source_identity_conflicts.canonical_track_id
+                      <> excluded.canonical_track_id
                 """,
                 (external_id, canonical_id, conflicting_id, timestamp),
             )

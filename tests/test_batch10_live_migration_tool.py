@@ -195,7 +195,7 @@ def test_create_backup_uses_sqlite_api_and_verifies_aggregate_counts(tmp_path: P
         assert connection.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
 
 
-def test_verify_accepts_v4_to_v5_migration_with_verified_rollback_backup(tmp_path: Path):
+def test_verify_accepts_v4_to_v6_migration_with_verified_rollback_backup(tmp_path: Path):
     data_dir, database, _media = _seed_v4_runtime(tmp_path)
     baseline = gate.capture_baseline(
         project_root=tmp_path,
@@ -344,7 +344,7 @@ def test_invalid_second_sqlite_file_is_not_accepted_as_automatic_backup(
     invalid_backup = (
         data_dir
         / "backups"
-        / "music_vault_pre_schema_v5_2099-01-01_00-00-00.sqlite3"
+        / "music_vault_pre_schema_v6_2099-01-01_00-00-00.sqlite3"
     )
     invalid_backup.write_bytes(b"not a sqlite database")
 

@@ -72,6 +72,8 @@ METADATA_REVIEW_SCENES = (
     "metadata_currently_playing",
 )
 
+METADATA_INTELLIGENCE_REVIEW_SCENES = ("metadata_intelligence_smoke",)
+
 REMEDIATION_REVIEW_SCENES = (
     "remediation_empty",
     "remediation_analyzing",
@@ -135,6 +137,7 @@ SCENE_LABELS = {
     "metadata_undo_confirmation": "Metadata • Undo Confirmation",
     "metadata_long_values": "Metadata • Long Values",
     "metadata_currently_playing": "Metadata • Currently Playing",
+    "metadata_intelligence_smoke": "Automatic Metadata Intelligence - Packaged Smoke",
     "remediation_empty": "Remediation - Empty",
     "remediation_analyzing": "Remediation - Analyzing",
     "remediation_paused": "Remediation - Paused",
@@ -298,6 +301,7 @@ def _ensure_under_runtime(path: Path, runtime_root: Path, label: str) -> None:
 
 def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
     """Validate the active resolver and synthetic data without reading any key."""
+    from music_vault.core.db import CURRENT_SCHEMA_VERSION
     from music_vault.core.paths import (
         app_status_path,
         config_path,
@@ -343,8 +347,10 @@ def validate_review_runtime(plan: ReviewPlan) -> dict[str, Any]:
         schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     finally:
         connection.close()
-    if schema_version != 5:
-        raise ReviewPlanError("Synthetic database schema is not version 5.")
+    if schema_version != CURRENT_SCHEMA_VERSION:
+        raise ReviewPlanError(
+            f"Synthetic database schema is not version {CURRENT_SCHEMA_VERSION}."
+        )
 
     status_file = Path(resolved_paths["status"])
     try:
@@ -1165,6 +1171,531 @@ def validate_party_review_behaviors(
         "temporary_output_muted": True,
     }
     setattr(window, "_review_party_metrics", evidence)
+    return evidence
+
+
+class _SyntheticIntelligenceTokenStore:
+    """In-memory review consent marker; no credential path is opened."""
+
+    def read(self) -> str:
+        return "isolated-review-placeholder"
+
+
+def _write_synthetic_intelligence_mp3(path: Path) -> None:
+    """Create a tiny valid MP3 made only from deterministic synthetic frames."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = (
+        bytes.fromhex("fffb10c40003c00001a40000002000003480000004")
+        + b"LAME3.100"
+        + (b"U" * 64)
+        + b"LAME3.100U"
+    )
+    path.write_bytes(frame * 12)
+
+
+def _write_synthetic_intelligence_png(path: Path, color: str) -> None:
+    """Create deterministic review artwork without provider or media access."""
+
+    from PySide6.QtGui import QColor, QImage
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = QImage(24, 24, QImage.Format.Format_RGB32)
+    image.fill(QColor(color))
+    if not image.save(str(path), "PNG"):
+        raise ReviewPlanError("Synthetic metadata-intelligence artwork could not be created.")
+
+
+@dataclass(frozen=True)
+class _SyntheticIntelligenceArtworkRecord:
+    path: Path
+    provider_page_url: str
+
+
+class _SyntheticIntelligenceArtworkStore:
+    """Gap-aware fake store; it never performs network retrieval."""
+
+    def __init__(self, record: _SyntheticIntelligenceArtworkRecord) -> None:
+        self.record = record
+        self.calls: list[tuple[object, dict[str, object]]] = []
+
+    def fetch_for_gap(self, candidate: object, **kwargs: object):
+        from music_vault.metadata.discogs_artwork import is_true_artwork_gap
+
+        self.calls.append((candidate, dict(kwargs)))
+        if not is_true_artwork_gap(
+            kwargs.get("current_cover_path"),
+            manual=bool(kwargs.get("manual")),
+            locked=bool(kwargs.get("locked")),
+        ):
+            return None
+        return self.record
+
+
+class _SyntheticIntelligenceDiscogs:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    @staticmethod
+    def _candidate(query: object):
+        from music_vault.metadata.providers import (
+            ProviderArtistCredit,
+            ProviderArtworkCandidate,
+            ProviderReleaseCandidate,
+        )
+
+        title = str(getattr(query, "title", "")).strip()
+        folded = title.casefold()
+        if folded == "neon notebook session":
+            return None
+        mapping = {
+            "amber circuit": ("Aster Vale", "person", None),
+            "glass meridian": ("Lowland Unit", "group", None),
+            "cloud geometry": ("Sable Current", "group", "Guest Signal"),
+            "static bloom": ("Violet Engine", "group", None),
+            "velvet transit": ("Velvet Transit Unit", "group", None),
+            "paper lantern": ("Copper Horizon", "group", None),
+            "quiet prism": ("Juniper Arc", "duo", None),
+        }
+        artist, entity_type, featured = mapping.get(
+            folded, (str(getattr(query, "artist", "") or "Synthetic Unit"), "group", None)
+        )
+        version = str(getattr(query, "version_type", "") or "unknown").casefold()
+        is_live = folded == "static bloom" and version == "live"
+        identity = {
+            "amber circuit": "71001",
+            "glass meridian": "71002",
+            "cloud geometry": "71003",
+            "static bloom": "71004" if not is_live else "71005",
+            "velvet transit": "71006",
+            "paper lantern": "71007",
+            "quiet prism": "71008",
+        }.get(folded, "71999")
+        credits = [
+            ProviderArtistCredit(
+                artist,
+                role="primary",
+                artist_id=f"8{identity}",
+                join_phrase=" feat. " if featured else "",
+                entity_type=entity_type,
+            )
+        ]
+        if featured:
+            credits.append(
+                ProviderArtistCredit(
+                    featured,
+                    role="featured",
+                    artist_id="8710031",
+                    entity_type="person",
+                )
+            )
+        score = 96.0
+        artwork = None
+        if folded in {"paper lantern", "quiet prism"}:
+            artwork = ProviderArtworkCandidate(
+                source_url=f"https://i.discogs.com/synthetic-{identity}.png",
+                provider_page_url=f"https://www.discogs.com/release/{identity}",
+                release_id=identity,
+                image_type="front",
+                width=24,
+                height=24,
+            )
+        return ProviderReleaseCandidate(
+            provider="discogs",
+            title=title,
+            artist=artist,
+            artist_credits=tuple(credits),
+            album="Synthetic Catalogue Release",
+            album_artist=artist,
+            release_date="1987",
+            original_release_date="1984",
+            version_type="live" if is_live else "studio",
+            version_label="Live at Synthetic Hall" if is_live else None,
+            provider_score=score,
+            release_id=identity,
+            master_id="72004" if folded == "static bloom" else f"72{identity}",
+            track_position="A1",
+            label="Synthetic Catalogue Label",
+            provider_reference=f"https://www.discogs.com/release/{identity}",
+            artwork=artwork,
+            is_official=not is_live,
+            field_scores={
+                name: score
+                for name in (
+                    "title",
+                    "artist",
+                    "artist_credits",
+                    "album",
+                    "album_artist",
+                    "release_date",
+                    "original_release_date",
+                    "version_type",
+                    "version_label",
+                    "discogs_release_id",
+                    "discogs_master_id",
+                    "discogs_track_position",
+                )
+            },
+        )
+
+    def search(self, query: object, *, cancel_event=None):
+        self.calls.append(query)
+        candidate = self._candidate(query)
+        return () if candidate is None else (candidate,)
+
+
+class _SyntheticIntelligenceMusicBrainz:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def search(self, title: str, artist: str | None = None, *, cancel_event=None):
+        from music_vault.metadata.musicbrainz_enricher import MetadataCandidate
+
+        self.calls.append((title, artist))
+        folded = str(title).casefold()
+        if folded in {"neon notebook session", "static bloom"}:
+            return ()
+        mapping = {
+            "amber circuit": "Aster Vale",
+            "glass meridian": "Lowland Unit",
+            "cloud geometry": "Sable Current",
+            "velvet transit": "Velvet Transit Unit Alternate",
+        }
+        canonical_artist = mapping.get(folded, artist or "Synthetic Unit")
+        candidate_title = (
+            "Velvet Transit Alternate" if folded == "velvet transit" else title
+        )
+        return (
+            MetadataCandidate(
+                title=candidate_title,
+                artist=canonical_artist,
+                album="Synthetic Catalogue Release",
+                release_date="1987",
+                recording_id=f"synthetic-recording-{len(self.calls)}",
+                release_id=f"synthetic-release-{len(self.calls)}",
+                score=96,
+                album_artist=canonical_artist,
+            ),
+        )
+
+
+def validate_metadata_intelligence_review_behaviors(
+    window: object,
+    plan: ReviewPlan,
+) -> dict[str, object]:
+    """Run representative Batch 10.1 behavior inside the isolated app process."""
+
+    from music_vault.metadata.intelligence import MetadataIntelligenceService
+    from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
+
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() != "1":
+        raise ReviewPlanError("Metadata-intelligence review requires no-secret mode.")
+    database_path = Path(str(window.db.db_path)).resolve()
+    _ensure_under_runtime(database_path, plan.runtime_root, "intelligence database")
+    if int(window.db.conn.execute("PRAGMA user_version").fetchone()[0]) != 6:
+        raise ReviewPlanError("Metadata-intelligence review requires schema 6.")
+    api_key = plan.runtime_root / "data" / "youtube_api_key.txt"
+    discogs_token = plan.runtime_root / "data" / "discogs_token.txt"
+    if api_key.exists() or discogs_token.exists():
+        raise ReviewPlanError("Synthetic review runtime unexpectedly contains a credential file.")
+
+    memberships_before = int(
+        window.db.conn.execute("SELECT COUNT(*) FROM playlist_track_origins").fetchone()[0]
+    )
+    synthetic_media = plan.runtime_root / "synthetic_media"
+    exact_media = synthetic_media / "intelligence-exact.mp3"
+    artwork_gap_media = synthetic_media / "intelligence-art-gap.mp3"
+    existing_artwork = plan.runtime_root / "data" / "covers" / "synthetic-existing.png"
+    replacement_artwork = (
+        plan.runtime_root / "data" / "covers" / "discogs" / "synthetic-front.png"
+    )
+    for path in (exact_media, artwork_gap_media, existing_artwork, replacement_artwork):
+        _ensure_under_runtime(path, plan.runtime_root, "synthetic intelligence artifact")
+    _write_synthetic_intelligence_mp3(exact_media)
+    _write_synthetic_intelligence_mp3(artwork_gap_media)
+    _write_synthetic_intelligence_png(existing_artwork, "#22aa66")
+    _write_synthetic_intelligence_png(replacement_artwork, "#805cff")
+
+    from music_vault.metadata.tag_writer import (
+        SafeTagWriter,
+        TagWriteError,
+        full_file_sha256,
+        inspect_mp3,
+    )
+
+    class _ReviewTagWriter(SafeTagWriter):
+        def __init__(self) -> None:
+            self.last_error: str | None = None
+
+        def _capture(self, operation, *args, **kwargs):
+            try:
+                return operation(*args, **kwargs)
+            except TagWriteError as exc:
+                cause = f":{exc.__cause__.__class__.__name__}" if exc.__cause__ else ""
+                self.last_error = f"{exc}{cause}"
+                raise
+
+        def create_backup(self, *args, **kwargs):
+            return self._capture(super().create_backup, *args, **kwargs)
+
+        def prepare(self, *args, **kwargs):
+            return self._capture(super().prepare, *args, **kwargs)
+
+        def commit(self, *args, **kwargs):
+            return self._capture(super().commit, *args, **kwargs)
+
+    media_before = {
+        "exact": inspect_mp3(exact_media),
+        "art_gap": inspect_mp3(artwork_gap_media),
+    }
+    specifications = (
+        ("exact", "Aster Vale - Amber Circuit", "Random Archive"),
+        ("label", "Lowland Unit - Glass Meridian", "Synthetic Records"),
+        ("featured", "Sable Current feat. Guest Signal - Cloud Geometry", "Fan Archive"),
+        ("studio", "Violet Engine - Static Bloom", "Video Archive"),
+        ("live", "Violet Engine - Static Bloom (Live at Synthetic Hall)", "Audience Capture"),
+        ("conflict", "Velvet Transit Unit - Velvet Transit", "Loose Upload"),
+        ("exclusive", "Independent Channel - Neon Notebook Session", "Independent Channel"),
+        ("art_gap", "Copper Horizon - Paper Lantern", "Fan Mirror"),
+        ("art_existing", "Juniper Arc - Quiet Prism", "Archive Channel"),
+    )
+    track_ids: dict[str, int] = {}
+    with window.db.conn:
+        for index, (key, title, uploader) in enumerate(specifications):
+            if key == "exact":
+                path = exact_media
+            elif key == "art_gap":
+                path = artwork_gap_media
+            else:
+                path = synthetic_media / f"intelligence-{index}.synthetic-audio"
+            _ensure_under_runtime(path, plan.runtime_root, "synthetic intelligence media path")
+            track_ids[key] = window.db.upsert_track(
+                path,
+                title=title,
+                artist=uploader,
+                album="Imported Placeholder",
+                source_kind="youtube",
+                source_video_id=f"mi{index:09d}",
+                duration_seconds=210.0 + index,
+                cover_path=(str(existing_artwork) if key == "art_existing" else None),
+                commit=False,
+            )
+    store = MetadataIntelligenceJobStore(window.db)
+    job_id = store.create_existing_library_job(tuple(track_ids.values()))
+    discogs = _SyntheticIntelligenceDiscogs()
+    musicbrainz = _SyntheticIntelligenceMusicBrainz()
+    artwork_store = _SyntheticIntelligenceArtworkStore(
+        _SyntheticIntelligenceArtworkRecord(
+            path=replacement_artwork,
+            provider_page_url="https://www.discogs.com/release/71007",
+        )
+    )
+    tag_writer = _ReviewTagWriter()
+    settings = {
+        "metadata_intelligence_enabled": True,
+        "metadata_discogs_enabled": True,
+        "metadata_musicbrainz_secondary_enabled": True,
+        "metadata_writeback_enabled": True,
+        "metadata_fill_missing_artwork_enabled": True,
+        "metadata_scan_existing_after_setup": False,
+        "metadata_intelligence_consent_version": 1,
+        "metadata_discogs_consent_version": 1,
+    }
+    service = MetadataIntelligenceService(
+        window.db,
+        settings,
+        token_store=_SyntheticIntelligenceTokenStore(),
+        discogs_provider_factory=lambda _token: discogs,
+        musicbrainz_provider_factory=lambda: musicbrainz,
+        tag_writer=tag_writer,
+        artwork_store_factory=lambda _token: artwork_store,
+    )
+    result = service.analyze_existing_library()
+    rows = {key: window.db.get_track(track_id) for key, track_id in track_ids.items()}
+    exact_corrected = bool(
+        rows["exact"]["title"] == "Amber Circuit"
+        and rows["exact"]["artist"] == "Aster Vale"
+        and rows["exact"]["release_date"] == "1987"
+        and rows["exact"]["original_release_date"] == "1984"
+    )
+    label_credit_count = int(
+        window.db.conn.execute(
+            """
+            SELECT COUNT(*) FROM track_artist_credits c JOIN artists a ON a.id=c.artist_id
+            WHERE c.track_id=? AND lower(a.display_name)=lower('Synthetic Records')
+            """,
+            (track_ids["label"],),
+        ).fetchone()[0]
+    )
+    featured = [
+        tuple(row)
+        for row in window.db.conn.execute(
+            """
+            SELECT a.display_name,c.role,a.entity_type FROM track_artist_credits c
+            JOIN artists a ON a.id=c.artist_id WHERE c.track_id=? ORDER BY c.credit_order
+            """,
+            (track_ids["featured"],),
+        )
+    ]
+    group_and_featured = bool(
+        featured == [
+            ("Sable Current", "primary", "group"),
+            ("Guest Signal", "featured", "person"),
+        ]
+    )
+    studio_live_preserved = bool(
+        rows["studio"]["id"] != rows["live"]["id"]
+        and rows["studio"]["version_type"] == "studio"
+        and rows["live"]["version_type"] == "live"
+        and rows["live"]["release_date"] in (None, "")
+        and rows["live"]["original_release_date"] == "1984"
+    )
+    states = {
+        str(row["reason"]): str(row["state"])
+        for row in window.db.conn.execute(
+            "SELECT reason,state FROM metadata_intelligence_items WHERE job_id=?",
+            (job_id,),
+        )
+    }
+    # Item reasons are all existing_library, so address the two decision rows by track.
+    conflict_state = str(
+        window.db.conn.execute(
+            "SELECT state FROM metadata_intelligence_items WHERE job_id=? AND track_id=?",
+            (job_id, track_ids["conflict"]),
+        ).fetchone()[0]
+    )
+    exclusive_state = str(
+        window.db.conn.execute(
+            "SELECT state FROM metadata_intelligence_items WHERE job_id=? AND track_id=?",
+            (job_id, track_ids["exclusive"]),
+        ).fetchone()[0]
+    )
+    memberships_after = int(
+        window.db.conn.execute("SELECT COUNT(*) FROM playlist_track_origins").fetchone()[0]
+    )
+    item_results = {
+        int(row["track_id"]): (str(row["file_write_result"]), str(row["artwork_result"]))
+        for row in window.db.conn.execute(
+            """
+            SELECT track_id,file_write_result,artwork_result
+            FROM metadata_intelligence_items WHERE job_id=?
+            """,
+            (job_id,),
+        )
+    }
+    media_after = {
+        "exact": inspect_mp3(exact_media),
+        "art_gap": inspect_mp3(artwork_gap_media),
+    }
+    from mutagen.id3 import ID3
+
+    if tag_writer.last_error:
+        raise ReviewPlanError(
+            f"Synthetic metadata-intelligence tag write failed: {tag_writer.last_error}"
+        )
+    exact_tags = ID3(exact_media)
+    gap_tags = ID3(artwork_gap_media)
+    writeback_verified = bool(
+        item_results[track_ids["exact"]][0] == "verified"
+        and item_results[track_ids["art_gap"]][0] == "verified"
+        and str(exact_tags.getall("TIT2")[0].text[0]) == "Amber Circuit"
+        and str(exact_tags.getall("TPE1")[0].text[0]) == "Aster Vale"
+        and str(gap_tags.getall("TIT2")[0].text[0]) == "Paper Lantern"
+        and str(gap_tags.getall("TPE1")[0].text[0]) == "Copper Horizon"
+    )
+    audio_unchanged = all(
+        media_after[key].audio_payload_sha256 == media_before[key].audio_payload_sha256
+        and media_after[key].codec == media_before[key].codec
+        and abs(media_after[key].duration_seconds - media_before[key].duration_seconds) <= 0.05
+        for key in media_before
+    )
+    backup_root = database_path.parent / "backups" / "metadata_jobs" / str(job_id)
+    backup_files = sorted(path for path in backup_root.glob("*.mp3") if path.is_file())
+    expected_backup_hashes = sorted(
+        (media_before["exact"].full_sha256, media_before["art_gap"].full_sha256)
+    )
+    exact_backup_verified = bool(
+        len(backup_files) == 2
+        and sorted(full_file_sha256(path) for path in backup_files)
+        == expected_backup_hashes
+    )
+    from music_vault.metadata.service import MetadataService
+
+    artwork_state = MetadataService(window.db).snapshot(track_ids["art_gap"]).fields["artwork"]
+    missing_artwork_filled = bool(
+        Path(str(rows["art_gap"]["cover_path"])).resolve() == replacement_artwork.resolve()
+        and item_results[track_ids["art_gap"]][1] == "filled"
+        and artwork_state.provider_reference == "https://www.discogs.com/release/71007"
+    )
+    existing_artwork_preserved = bool(
+        Path(str(rows["art_existing"]["cover_path"])).resolve() == existing_artwork.resolve()
+        and item_results[track_ids["art_existing"]][1] == "preserved_existing"
+    )
+    artwork_not_embedded = not exact_tags.getall("APIC") and not gap_tags.getall("APIC")
+    all_track_paths_confined = all(
+        Path(str(row["path"])).resolve().is_relative_to(plan.runtime_root.resolve())
+        for row in window.db.conn.execute("SELECT path FROM tracks")
+    )
+    evidence: dict[str, object] = {
+        "packaged_process": bool(getattr(sys, "frozen", False)),
+        "schema_6": True,
+        "exact_random_uploader_corrected": exact_corrected,
+        "label_excluded_from_artist_credits": label_credit_count == 0,
+        "group_and_featured_credits_structured": group_and_featured,
+        "studio_live_tracks_remain_separate": studio_live_preserved,
+        "unofficial_live_year_blank_original_date_separate": studio_live_preserved,
+        "provider_conflict_requires_review": conflict_state == "review",
+        "youtube_exclusive_fallback_reviewed": (
+            exclusive_state == "review"
+            and rows["exclusive"]["version_type"] == "youtube_exclusive"
+        ),
+        "source_memberships_preserved": memberships_after == memberships_before,
+        "network_guard_active": _REVIEW_NETWORK_GUARD_INSTALLED,
+        "network_attempt_count": len(_REVIEW_NETWORK_EVENTS),
+        "no_secret_files": not api_key.exists() and not discogs_token.exists(),
+        "synthetic_media_writes_confined_to_runtime": all_track_paths_confined,
+        "file_writeback_enabled": settings["metadata_writeback_enabled"] is True,
+        "high_confidence_tag_writeback_verified": writeback_verified,
+        "exact_file_backups_verified": exact_backup_verified,
+        "audio_payload_unchanged": audio_unchanged,
+        "artwork_gap_fill_enabled": settings["metadata_fill_missing_artwork_enabled"] is True,
+        "missing_artwork_filled": missing_artwork_filled,
+        "valid_existing_artwork_preserved": existing_artwork_preserved,
+        "artwork_attribution_persisted": missing_artwork_filled,
+        "discogs_artwork_not_embedded": artwork_not_embedded,
+        "artwork_store_call_count": len(artwork_store.calls),
+        "discogs_query_count": len(discogs.calls),
+        "musicbrainz_query_count": len(musicbrainz.calls),
+        "processed_count": result.processed,
+    }
+    required = (
+        "schema_6",
+        "exact_random_uploader_corrected",
+        "label_excluded_from_artist_credits",
+        "group_and_featured_credits_structured",
+        "studio_live_tracks_remain_separate",
+        "unofficial_live_year_blank_original_date_separate",
+        "provider_conflict_requires_review",
+        "youtube_exclusive_fallback_reviewed",
+        "source_memberships_preserved",
+        "network_guard_active",
+        "no_secret_files",
+        "synthetic_media_writes_confined_to_runtime",
+        "file_writeback_enabled",
+        "high_confidence_tag_writeback_verified",
+        "exact_file_backups_verified",
+        "audio_payload_unchanged",
+        "artwork_gap_fill_enabled",
+        "missing_artwork_filled",
+        "valid_existing_artwork_preserved",
+        "artwork_attribution_persisted",
+        "discogs_artwork_not_embedded",
+    )
+    if any(evidence[name] is not True for name in required):
+        raise ReviewPlanError("Synthetic packaged metadata-intelligence behavior failed.")
+    if evidence["network_attempt_count"] != 0 or result.processed != len(specifications):
+        raise ReviewPlanError("Synthetic metadata-intelligence work was incomplete or attempted network access.")
+    setattr(window, "_review_metadata_intelligence_metrics", evidence)
     return evidence
 
 
@@ -3088,6 +3619,14 @@ def _close_review_metadata_dialog(window: object) -> None:
     setattr(window, "_review_metadata_dialog", None)
 
 
+def _close_review_metadata_intelligence_dialog(window: object) -> None:
+    dialog = getattr(window, "_review_metadata_intelligence_dialog", None)
+    if dialog is not None:
+        dialog.close()
+        dialog.deleteLater()
+    setattr(window, "_review_metadata_intelligence_dialog", None)
+
+
 def _prepare_metadata_scene(window: object, scene: str) -> None:
     from music_vault.metadata.artwork import prepare_local_artwork
     from music_vault.metadata.service import MetadataAction
@@ -3258,10 +3797,23 @@ def _prepare_metadata_scene(window: object, scene: str) -> None:
 
 def prepare_review_scene(window: object, scene: str) -> None:
     _close_review_metadata_dialog(window)
+    _close_review_metadata_intelligence_dialog(window)
     _close_review_remediation_dialog(window)
     _close_review_sync_dialog(window)
     if scene in METADATA_REVIEW_SCENES:
         _prepare_metadata_scene(window, scene)
+    elif scene in METADATA_INTELLIGENCE_REVIEW_SCENES:
+        from music_vault.ui.metadata_intelligence import MetadataIntelligenceDialog
+
+        dialog = MetadataIntelligenceDialog(
+            window.db,
+            getattr(window, "metadata_intelligence_service", None),
+            window,
+        )
+        setattr(window, "_review_metadata_intelligence_dialog", dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
     elif scene in REMEDIATION_REVIEW_SCENES:
         _prepare_remediation_scene(window, scene)
     elif scene == "sync_managed_playlist":
@@ -3366,6 +3918,10 @@ def review_scene_ready(window: object, scene: str) -> bool:
 
     if scene in PARTY_REVIEW_SCENES:
         return True
+
+    if scene in METADATA_INTELLIGENCE_REVIEW_SCENES:
+        dialog = getattr(window, "_review_metadata_intelligence_dialog", None)
+        return bool(dialog is not None and dialog.isVisible())
 
     if scene in {"sync_source_add", "sync_source_edit"}:
         dialog = getattr(window, "_review_sync_source_dialog", None)
@@ -3842,6 +4398,7 @@ def party_review_metrics(window: object, scene: str) -> dict[str, object] | None
 def _active_review_dialog(window: object):
     return (
         getattr(window, "_review_metadata_dialog", None)
+        or getattr(window, "_review_metadata_intelligence_dialog", None)
         or getattr(window, "_review_remediation_dialog", None)
         or getattr(window, "_review_sync_source_dialog", None)
         or getattr(window, "_review_sync_remove_confirmation", None)
@@ -3938,7 +4495,9 @@ class UIReviewController(QObject):
         try:
             self.plan.output_dir.mkdir(parents=True, exist_ok=True)
             if any(
-                scene in PARTY_REVIEW_SCENES or scene in MULTI_SOURCE_REVIEW_SCENES
+                scene in PARTY_REVIEW_SCENES
+                or scene in MULTI_SOURCE_REVIEW_SCENES
+                or scene in METADATA_INTELLIGENCE_REVIEW_SCENES
                 for scene in self.plan.scenes
             ):
                 _install_review_network_guard()
@@ -3947,6 +4506,16 @@ class UIReviewController(QObject):
                 self.runtime_checks["metadata_behaviors"] = validate_metadata_review_behaviors(
                     self.window,
                     self.plan,
+                )
+            if any(
+                scene in METADATA_INTELLIGENCE_REVIEW_SCENES
+                for scene in self.plan.scenes
+            ):
+                self.runtime_checks["metadata_intelligence_behaviors"] = (
+                    validate_metadata_intelligence_review_behaviors(
+                        self.window,
+                        self.plan,
+                    )
                 )
             if any(scene in REMEDIATION_REVIEW_SCENES for scene in self.plan.scenes):
                 self.runtime_checks["remediation_behaviors"] = (
@@ -4167,12 +4736,19 @@ class UIReviewController(QObject):
     def _finish(self) -> None:
         try:
             metadata_behaviors = self.runtime_checks.get("metadata_behaviors")
+            metadata_intelligence_behaviors = self.runtime_checks.get(
+                "metadata_intelligence_behaviors"
+            )
             remediation_behaviors = self.runtime_checks.get("remediation_behaviors")
             party_mode_behaviors = self.runtime_checks.get("party_mode_behaviors")
             multi_source_behaviors = self.runtime_checks.get("multi_source_behaviors")
             self.runtime_checks = validate_review_runtime(self.plan)
             if metadata_behaviors is not None:
                 self.runtime_checks["metadata_behaviors"] = metadata_behaviors
+            if metadata_intelligence_behaviors is not None:
+                self.runtime_checks["metadata_intelligence_behaviors"] = (
+                    metadata_intelligence_behaviors
+                )
             if remediation_behaviors is not None:
                 self.runtime_checks["remediation_behaviors"] = remediation_behaviors
             if party_mode_behaviors is not None:

@@ -29,13 +29,19 @@ in Now Playing:
 - artist;
 - album;
 - album artist;
-- canonical release date; and
+- version-specific canonical release date;
+- original-song release date;
+- normalized version type and descriptive version label; and
 - artwork.
 
 These values remain materialized in `tracks` (`cover_path` stores artwork) for
 compatibility and browser performance. Schema version 3 adds `release_date` and
 `metadata_updated_at`. The `year` column remains a compatible display/grouping
 value derived from the first four digits of a valid canonical `release_date`.
+Schema version 6 adds `original_release_date`, `version_type`, `version_label`,
+Discogs release/master/position identifiers, and `recording_group_key`. A group
+key is navigation/relationship evidence only; it never merges or deletes
+separate track/media records.
 
 `release_date` accepts `YYYY`, `YYYY-MM`, or `YYYY-MM-DD` with real calendar
 validation. A YouTube/source upload date describes publication of the source;
@@ -53,6 +59,33 @@ Common provenance values include `manual`, `musicbrainz_confirmed`,
 `cover_art_archive_high_confidence`, `embedded`, `youtube`,
 `youtube_thumbnail`, `cover_art_archive`, `filename`, and `unknown`.
 
+## Structured artists, release context, and versions
+
+Schema version 6 stores artists independently from the legacy display string.
+`artists` distinguishes person, group, band, duo, orchestra, fictional,
+collective, and unknown entities. `track_artist_credits` preserves ordered
+primary, featured, collaborator, remixer, and performer roles plus display join
+phrases. A band/group remains one entity; punctuation alone does not imply a
+split, and labels or uploader channels do not become artists merely because
+they released or uploaded media.
+
+The materialized `tracks.artist` remains the compatibility/display value.
+Featured artists appear in the primary artist's ordinary tracks and in the
+featured artist's **Featured On** section, but not as primary releases for that
+artist. `track_release_context` keeps Discogs release/master identity, title,
+country, format, catalogue number, label, version release date, original-song
+date, provider reference, confidence, and timestamp. A label is company/release
+metadata, never an artist credit.
+
+`release_date` describes the specific effective recording/release version;
+`original_release_date` describes the underlying song/recording history when
+credible. For an unofficial live recording with no official release,
+`release_date` and Year remain blank while the original-song date may still be
+shown separately. `version_type` normalizes studio, live, remix, edit, acoustic,
+cover, instrumental, demo, radio/extended, sped-up/slowed, nightcore, mashup,
+re-recording, soundtrack, YouTube-exclusive, and unknown identities;
+`version_label` preserves useful detail such as venue, mix, or remaster text.
+
 ## Authority and precedence
 
 Automatic observations use a centralized precedence policy:
@@ -65,6 +98,14 @@ Automatic observations use a centralized precedence policy:
 6. YouTube/source fallback;
 7. filename fallback or unknown.
 
+When automatic intelligence is enabled, a strong version-consistent Discogs
+match is preferred; MusicBrainz is secondary corroboration/fallback. Provider
+preference never overrides confidence: only fields meeting the automatic
+threshold and without a meaningful conflict may apply. A medium/low-confidence
+field or provider/release/date/version disagreement stays review-only. YouTube
+title parsing supplies search hints, while uploader/channel and upload date
+remain source provenance rather than default artist or release date.
+
 Locked values are not replaced by automatic imports. A lower-priority or empty
 automatic observation cannot erase a stronger populated value, but the
 observation is still retained for inspection. An effective mutation updates the
@@ -74,7 +115,9 @@ only updates and no-op saves do not create metadata history or advance
 
 ## Manual correction operations
 
-The Trusted Metadata editor supports six editable fields and deliberately
+The Trusted Metadata editor supports title, artist, album, album artist,
+version release date, original-song release date, normalized version type,
+version label, and artwork, and deliberately
 separates four operations:
 
 - **Set:** stores the entered value as manual and locked by default.
@@ -150,6 +193,14 @@ Schema version 4 additively introduces persisted remediation jobs/items and a
 bounded provider cache. It does not reinterpret existing effective values,
 locks, observations, or history during migration. A verified SQLite backup is
 created before a non-empty schema-v3 database is upgraded.
+
+Schema version 5 adds multiple-source synchronization identity and origin
+tables. Schema version 6 additively introduces structured artists/credits,
+release context, new version/date materialization, and resumable automatic-
+intelligence jobs/items. Its conservative backfill preserves the exact legacy
+artist display string as one unsplit primary unknown entity, respects existing
+field authority, and performs no provider request or media write. The verified
+SQLite backup/integrity/idempotence rules remain in force.
 
 ## Existing-library remediation
 

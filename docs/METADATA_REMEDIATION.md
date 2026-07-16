@@ -10,6 +10,15 @@ Remediation is separate from synchronization. It never starts a YouTube sync,
 does not use or read the YouTube API key, and does not change source-video
 identity, playlists, queue state, or media organization.
 
+Batch 10.1 adds a separate automatic Metadata Intelligence queue. Its
+Discogs-first, MusicBrainz-secondary field ensemble can run after new imports
+or in a resumable existing-library job only after explicit provider/privacy
+consent. The older remediation guarantees remain authoritative: analysis and
+review evidence are private, automatic application is field-level and strict,
+manual/confirmed locks win, and no track, version, source membership, playlist
+origin, or media file is merged or deleted. See
+[Discogs Metadata](DISCOGS_METADATA.md).
+
 ## Analysis and apply are separate
 
 **Analyze Library** creates or resumes a schema-v4 remediation job. Analysis:
@@ -157,6 +166,14 @@ MIME, encoded-format, dimension, pixel, and decode checks. Artwork is normalized
 for safe embedding, bounded to avoid unnecessary file growth, and never
 replaces manual or confirmed locked artwork. Missing or ambiguous art preserves
 the current cover.
+
+Discogs artwork follows a narrower automatic policy: it may fill only a true
+gap and is stored in private content-addressed runtime cover storage with
+attribution. It never automatically replaces valid embedded, YouTube, Cover Art
+Archive, manual, locked, or existing cover artwork, and it is never embedded in
+media automatically. Accepted high-confidence text fields—including supported
+original-date, version, and provider identifiers—may use the same verified MP3
+writeback transaction; source upload date is never written as release date.
 
 ## Failure isolation, verification, and rollback
 

@@ -47,6 +47,7 @@ METADATA_SCENES = (
     "metadata_long_values",
     "metadata_currently_playing",
 )
+METADATA_INTELLIGENCE_SCENES = ("metadata_intelligence_smoke",)
 REMEDIATION_SCENES = (
     "remediation_empty",
     "remediation_analyzing",
@@ -150,6 +151,7 @@ def parse_args() -> argparse.Namespace:
             "artists",
             "no_results",
             *METADATA_SCENES,
+            *METADATA_INTELLIGENCE_SCENES,
             *REMEDIATION_SCENES,
             *PARTY_SCENES,
             *MULTI_SOURCE_SCENES,
@@ -366,7 +368,7 @@ def seed_synthetic_runtime(
 
     try:
         from music_vault.core import paths
-        from music_vault.core.db import MusicVaultDB
+        from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB
 
         paths._resolved_project_root.cache_clear()
         if paths.project_root().resolve() != runtime:
@@ -503,7 +505,7 @@ def seed_synthetic_runtime(
         schema = int(db.conn.execute("PRAGMA user_version").fetchone()[0])
         integrity = str(db.conn.execute("PRAGMA integrity_check").fetchone()[0])
         db.close()
-        if schema != 5 or integrity != "ok":
+        if schema != CURRENT_SCHEMA_VERSION or integrity != "ok":
             raise RuntimeError("Synthetic database validation failed.")
 
         if include_party:
@@ -534,6 +536,7 @@ def seed_synthetic_runtime(
     if (data / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
     return {
+        "schema_version": schema,
         "track_count": len(track_ids),
         "playlist_count": len(playlist_specs),
         "synthetic_album_target": 100,
@@ -696,6 +699,40 @@ def validate_output(
         }
         if any(metadata_behaviors.get(name) is not True for name in required_behaviors):
             raise RuntimeError("Synthetic packaged metadata behavior validation failed.")
+    if captured_scenes.intersection(METADATA_INTELLIGENCE_SCENES):
+        runtime_checks = payload.get("runtime_checks") or {}
+        behaviors = runtime_checks.get("metadata_intelligence_behaviors") or {}
+        required_behaviors = {
+            "schema_6",
+            "exact_random_uploader_corrected",
+            "label_excluded_from_artist_credits",
+            "group_and_featured_credits_structured",
+            "studio_live_tracks_remain_separate",
+            "unofficial_live_year_blank_original_date_separate",
+            "provider_conflict_requires_review",
+            "youtube_exclusive_fallback_reviewed",
+            "source_memberships_preserved",
+            "network_guard_active",
+            "no_secret_files",
+            "synthetic_media_writes_confined_to_runtime",
+            "file_writeback_enabled",
+            "high_confidence_tag_writeback_verified",
+            "exact_file_backups_verified",
+            "audio_payload_unchanged",
+            "artwork_gap_fill_enabled",
+            "missing_artwork_filled",
+            "valid_existing_artwork_preserved",
+            "artwork_attribution_persisted",
+            "discogs_artwork_not_embedded",
+        }
+        if any(behaviors.get(name) is not True for name in required_behaviors):
+            raise RuntimeError(
+                "Synthetic packaged metadata-intelligence validation failed."
+            )
+        if int(behaviors.get("network_attempt_count", -1)) != 0:
+            raise RuntimeError(
+                "Synthetic metadata-intelligence smoke attempted network access."
+            )
     if captured_scenes.intersection(REMEDIATION_SCENES):
         runtime_checks = payload.get("runtime_checks") or {}
         remediation_behaviors = runtime_checks.get("remediation_behaviors") or {}
@@ -1070,7 +1107,9 @@ def validate_output(
         integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
     finally:
         connection.close()
-    if schema != 5 or integrity != "ok":
+    from music_vault.core.db import CURRENT_SCHEMA_VERSION
+
+    if schema != CURRENT_SCHEMA_VERSION or integrity != "ok":
         raise RuntimeError("Synthetic database failed final validation.")
     if (runtime / "data" / "youtube_api_key.txt").exists():
         raise RuntimeError("Synthetic runtime unexpectedly contains an API key.")
@@ -1176,6 +1215,12 @@ def write_aggregate_manifest(
             if isinstance(page, str) and page not in pages:
                 pages.append(page)
 
+    runtime_checks: dict[str, object] = {}
+    for manifest in manifests:
+        child_checks = manifest.get("runtime_checks", {})
+        if isinstance(child_checks, dict):
+            runtime_checks.update(child_checks)
+
     aggregate = dict(manifests[0])
     aggregate.update(
         {
@@ -1194,7 +1239,7 @@ def write_aggregate_manifest(
                 bool(manifest.get("dark_title_bar_applied"))
                 for manifest in manifests
             ),
-            "runtime_checks": manifests[-1].get("runtime_checks", {}),
+            "runtime_checks": runtime_checks,
         }
     )
     destination = output / "manifest.json"
@@ -1383,6 +1428,18 @@ def main() -> int:
                 raise RuntimeError(
                     "Multi-source smoke did not run inside the packaged EXE."
                 )
+        if args.exe is not None and set(scenes).intersection(
+            METADATA_INTELLIGENCE_SCENES
+        ):
+            intelligence_behaviors = (
+                (manifest.get("runtime_checks") or {}).get(
+                    "metadata_intelligence_behaviors", {}
+                )
+            )
+            if intelligence_behaviors.get("packaged_process") is not True:
+                raise RuntimeError(
+                    "Metadata-intelligence smoke did not run inside the packaged EXE."
+                )
         wrong_data = project_root / "dist" / "MusicVault" / "data"
         if wrong_data.exists():
             raise RuntimeError("dist/MusicVault/data was created during UI review.")
@@ -1398,7 +1455,7 @@ def main() -> int:
                     "sizes": manifest["sizes"],
                     "pages": manifest["pages"],
                     "dark_title_bar_applied": manifest.get("dark_title_bar_applied"),
-                    "schema_version": 5,
+                    "schema_version": dataset["schema_version"],
                     "config_volume_percent": 23,
                     "api_key_present": False,
                     "artist_provider": "synthetic_no_network",

@@ -735,7 +735,7 @@ def verify_source_compliance(
             if parts & {".git", ".venv", ".codex", ".agents", "__pycache__", "release_artifacts", "build", "dist"}:
                 findings.append(Finding(relative, "private/generated source content", "compliance"))
             if name in {
-                "youtube_api_key.txt", "music_vault_config.json", "music_vault_status.json",
+                "discogs_token.txt", "youtube_api_key.txt", "music_vault_config.json", "music_vault_status.json",
                 "music_vault.sqlite3", "youtube_failed_ids.txt", "youtube_download_archive.txt",
             }:
                 findings.append(Finding(relative, "runtime/private source content", "compliance"))

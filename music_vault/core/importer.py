@@ -14,6 +14,8 @@ from mutagen.flac import Picture
 from .paths import covers_dir
 from .safety import normalize_source_upload_date
 from music_vault.metadata.service import MetadataService
+from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
+from music_vault.metadata.artist_credits import seed_existing_artist_credits
 
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac"}
@@ -202,6 +204,7 @@ def import_file(
         "SELECT source_kind, source_video_id, source_upload_date FROM tracks WHERE path=?",
         (resolved_path,),
     ).fetchone()
+    is_new_track = existing is None
     raw_source_kind = (
         source.source_kind
         if source is not None
@@ -281,6 +284,19 @@ def import_file(
                 change_group_id=change_group_id,
                 commit=False,
             )
+        seed_existing_artist_credits(db.conn, (track_id,))
+
+    if is_new_track:
+        # Provider work is deliberately outside the ordinary import
+        # transaction. Enqueue failure must never roll back or fail a local
+        # import, and no network request is performed here.
+        try:
+            MetadataIntelligenceJobStore(db).enqueue_track(
+                track_id,
+                reason="new_import",
+            )
+        except Exception:
+            pass
 
     return True
 

@@ -16,6 +16,9 @@ attachment, screenshot, log excerpt, or reproduction repository:
 - Personal filesystem paths or usernames
 - Unsanitized logs that may contain any of the above
 
+This includes `data/discogs_token.txt`, Discogs queries/results and downloaded
+images, metadata-intelligence item records, and personal review screenshots.
+
 Credentials and runtime data are stored locally and are excluded from Git by
 the repository rules. Those rules do not make it safe to share an arbitrary
 copy of a working data directory.
@@ -133,6 +136,33 @@ never report a successful write. Private reports, cache rows, candidate
 snapshots, generated artwork, and media/database backups are runtime data and
 must not be shared or committed. See
 [Metadata Remediation](docs/METADATA_REMEDIATION.md).
+
+Batch 10.1's automatic metadata intelligence is separately disabled until the
+user supplies a personal Discogs token, accepts the provider/privacy notice,
+and enables the feature. The token is stored only in
+`data/discogs_token.txt`; it is never copied into JSON config, SQLite, App
+Status, logs, reports, manifests, screenshots, or packages. Requests use HTTPS
+to the official Discogs API destination with bounded time/response/pagination,
+public-address validation, disabled environment proxy inheritance, rate-limit
+handling, cancellation, and sanitized errors. Authentication is never placed
+in a query string or sent to an image host.
+
+Discogs queries may contain normalized title, artist, and album hints for the
+current track being analyzed. YouTube uploader/channel and upload date stay
+provenance; they are not silently promoted to artist or canonical release date.
+Raw API responses are not persisted. Only accepted normalized metadata,
+provider IDs and public page references, field provenance/confidence, fetch
+timestamps, and private job evidence required for review/resume are retained.
+App Status is aggregate-only and contains no token, query, provider response,
+item identifier, candidate, artwork URL, or raw error.
+
+Discogs artwork can fill only a verified gap. Downloads are host-restricted,
+bounded, decoded, and stored under private content-addressed runtime storage.
+Valid embedded, YouTube, Cover Art Archive, manual, locked, or existing artwork
+is not automatically replaced. Discogs images are never embedded into media
+automatically and are rejected by Git/history and release publication checks.
+Textual catalogue metadata is treated separately from restricted image
+content. See [Discogs Metadata](docs/DISCOGS_METADATA.md).
 
 ## Optional artist-image requests
 

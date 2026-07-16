@@ -251,6 +251,9 @@ def test_new_track_persists_every_effective_field_state(tmp_path):
         "album",
         "album_artist",
         "release_date",
+        "original_release_date",
+        "version_type",
+        "version_label",
         "artwork",
     }
     db.close()

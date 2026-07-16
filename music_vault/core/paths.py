@@ -377,6 +377,11 @@ def youtube_api_key_path() -> Path:
     return data_dir() / "youtube_api_key.txt"
 
 
+def discogs_token_path() -> Path:
+    """Return the local-only personal Discogs token file."""
+    return data_dir() / "discogs_token.txt"
+
+
 def youtube_download_archive_path() -> Path:
     return data_dir() / "youtube_download_archive.txt"
 
@@ -395,6 +400,14 @@ def manual_covers_dir() -> Path:
 
 def cover_art_archive_dir() -> Path:
     return covers_dir() / "providers" / "cover_art_archive"
+
+
+def discogs_covers_dir() -> Path:
+    return covers_dir() / "discogs"
+
+
+def discogs_provider_cache_dir() -> Path:
+    return data_dir() / "provider_cache" / "discogs"
 
 
 def artist_images_dir() -> Path:

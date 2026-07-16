@@ -19,6 +19,9 @@ Depending on which features are used, local runtime data can include:
 - manually imported or provider-cached lyrics and negative-cache records;
 - field-level metadata provenance, source observations, confidence, locks, and
   change history;
+- a locally stored Discogs token, normalized accepted catalogue results,
+  structured artist/release provenance, metadata-intelligence jobs, and private
+  gap-only Discogs artwork;
 - metadata-remediation reports; and
 - local backups.
 
@@ -48,6 +51,11 @@ exports a saved source URL, label, remote title, playlist ID, playlist-item or
 video ID, destination playlist, source folder, membership snapshot, or per-item
 error. App Status is updated at meaningful source/batch transitions rather than
 for every progress line.
+
+Batch 10.1 adds only aggregate metadata-intelligence readiness/job counts to App
+Status. It never exports the Discogs token, provider query/result, track or
+release/artist ID, title, artist, uploader, candidate, review reason, image URL,
+local cover path, or raw provider error.
 
 Synchronization supports public and unlisted playlists and performs anonymous
 media extraction. It does not silently read Firefox, Chrome, Edge, or other
@@ -79,6 +87,40 @@ order. Remote removal, source detachment, destination changes, and source
 archive never delete global tracks, media, metadata, artwork, lyrics, or
 history. Managed playlist contents are preserved as manual origins when a
 source is detached. See [Multiple Source Playlists](MULTIPLE_SOURCE_PLAYLISTS.md).
+
+## Optional Discogs-first metadata intelligence
+
+Automatic intelligence is disabled until the user stores a personal Discogs
+token, accepts the provider/privacy notice, and enables the feature. The token
+is kept only in `data/discogs_token.txt`, not config JSON or SQLite, and it is
+never printed, logged, copied to App Status, sent to an image host, committed,
+or bundled. Music Vault performs no purchase, marketplace transaction, or
+automatic paid-service enrollment. Provider availability and terms can change;
+imports and playback continue when Discogs is missing or unavailable.
+
+For an analyzed track, Music Vault may send normalized title, artist, album,
+duration, and version hints to Discogs. MusicBrainz can be used as secondary
+corroboration/fallback. YouTube video titles help form queries; uploader/channel
+names and upload dates remain source provenance. Provider networking is
+bounded, cancellable, rate-aware, HTTPS/host restricted, and isolated from
+browser credentials and environment proxy inheritance. Raw Discogs responses
+are held in memory only for a short-lived duplicate-suppression cache and are
+never retained as long-term library data.
+
+Accepted metadata stores only normalized effective values, structured credits,
+release/label context, provider IDs/page reference, field provenance,
+confidence, and fetch time. Resumable job items can include private current
+snapshots, parsed hints, proposals, agreement summaries, and review reasons;
+these records can identify a personal library and stay inside the private
+database. No item-level data enters public verification output.
+
+Discogs catalogue text and images have different handling. Text catalogue data
+is provided as CC0; Discogs image use remains restricted. A validated front
+image may be cached under `data/covers/discogs/` only to fill a true gap, with
+provider-page attribution. It never automatically replaces valid artwork and
+is never embedded into an audio file automatically. The image, provider cache,
+and attribution metadata are private runtime data, ignored by Git, and rejected
+from release packages. See [Discogs Metadata](DISCOGS_METADATA.md).
 
 These categories can contain credentials, private library information,
 personal playlist information, local paths, and copyrighted media. They are
@@ -252,7 +294,9 @@ incomplete. Back up the local `data/` directory before future metadata
 remediation, database-schema work, or other maintenance that may alter runtime
 state.
 
-The v1.0.0 portable package bootstraps empty schema-v4 runtime data on first use.
+The v1.0.0 portable package bootstraps empty runtime data using its tagged
+release schema; current v1.1.0 development builds create or migrate to schema
+version 6 on first use.
 Moving, copying, or sharing an initialized portable folder can also move its
 private `data` directory, so inspect and remove runtime data before sharing an
 application folder. The clean release ZIP should be obtained from the published

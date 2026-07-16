@@ -14,9 +14,10 @@ licensing, and known-limit details.
 
 **Current main development line: v1.1.0 Development.** Batch 9 adds
 full-screen audio-reactive Party Mode, Batch 9.1 refines its musical motion and
-adds optional local-first lyrics, and Batch 10 adds persistent Multiple Source
-Playlists. No v1.1.0 tag or public v1.1.0 release has been created. Music Vault
-has no Watchtower relationship or runtime dependency.
+adds optional local-first lyrics, Batch 10 adds persistent Multiple Source
+Playlists, and Batch 10.1 adds consent-gated Discogs-first metadata
+intelligence. No v1.1.0 tag or public v1.1.0 release has been created. Music
+Vault has no Watchtower relationship or runtime dependency.
 
 ## Install the portable release
 
@@ -50,11 +51,15 @@ downloaded automatically.
 - Local settings for downloads, conversion quality, API readiness, FFmpeg
   readiness, data location, and a non-admin desktop shortcut
 - Trusted Metadata editing with provenance, protected manual/confirmed values,
-  grouped history, undo, explicit MusicBrainz candidate review, and validated
-  artwork
+  grouped history, undo, structured artist credits, explicit MusicBrainz
+  candidate review, and validated artwork
 - Resumable existing-library remediation with analysis before apply, strict
   high-confidence automation, private reports, verified MP3 backups/writeback,
   unchanged-audio checks, and conflict-aware rollback
+- Optional Discogs-first automatic intelligence for title, artist credits,
+  release/version context, and true artwork gaps; MusicBrainz remains a
+  secondary authority, uncertain fields stay review-only, and uploader/channel
+  names remain source provenance rather than assumed musical artists
 - Fast SQL-backed album/artist grids, optional privacy-aware artist photos, and
   the premium scalable Windows desktop UI
 - Neutral, versioned local App Status JSON for optional local consumers
@@ -94,6 +99,16 @@ never infers removals, and source removal safely preserves the local playlist,
 library, media, metadata, artwork, lyrics, and history. See
 [Multiple Source Playlists](docs/MULTIPLE_SOURCE_PLAYLISTS.md).
 
+Discogs-first Metadata Intelligence is disabled until the user stores a
+personal token, accepts the provider/privacy notice, and enables it in
+Settings. It can enrich new imports in the background and offers a resumable
+existing-library scan. Only strong, unambiguous, unlocked fields may apply
+automatically; meaningful provider disagreement, date/release ambiguity, and
+version conflicts go to review. Structured credits distinguish primary,
+featured, collaborator, remixer, and performer roles. Studio, live, remix,
+edit, acoustic, cover, slowed, sped-up, YouTube-exclusive, and other versions
+remain separate tracks. See [Discogs Metadata](docs/DISCOGS_METADATA.md).
+
 ## First launch and local data
 
 The first-run guide appears only for a genuinely blank runtime. It validates a
@@ -115,11 +130,13 @@ Use synchronization only for music that you own or are authorized to download.
 Public and unlisted playlists are supported; private-playlist OAuth is not.
 Failed items remain visible and are retried on a later manual sync.
 
-YouTube upload dates remain source provenance rather than canonical release
-dates. Manual metadata work is local. Music Vault contacts MusicBrainz only for
-an explicit candidate search or library analysis; uncertain items remain
-unchanged. See the [Metadata Model](docs/METADATA_MODEL.md) and
-[Metadata Remediation](docs/METADATA_REMEDIATION.md).
+YouTube upload dates and uploader/channel names remain source provenance rather
+than canonical release dates or default musical artists. Manual metadata work
+is local. Music Vault can contact Discogs only after explicit setup and consent;
+MusicBrainz remains an explicit candidate source and secondary corroboration or
+fallback. Uncertain items remain unchanged or enter review. See the
+[Metadata Model](docs/METADATA_MODEL.md), [Metadata Remediation](docs/METADATA_REMEDIATION.md),
+and [Discogs Metadata](docs/DISCOGS_METADATA.md).
 
 ## Source development
 
@@ -143,6 +160,7 @@ Common engineering commands:
 .\tools\dev\run_exe.ps1
 .\tools\dev\capture_ui_review.ps1
 .\tools\dev\run_party_mode_review.ps1
+.\tools\dev\run_batch10_1_review.ps1 --offscreen
 .\tools\dev\profile_media_browsers.ps1
 .\tools\dev\remediate_library_metadata.ps1 status
 .\.venv\Scripts\python.exe -B -m pytest -q
@@ -182,9 +200,10 @@ proposing a change.
 Music Vault is a standalone application. Neutral Prime interoperability is only
 a possible external future option. Android, Best Original quality, an
 installer/updater, an editable queue panel, and personal radio are not V1
-requirements. Batch 9 Party Mode, Batch 9.1 motion/lyrics refinement, and Batch
-10 Multiple Source Playlists are complete on the v1.1.0 development line;
-Batch 11 Highest-Practical-Quality / Best Original is next. See the
+requirements. Batch 9 Party Mode, Batch 9.1 motion/lyrics refinement, Batch 10
+Multiple Source Playlists, and Batch 10.1 Discogs-first metadata intelligence
+are complete on the v1.1.0 development line; Batch 11
+Highest-Practical-Quality / Best Original is next. See the
 [roadmap](docs/ROADMAP.md).
 
 ## Licensing

@@ -189,6 +189,45 @@ def test_mp3_writeback_round_trips_all_approved_fields_and_artwork(
     assert backup.backup_path.read_bytes() == original_bytes
 
 
+def test_batch10_1_writeback_round_trips_discogs_and_version_text_without_artwork(
+    synthetic_mp3: Path,
+    tmp_path: Path,
+):
+    writer = SafeTagWriter()
+    before = inspect_mp3(synthetic_mp3)
+    backup = _backup(writer, synthetic_mp3, tmp_path / "backups")
+    prepared = writer.prepare(
+        synthetic_mp3,
+        {
+            "artist": "Primary Artist feat. Featured Artist",
+            "original_release_date": "1978",
+            "version_type": "live",
+            "version_label": "Live at Synthetic Hall",
+            "discogs_release_id": "12345",
+            "discogs_master_id": "67890",
+            "discogs_artist_ids": "101;202",
+            "musicbrainz_artist_ids": "mb-artist-a;mb-artist-b",
+            "source_upload_date": "2025-01-02",
+        },
+        expected_full_sha256=before.full_sha256,
+        artwork_path=None,
+    )
+    result = writer.commit(prepared, backup=backup)
+    tags = ID3(synthetic_mp3)
+
+    assert _text(tags, "TPE1") == "Primary Artist feat. Featured Artist"
+    assert _txxx(tags, "Music Vault Original Release Date") == "1978"
+    assert _txxx(tags, "Music Vault Version Type") == "live"
+    assert _txxx(tags, "Music Vault Version Label") == "Live at Synthetic Hall"
+    assert _txxx(tags, "Discogs Release Id") == "12345"
+    assert _txxx(tags, "Discogs Master Id") == "67890"
+    assert _txxx(tags, "Discogs Artist Ids") == "101;202"
+    assert _txxx(tags, "MusicBrainz Artist Ids") == "mb-artist-a;mb-artist-b"
+    assert _txxx(tags, "Source Upload Date") is None
+    assert tags.getall("APIC") == []
+    assert result.updated.audio_payload_sha256 == before.audio_payload_sha256
+
+
 def test_artwork_writeback_replaces_only_front_cover_and_preserves_other_apic_frames(
     synthetic_mp3: Path,
     tmp_path: Path,

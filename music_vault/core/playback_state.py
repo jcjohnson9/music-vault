@@ -8,6 +8,10 @@ from typing import Any
 DEFAULT_VOLUME_PERCENT = 75
 _CONFIG_SECRET_KEYS = {
     "api_key",
+    "discogs_api_token",
+    "discogs_personal_token",
+    "discogs_token",
+    "discogs_token_value",
     "youtube_api_key",
     "youtube_api_key_value",
 }

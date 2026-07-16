@@ -152,10 +152,10 @@ def _insert_source(connection, external_id: str, storage_key: str, destination=N
     ).lastrowid
 
 
-def test_new_database_initializes_complete_schema_v5(tmp_path):
+def test_new_database_keeps_batch10_structures_at_latest_schema(tmp_path):
     db = MusicVaultDB(tmp_path / "new.sqlite3")
-    assert CURRENT_SCHEMA_VERSION == 5
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert CURRENT_SCHEMA_VERSION == 6
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 6
     tables = {
         str(row[0])
         for row in db.conn.execute(
@@ -187,12 +187,12 @@ def test_new_database_initializes_complete_schema_v5(tmp_path):
     db.close()
 
 
-def test_v4_to_v5_migration_is_backed_up_preserving_and_idempotent(tmp_path):
+def test_v4_to_latest_migration_is_backed_up_preserving_and_idempotent(tmp_path):
     path = _schema_v4_database(tmp_path / "library.sqlite3", tmp_path / "exists.media")
     backups = tmp_path / "backups"
     db = MusicVaultDB(path, backup_dir=backups)
 
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 6
     assert db.last_migration_backup and db.last_migration_backup.is_file()
     with sqlite3.connect(db.last_migration_backup) as backup:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 4
@@ -233,7 +233,7 @@ def test_v4_to_v5_migration_is_backed_up_preserving_and_idempotent(tmp_path):
         """
     ).fetchone()
     assert tuple(conflict) == (2, 1)
-    assert db.conn.execute("SELECT COUNT(*) FROM track_metadata_fields").fetchone()[0] == 12
+    assert db.conn.execute("SELECT COUNT(*) FROM track_metadata_fields").fetchone()[0] == 18
     assert db.conn.execute("SELECT COUNT(*) FROM metadata_remediation_jobs").fetchone()[0] == 1
     assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -249,7 +249,7 @@ def test_v4_to_v5_migration_is_backed_up_preserving_and_idempotent(tmp_path):
     reopened.close()
 
 
-def test_v5_constraints_prevent_ambiguous_sources_and_origins(tmp_path):
+def test_batch10_constraints_prevent_ambiguous_sources_and_origins(tmp_path):
     db = MusicVaultDB(tmp_path / "constraints.sqlite3")
     track = db.upsert_track(tmp_path / "synthetic.media", title="Synthetic")
     playlist_a = db.create_playlist("A")

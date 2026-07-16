@@ -30,11 +30,23 @@ REQUIRED_FILES = (
     "music_vault/metadata/remediation.py",
     "music_vault/metadata/tag_writer.py",
     "music_vault/metadata/artist_images.py",
+    "music_vault/metadata/artist_credits.py",
+    "music_vault/metadata/intelligence_schema.py",
+    "music_vault/metadata/intelligence_settings.py",
+    "music_vault/metadata/intelligence.py",
+    "music_vault/metadata/title_parser.py",
+    "music_vault/metadata/uploader_classifier.py",
+    "music_vault/metadata/ensemble.py",
+    "music_vault/metadata/providers/__init__.py",
+    "music_vault/metadata/providers/discogs.py",
+    "music_vault/metadata/discogs_artwork.py",
     "music_vault/ui/browser_loader.py",
     "music_vault/ui/media_grid.py",
     "music_vault/ui/metadata_editor.py",
     "music_vault/ui/metadata_tasks.py",
     "music_vault/ui/metadata_remediation.py",
+    "music_vault/ui/metadata_intelligence.py",
+    "music_vault/ui/artist_credit_editor.py",
     "music_vault/ui/thumbnail_cache.py",
     "music_vault/ui/theme.py",
     "music_vault/ui/icons.py",
@@ -105,6 +117,13 @@ def main() -> int:
     from music_vault.ui.media_grid import MediaGridModel, MediaGridView
     from music_vault.ui.thumbnail_cache import ThumbnailCache
     from music_vault.metadata.artist_images import ArtistImageCache, ArtistImageService
+    from music_vault.metadata.artist_credits import ArtistCreditService
+    from music_vault.metadata.discogs_artwork import DiscogsArtworkCache
+    from music_vault.metadata.ensemble import build_metadata_ensemble
+    from music_vault.metadata.intelligence import MetadataIntelligenceService
+    from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
+    from music_vault.metadata.providers.discogs import DiscogsProvider
+    from music_vault.metadata.title_parser import parse_youtube_title
     from music_vault.metadata.artwork import CoverArtArchiveProvider, prepare_local_artwork
     from music_vault.metadata.musicbrainz_enricher import MusicBrainzProvider
     from music_vault.metadata.matching import classify_candidates
@@ -179,6 +198,13 @@ def main() -> int:
             ThumbnailCache,
             ArtistImageCache,
             ArtistImageService,
+            ArtistCreditService,
+            DiscogsArtworkCache,
+            DiscogsProvider,
+            MetadataIntelligenceJobStore,
+            MetadataIntelligenceService,
+            build_metadata_ensemble,
+            parse_youtube_title,
             MetadataService,
             MusicBrainzProvider,
             CoverArtArchiveProvider,
@@ -204,6 +230,9 @@ def main() -> int:
         "artist images": paths.artist_images_dir(),
         "metadata reports": paths.metadata_reports_dir(),
         "metadata job backups": paths.metadata_job_backups_dir(),
+        "Discogs token": paths.discogs_token_path(),
+        "Discogs covers": paths.discogs_covers_dir(),
+        "Discogs provider cache": paths.discogs_provider_cache_dir(),
     }
 
     if resolved_paths["project root"] != PROJECT_ROOT:
@@ -219,7 +248,13 @@ def main() -> int:
             print(f"{name.title()} path is outside the data directory: {resolved_paths[name]}")
             return 1
 
-    for name in ("metadata reports", "metadata job backups"):
+    for name in (
+        "metadata reports",
+        "metadata job backups",
+        "Discogs token",
+        "Discogs covers",
+        "Discogs provider cache",
+    ):
         if not resolved_paths[name].is_relative_to(expected_data_dir):
             print(f"{name.title()} path is outside the data directory: {resolved_paths[name]}")
             return 1

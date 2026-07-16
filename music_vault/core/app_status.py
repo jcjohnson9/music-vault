@@ -14,6 +14,7 @@ from .paths import (
     data_dir,
     database_path as default_database_path,
     default_downloads_dir,
+    discogs_token_path,
     path_resolution_source,
     project_root,
     youtube_api_key_path,
@@ -82,6 +83,63 @@ def _api_ready() -> bool:
         return bool(youtube_api_key_path().read_text(encoding="utf-8", errors="ignore").strip())
     except Exception:
         return False
+
+
+def _discogs_ready() -> bool:
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+        return False
+    try:
+        # Read only enough local state to report readiness. The value is never
+        # returned, logged, or included in App Status.
+        return bool(discogs_token_path().read_text(encoding="utf-8", errors="ignore").strip())
+    except Exception:
+        return False
+
+
+def _metadata_intelligence_summary(db, config) -> dict:
+    try:
+        consent_version = int(config.get("metadata_intelligence_consent_version") or 0)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        consent_version = 0
+    enabled = bool(
+        isinstance(config, dict)
+        and config.get("metadata_intelligence_enabled") is True
+        and consent_version >= 1
+    )
+    summary = {
+        "metadata_intelligence_enabled": enabled,
+        "metadata_intelligence_job_status": None,
+        "metadata_intelligence_total": 0,
+        "metadata_intelligence_analyzed": 0,
+        "metadata_intelligence_applied": 0,
+        "metadata_intelligence_review_count": 0,
+        "discogs_ready": _discogs_ready(),
+    }
+    try:
+        job = db.conn.execute(
+            "SELECT status FROM metadata_intelligence_jobs "
+            "ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if job is not None:
+            summary["metadata_intelligence_job_status"] = str(job[0])
+        counts = db.conn.execute(
+            """
+            SELECT
+                COUNT(*),
+                SUM(CASE WHEN state NOT IN ('created', 'queued') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN state IN ('applied', 'complete') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN state IN ('needs_review', 'review') THEN 1 ELSE 0 END)
+            FROM metadata_intelligence_items
+            """
+        ).fetchone()
+        if counts is not None:
+            summary["metadata_intelligence_total"] = int(counts[0] or 0)
+            summary["metadata_intelligence_analyzed"] = int(counts[1] or 0)
+            summary["metadata_intelligence_applied"] = int(counts[2] or 0)
+            summary["metadata_intelligence_review_count"] = int(counts[3] or 0)
+    except Exception:
+        pass
+    return summary
 
 
 def _ffmpeg_ready(config=None) -> bool:
@@ -197,6 +255,7 @@ def write_app_status(db, config, extra=None) -> Path:
         ),
         "lyrics_available": False,
         "lyrics_synchronized": False,
+        **_metadata_intelligence_summary(db, config),
         "paths": {
             "project_root": str(root),
             "data_dir": str(resolved_data_dir),
@@ -217,6 +276,13 @@ def write_app_status(db, config, extra=None) -> Path:
             "party_mode_lyrics_enabled",
             "lyrics_available",
             "lyrics_synchronized",
+            "metadata_intelligence_enabled",
+            "metadata_intelligence_job_status",
+            "metadata_intelligence_total",
+            "metadata_intelligence_analyzed",
+            "metadata_intelligence_applied",
+            "metadata_intelligence_review_count",
+            "discogs_ready",
         ):
             if field in extra:
                 payload[field] = extra[field]

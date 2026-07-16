@@ -7,6 +7,18 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Added
 
+- Added schema-v6 structured artist entities/credits, release and label
+  context, original-versus-version dates, normalized version identity, and
+  resumable metadata-intelligence jobs without changing canonical track or
+  source-membership identity.
+- Added optional Discogs-first automatic metadata intelligence with a private
+  personal-token store, explicit consent, MusicBrainz corroboration/fallback,
+  YouTube-title hint parsing, uploader classification, field-level confidence,
+  a review dashboard, and automatic post-import queueing.
+- Added gap-only Discogs cover retrieval to private content-addressed storage,
+  required attribution, and verified high-confidence text-tag writeback through
+  the existing backup/readback/unchanged-audio pipeline. Discogs artwork is not
+  embedded automatically.
 - Added persistent saved YouTube playlist sources with Library Only and Managed
   Local Playlist destinations, deterministic enable/order controls, sequential
   Sync Selected and Sync All execution, Stop After Current, per-source run and
@@ -34,6 +46,12 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Changed
 
+- Artist browsing now uses structured primary/featured/collaborator roles while
+  preserving legacy display strings, bands/groups as single entities, and a
+  distinct Featured On view.
+- Discogs is the preferred automatic catalogue authority when configured;
+  MusicBrainz remains secondary, source uploader/date fields remain provenance,
+  and meaningful provider/release/version disagreement remains review-only.
 - Advanced the current source tree to `1.1.0` on the `development` channel.
   The latest public stable release and immutable release tag remain `v1.0.0`.
 - Made Static the one-time migrated Party default, routed long-lived animation
@@ -46,6 +64,14 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Security and privacy
 
+- Kept the Discogs token in an ignored local secret file and out of config,
+  App Status, logs, reports, manifests, packages, and source control. Raw
+  responses are memory-only and short-lived; accepted metadata stores only the
+  normalized result, provenance, provider reference, confidence, and timestamp.
+- Kept Discogs artwork private and runtime-only, prohibited automatic media-tag
+  embedding and replacement of valid artwork, and extended publication/release
+  gates to reject credentials, provider caches, images, and item-level metadata
+  intelligence records.
 - Kept saved source URLs, labels, remote titles, playlist/item identities,
   membership snapshots, local source folders, and per-item failures inside
   private runtime data. App Status receives aggregate source/batch values only.
@@ -63,6 +89,10 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Fixed
 
+- Preserved `source_track_identities.updated_at` during no-op schema backfills,
+  while retaining timestamp updates for real canonical-track remaps. Corrected
+  the schema-6 acceptance gate to recognize the three intentional field-state
+  additions per track and deterministic normalized artist-entity reuse.
 - Added a corrective publication path for the existing immutable `v1.0.0`
   application tag without changing the application or retagging its source.
   Corrective release tooling now records the tagged application commit and the

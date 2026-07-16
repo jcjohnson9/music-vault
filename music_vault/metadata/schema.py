@@ -14,6 +14,9 @@ EDITABLE_METADATA_FIELDS = (
     "album",
     "album_artist",
     "release_date",
+    "original_release_date",
+    "version_type",
+    "version_label",
     "artwork",
 )
 
@@ -28,8 +31,32 @@ MATERIALIZED_COLUMNS = {
     "album": "album",
     "album_artist": "album_artist",
     "release_date": "release_date",
+    "original_release_date": "original_release_date",
+    "version_type": "version_type",
+    "version_label": "version_label",
     "artwork": "cover_path",
 }
+
+VERSION_TYPES = (
+    "studio",
+    "live",
+    "remix",
+    "edit",
+    "acoustic",
+    "cover",
+    "instrumental",
+    "demo",
+    "radio_edit",
+    "extended",
+    "sped_up",
+    "slowed",
+    "nightcore",
+    "mashup",
+    "re_recording",
+    "soundtrack",
+    "youtube_exclusive",
+    "unknown",
+)
 
 _RELEASE_DATE_RE = re.compile(r"^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$")
 
@@ -72,6 +99,15 @@ def release_year(value: object) -> str | None:
     return normalized[:4] if normalized else None
 
 
+def normalize_version_type(value: object) -> str | None:
+    text = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    if not text:
+        return None
+    if text not in VERSION_TYPES:
+        raise ValueError(f"Unsupported version type: {text}")
+    return text
+
+
 def observation_key(
     track_id: int,
     provider: str,
@@ -95,21 +131,90 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return str(row[0] or "") if row is not None else ""
+
+
+def _rebuild_checked_table(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    create_sql: str,
+    columns: tuple[str, ...],
+) -> None:
+    """Expand a CHECK-constrained table without losing a single stored value."""
+
+    current_sql = _table_sql(conn, table)
+    if not current_sql:
+        conn.execute(create_sql.format(table=table))
+        return
+    required_literals = ("'original_release_date'", "'version_type'", "'version_label'")
+    if all(value in current_sql for value in required_literals):
+        return
+
+    replacement = f"{table}_schema_v6_new"
+    conn.execute(f'DROP TABLE IF EXISTS "{replacement}"')
+    conn.execute(create_sql.format(table=replacement))
+    names = ", ".join(f'"{name}"' for name in columns)
+    before_count = int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+    conn.execute(
+        f'INSERT INTO "{replacement}" ({names}) SELECT {names} FROM "{table}"'
+    )
+    after_count = int(
+        conn.execute(f'SELECT COUNT(*) FROM "{replacement}"').fetchone()[0]
+    )
+    missing = int(
+        conn.execute(
+            f'SELECT COUNT(*) FROM (SELECT {names} FROM "{table}" '
+            f'EXCEPT SELECT {names} FROM "{replacement}")'
+        ).fetchone()[0]
+    )
+    added = int(
+        conn.execute(
+            f'SELECT COUNT(*) FROM (SELECT {names} FROM "{replacement}" '
+            f'EXCEPT SELECT {names} FROM "{table}")'
+        ).fetchone()[0]
+    )
+    if before_count != after_count or missing or added:
+        raise RuntimeError(f"Could not verify the schema-v6 copy of {table}.")
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "{replacement}" RENAME TO "{table}"')
+
+
 def create_metadata_schema(conn: sqlite3.Connection) -> None:
     columns = _columns(conn, "tracks")
     if "release_date" not in columns:
         conn.execute("ALTER TABLE tracks ADD COLUMN release_date TEXT")
     if "metadata_updated_at" not in columns:
         conn.execute("ALTER TABLE tracks ADD COLUMN metadata_updated_at TEXT")
+    version_types = ", ".join(f"'{value}'" for value in VERSION_TYPES)
+    for column, definition in (
+        ("original_release_date", "TEXT"),
+        ("version_type", f"TEXT CHECK (version_type IS NULL OR version_type IN ({version_types}))"),
+        ("version_label", "TEXT"),
+        ("discogs_release_id", "TEXT"),
+        ("discogs_master_id", "TEXT"),
+        ("discogs_track_position", "TEXT"),
+        ("recording_group_key", "TEXT"),
+    ):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE tracks ADD COLUMN {column} {definition}")
 
     editable = ", ".join(f"'{field}'" for field in EDITABLE_METADATA_FIELDS)
     observations = ", ".join(f"'{field}'" for field in OBSERVATION_FIELDS)
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS track_metadata_fields (
+    version_value_check = (
+        "field_name != 'version_type' OR value IS NULL OR "
+        f"value IN ({version_types})"
+    )
+    field_sql = f"""
+        CREATE TABLE {{table}} (
             track_id INTEGER NOT NULL,
             field_name TEXT NOT NULL CHECK (field_name IN ({editable})),
-            value TEXT,
+            value TEXT CHECK ({version_value_check}),
             provenance TEXT NOT NULL,
             provider_reference TEXT,
             confidence REAL CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 100),
@@ -120,32 +225,28 @@ def create_metadata_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
         )
         """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS track_metadata_observations (
+    observation_sql = f"""
+        CREATE TABLE {{table}} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             observation_key TEXT NOT NULL UNIQUE,
             track_id INTEGER NOT NULL,
             provider TEXT NOT NULL,
             field_name TEXT NOT NULL CHECK (field_name IN ({observations})),
-            value TEXT,
+            value TEXT CHECK ({version_value_check}),
             provider_reference TEXT,
             confidence REAL CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 100),
             observed_at TEXT NOT NULL,
             FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
         )
         """
-    )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS track_metadata_history (
+    history_sql = f"""
+        CREATE TABLE {{table}} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             change_group_id TEXT NOT NULL,
             track_id INTEGER NOT NULL,
             field_name TEXT NOT NULL CHECK (field_name IN ({editable})),
-            old_value TEXT,
-            new_value TEXT,
+            old_value TEXT CHECK (field_name != 'version_type' OR old_value IS NULL OR old_value IN ({version_types})),
+            new_value TEXT CHECK (field_name != 'version_type' OR new_value IS NULL OR new_value IN ({version_types})),
             old_provenance TEXT,
             new_provenance TEXT,
             old_provider_reference TEXT,
@@ -162,6 +263,35 @@ def create_metadata_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
         )
         """
+    _rebuild_checked_table(
+        conn,
+        table="track_metadata_fields",
+        create_sql=field_sql,
+        columns=(
+            "track_id", "field_name", "value", "provenance", "provider_reference",
+            "confidence", "is_manual", "is_locked", "updated_at",
+        ),
+    )
+    _rebuild_checked_table(
+        conn,
+        table="track_metadata_observations",
+        create_sql=observation_sql,
+        columns=(
+            "id", "observation_key", "track_id", "provider", "field_name", "value",
+            "provider_reference", "confidence", "observed_at",
+        ),
+    )
+    _rebuild_checked_table(
+        conn,
+        table="track_metadata_history",
+        create_sql=history_sql,
+        columns=(
+            "id", "change_group_id", "track_id", "field_name", "old_value", "new_value",
+            "old_provenance", "new_provenance", "old_provider_reference",
+            "new_provider_reference", "old_confidence", "new_confidence",
+            "old_is_manual", "new_is_manual", "old_is_locked", "new_is_locked",
+            "actor", "reason", "changed_at",
+        ),
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_metadata_fields_track "
@@ -270,6 +400,7 @@ def seed_existing_metadata(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
         SELECT id, title, artist, album, album_artist, year, release_date,
+               original_release_date, version_type, version_label,
                cover_path, source_kind, source_video_id, source_upload_date,
                musicbrainz_recording_id, musicbrainz_release_id,
                updated_at, metadata_updated_at
@@ -308,6 +439,9 @@ def seed_existing_metadata(conn: sqlite3.Connection) -> None:
             "album": row["album"],
             "album_artist": row["album_artist"],
             "release_date": canonical_release,
+            "original_release_date": row["original_release_date"],
+            "version_type": row["version_type"],
+            "version_label": row["version_label"],
             "artwork": row["cover_path"],
         }
         artwork_confirmed = bool(
@@ -368,6 +502,16 @@ def seed_existing_metadata(conn: sqlite3.Connection) -> None:
             is_locked=canonical_release is not None and release_confirmed,
             updated_at=observed_at,
         )
+        for field_name in ("original_release_date", "version_type", "version_label"):
+            value = values[field_name]
+            _insert_field_state(
+                conn,
+                track_id=track_id,
+                field_name=field_name,
+                value=value,
+                provenance="embedded" if value is not None else "unknown",
+                updated_at=observed_at,
+            )
         _insert_field_state(
             conn,
             track_id=track_id,

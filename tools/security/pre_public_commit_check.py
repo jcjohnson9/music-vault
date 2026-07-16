@@ -95,6 +95,7 @@ LOCAL_SECRET_SUFFIXES = {
     ".key",
 }
 RUNTIME_BASENAMES = {
+    "discogs_token.txt",
     "youtube_api_key.txt",
     "music_vault_config.json",
     "youtube_download_archive.txt",
@@ -250,6 +251,7 @@ def _text_patterns() -> list[tuple[re.Pattern[str], str, str]]:
     private_key = "-----BEGIN " + r"(?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
     github_token = r"\bgh" + r"[pousr]_[A-Za-z0-9_]{20,}"
     github_pat = "github" + r"_pat_[A-Za-z0-9_]{20,}"
+    discogs_token = r"(?i)Discogs\s+token\s*=\s*[A-Za-z0-9._~-]{16,}"
 
     return [
         (re.compile(re.escape(project_path), re.IGNORECASE), "full personal project path", "replace with a neutral project-root example"),
@@ -259,6 +261,7 @@ def _text_patterns() -> list[tuple[re.Pattern[str], str, str]]:
         (re.compile(private_key), "private-key material", "remove and rotate the credential"),
         (re.compile(github_token), "likely GitHub token", "remove and rotate the credential"),
         (re.compile(github_pat), "likely GitHub personal access token", "remove and rotate the credential"),
+        (re.compile(discogs_token), "likely Discogs personal token", "remove and rotate the credential"),
     ]
 
 

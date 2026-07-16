@@ -24,9 +24,16 @@ _TEXT_FRAME_IDS = {
     "album_artist": "TPE2",
     "release_date": "TDRC",
 }
-_MUSICBRAINZ_DESCRIPTIONS = {
+_CUSTOM_TEXT_DESCRIPTIONS = {
     "musicbrainz_recording_id": "MusicBrainz Track Id",
     "musicbrainz_release_id": "MusicBrainz Album Id",
+    "musicbrainz_artist_ids": "MusicBrainz Artist Ids",
+    "discogs_release_id": "Discogs Release Id",
+    "discogs_master_id": "Discogs Master Id",
+    "discogs_artist_ids": "Discogs Artist Ids",
+    "original_release_date": "Music Vault Original Release Date",
+    "version_type": "Music Vault Version Type",
+    "version_label": "Music Vault Version Label",
 }
 
 
@@ -243,7 +250,10 @@ class SafeTagWriter:
             if full_file_sha256(destination) != original.full_sha256:
                 raise TagWriteError("backup_hash_conflict")
             return MediaBackup(source, destination, original)
-        temporary = folder / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+        # Keep the atomic staging name short.  The verified destination keeps
+        # the full identity/hash, while a repeated long basename here can push
+        # otherwise valid Windows runtime roots beyond the legacy path limit.
+        temporary = folder / f".mv-backup-{uuid.uuid4().hex[:12]}.tmp"
         try:
             shutil.copy2(source, temporary)
             if full_file_sha256(temporary) != original.full_sha256:
@@ -276,7 +286,7 @@ class SafeTagWriter:
         normalized = {
             key: str(value).strip()
             for key, value in patch.items()
-            if key in {*_TEXT_FRAME_IDS, *_MUSICBRAINZ_DESCRIPTIONS}
+            if key in {*_TEXT_FRAME_IDS, *_CUSTOM_TEXT_DESCRIPTIONS}
             and value is not None
             and str(value).strip()
         }
@@ -304,7 +314,7 @@ class SafeTagWriter:
                     continue
                 tags.delall(frame_id)
                 tags.add(frame_types[field](encoding=3, text=[normalized[field]]))
-            for field, description in _MUSICBRAINZ_DESCRIPTIONS.items():
+            for field, description in _CUSTOM_TEXT_DESCRIPTIONS.items():
                 if field not in normalized:
                     continue
                 for key in list(tags.keys()):
@@ -370,7 +380,7 @@ class SafeTagWriter:
         for field, frame_id in _TEXT_FRAME_IDS.items():
             if field in expected and _first_text(tags, frame_id) != expected[field]:
                 raise TagWriteError("tag_readback_mismatch")
-        for field, description in _MUSICBRAINZ_DESCRIPTIONS.items():
+        for field, description in _CUSTOM_TEXT_DESCRIPTIONS.items():
             if field in expected and _musicbrainz_text(tags, description) != expected[field]:
                 raise TagWriteError("tag_readback_mismatch")
         if artwork_sha256 is not None:
