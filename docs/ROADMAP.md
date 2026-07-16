@@ -196,7 +196,28 @@ multi-source Sync Center.
 Vault into a hosted service.
 
 **Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0;
-Batch 11 remains next.
+Batch 10.1 follows as a corrective metadata patch on the same line.
+
+## Batch 10.1 — Discogs-First Automatic Metadata Intelligence
+
+**Objective:** Correct incomplete automatic metadata without weakening manual
+locks, source identity, version preservation, or safe file-writeback rules.
+
+**Scope:** Schema-v6 artist entities and ordered credits; release/label and
+original-versus-version context; personal-token, consent-gated Discogs primary
+authority; MusicBrainz secondary corroboration/fallback; YouTube-title parsing
+and uploader classification; field-level confidence/review; post-import and
+resumable existing-library jobs; gap-only private Discogs artwork; and verified
+high-confidence text-tag writeback.
+
+**Non-goals:** No blind bulk rewrite, label/uploader-as-artist promotion,
+track/version merge, source-membership change, automatic artwork replacement or
+Discogs image embedding, YouTube sync change, public v1.1.0 release, or Batch 11
+quality implementation.
+
+**Status:** Complete on the v1.1.0 development line after schema, provider,
+privacy, automated regression, packaged synthetic, controlled migration, and
+delivery gates. Stable remains v1.0.0; Batch 11 remains next.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original
 

@@ -10,6 +10,7 @@ runtime data are not source artifacts.
 | `.\tools\dev\run_source.ps1` | Run the checked-out development source. |
 | `.\tools\dev\build_exe.ps1` | Rebuild the official one-folder development EXE. |
 | `.\tools\dev\capture_ui_review.ps1` | Run the explicitly gated synthetic application review matrix. |
+| `.\tools\dev\run_batch10_1_review.ps1 --offscreen` | Capture the bounded ten-state Discogs metadata-intelligence review with in-memory synthetic data and networking blocked. |
 | `.\tools\dev\profile_media_browsers.ps1` | Profile browser structure with temporary synthetic databases. |
 | `.\tools\dev\run_party_mode_review.ps1` | Review PartyCanvas and real PartyModeWindow states plus bounded frame performance with temporary synthetic audio/artwork. |
 | `.\tools\dev\run_party_mode_9_1_review.ps1` | Review the 22-state Batch 9.1 motion/lyrics matrix and performance using temporary synthetic data with networking blocked. |
@@ -69,3 +70,58 @@ are blocked for the entire helper process.
 
 Pass `-Output .\.ui-review\batch9-1` only for a temporary human review. Delete
 that ignored output after recording the findings.
+
+## Batch 10.1 metadata-intelligence review
+
+The Batch 10.1 helper captures token setup, consent, resumable job summary,
+provider agreement/disagreement, structured credits, unofficial-live dates,
+YouTube-exclusive fallback, gap-only artwork, and Artist **Featured On** states.
+It uses an in-memory database and fake local evidence only, blocks network
+events, keeps the credential field blank and masked, rejects personal-path or
+authorization text, and deletes all captures after validation by default:
+
+```powershell
+.\tools\dev\run_batch10_1_review.ps1 --offscreen
+```
+
+For temporary human review, retain captures only below ignored `.ui-review/`
+or in a correctly prefixed TEMP directory, then delete them after review:
+
+```powershell
+.\tools\dev\run_batch10_1_review.ps1 --offscreen `
+  --output .\.ui-review\batch10-1 `
+  --keep-captures
+```
+
+## Batch 10.2 migration-preservation gates
+
+The Batch 10.2 helpers prove schema-5-to-6 migration preservation and the
+narrow source-identity timestamp correction without printing library values.
+They require the verified schema-5 rollback database and its pinned SHA-256.
+The source and packaged proofs copy that database to a system temporary root,
+sanitize media paths only in the disposable copy, run without secrets or
+network access, and delete the temporary runtime after collecting aggregate
+evidence.
+
+```powershell
+.\tools\dev\run_batch10_2_source_migration_proof.ps1 `
+  -Schema5Backup <verified-schema5-backup> `
+  -ExpectedSha256 <sha256>
+
+.\tools\dev\run_batch10_2_packaged_migration_smoke.ps1
+```
+
+The live repair wrapper is intentionally separate and fail-closed. Use
+`compare`, then `clone-proof`, before the explicitly acknowledged `repair`
+mode. Repair creates a fresh schema-6 SQLite backup and permits only
+`source_track_identities.updated_at` to change.
+
+```powershell
+.\tools\dev\repair_batch10_2_identity_timestamps.ps1 `
+  -Mode compare `
+  -TargetDatabase <schema6-database> `
+  -ReferenceBackup <verified-schema5-backup> `
+  -ReferenceSha256 <sha256> `
+  -ExpectedIdentityCount 304 `
+  -ExpectedRepairCount 304
+```

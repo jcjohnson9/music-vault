@@ -44,3 +44,21 @@ from the later corrective release-tooling source.
 
 This notice states the release's factual packaging and licensing basis; it is
 not legal advice.
+
+## Discogs catalogue service
+
+Discogs is an optional network service and is not bundled with Music Vault.
+Users supply their own personal token and remain responsible for complying with
+the current Discogs API terms. Catalogue text returned through the API is made
+available by Discogs under CC0; accepted fields are stored locally with source
+provenance, confidence, provider reference, and fetch time.
+
+Discogs images are governed separately and are not treated as CC0 catalogue
+text. Music Vault may retain a validated front image only in private runtime
+storage to fill a true artwork gap. It does not automatically replace valid
+artwork, embed a Discogs image into an audio file, commit an image, or include
+one in a public package. Provider-page attribution is preserved with accepted
+Discogs metadata and artwork.
+
+This application uses Discogs’ API but is not affiliated with, sponsored or
+endorsed by Discogs. “Discogs” is a trademark of Zink Media, LLC.

@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qs, urlparse
 
 
-EXPECTED_SCHEMA_VERSION = 5
+EXPECTED_SCHEMA_VERSION = 6
 BASELINE_FORMAT_VERSION = 1
 STATUS_SCHEMA_VERSION = 1
 
@@ -43,6 +43,11 @@ METADATA_COUNT_TABLES = (
     "metadata_remediation_jobs",
     "metadata_remediation_items",
     "metadata_provider_cache",
+)
+SCHEMA_V6_FIELD_STATES = (
+    "original_release_date",
+    "version_type",
+    "version_label",
 )
 REQUIRED_BATCH10_INDEXES = frozenset(
     {
@@ -302,6 +307,15 @@ def _database_summary(connection: sqlite3.Connection, database: Path) -> dict[st
     fields_columns = _columns(connection, "track_metadata_fields")
     metadata.update(
         {
+            "schema_v6_field_state_count": (
+                _count(
+                    connection,
+                    "track_metadata_fields",
+                    "field_name IN ('original_release_date','version_type','version_label')",
+                )
+                if "field_name" in fields_columns
+                else 0
+            ),
             "manual_field_count": (
                 _count(connection, "track_metadata_fields", "is_manual=1")
                 if "is_manual" in fields_columns
@@ -965,12 +979,30 @@ def verify_migration(
         "playlist_count",
         "membership_count",
         "playlist_order_digest",
-        "metadata",
     )
     preservation = {
         field: after_db.get(field) == before_db.get(field)
         for field in preserved_fields
     }
+    before_metadata = before_db["metadata"]
+    after_metadata = after_db["metadata"]
+    preserved_metadata_keys = set(before_metadata) - {
+        "track_metadata_fields",
+        "schema_v6_field_state_count",
+    }
+    preexisting_metadata_preserved = all(
+        after_metadata.get(key) == before_metadata.get(key)
+        for key in preserved_metadata_keys
+    )
+    before_v6_fields = int(before_metadata.get("schema_v6_field_state_count", 0))
+    after_v6_fields = int(after_metadata.get("schema_v6_field_state_count", 0))
+    before_legacy_fields = int(before_metadata["track_metadata_fields"]) - before_v6_fields
+    after_legacy_fields = int(after_metadata["track_metadata_fields"]) - after_v6_fields
+    schema_v6_field_states_complete = (
+        before_legacy_fields == after_legacy_fields
+        and after_v6_fields
+        == int(after_db["track_count"]) * len(SCHEMA_V6_FIELD_STATES)
+    )
     runtime_guards_unchanged = all(
         current["guard_files"][key] == baseline["guard_files"][key]
         for key in ("config", "download_archive", "failed_ids")
@@ -1035,12 +1067,14 @@ def verify_migration(
         == int(before_db["sources"]["expected_identity_conflict_count"])
     )
     checks = {
-        "schema_is_5": after_db["schema_version"] == EXPECTED_SCHEMA_VERSION,
+        "schema_is_6": after_db["schema_version"] == EXPECTED_SCHEMA_VERSION,
         "tracks_preserved": preservation["track_count"],
         "playlists_preserved": preservation["playlist_count"],
         "memberships_preserved": preservation["membership_count"],
         "playlist_order_preserved": preservation["playlist_order_digest"],
-        "metadata_history_remediation_preserved": preservation["metadata"],
+        "metadata_history_remediation_preserved": (
+            preexisting_metadata_preserved and schema_v6_field_states_complete
+        ),
         "foreign_keys_enabled": after_db["foreign_keys_enabled"],
         "foreign_key_check_clean": after_db["foreign_key_issue_count"] == 0,
         "integrity_ok": after_db["integrity_ok"],

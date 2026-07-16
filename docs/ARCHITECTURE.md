@@ -38,6 +38,8 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/ui/media_grid.py` | Reusable album/artist models, filter proxy, delegate-painted responsive grid, state presentation, and visible-range discovery. |
 | `music_vault/ui/thumbnail_cache.py` | Bounded memory LRU, coalesced background QImage decoding, high-DPI thumbnail keys, and stale-generation protection. |
 | `music_vault/ui/metadata_editor.py` | Trusted Metadata dialog for field actions, source inspection, candidate review, history, and undo. |
+| `music_vault/ui/artist_credit_editor.py` | Ordered primary/featured/collaborator/remixer/performer credit editing with manual lock authority. |
+| `music_vault/ui/metadata_intelligence.py` | Aggregate, token-free job dashboard and field-conflict/review routing. |
 | `music_vault/ui/metadata_tasks.py` | Cancellable, stale-result-safe background provider work for the metadata editor. |
 | `music_vault/ui/onboarding.py` | Blank-runtime detection helpers and the local-first, optional-sync first-run guide. |
 | `music_vault/ui/review.py` | Explicitly environment-gated synthetic screenshot controller; inert during normal application use. |
@@ -50,6 +52,13 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/lyrics/providers/lrclib.py` | Consent-gated, read-only LRCLIB client with HTTPS destination controls, bounded responses, and strict result matching. |
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
+| `music_vault/metadata/intelligence_schema.py` | Schema-v6 artist entities, ordered track credits, release context, and resumable intelligence-job state. |
+| `music_vault/metadata/intelligence.py` | Consent-gated Discogs-first, MusicBrainz-secondary field ensemble, automatic import queue, and resumable library analysis. |
+| `music_vault/metadata/artist_credits.py` | Conservative legacy seeding plus provider/manual structured-credit persistence and display materialization. |
+| `music_vault/metadata/title_parser.py` | Comparison-only extraction of YouTube title, credit, and version hints without rewriting stored metadata. |
+| `music_vault/metadata/uploader_classifier.py` | Conservative uploader/channel classification so labels and distribution channels remain provenance. |
+| `music_vault/metadata/discogs_artwork.py` | Validated gap-only Discogs front-art retrieval into private content-addressed storage with attribution. |
+| `music_vault/metadata/providers/discogs.py` | Personal-token Discogs catalogue client with bounded HTTPS, rate, response, redirect, and cancellation policy. |
 | `music_vault/metadata/remediation_schema.py` | Additive schema-v4 remediation job, item, cache, constraint, and index definitions. |
 | `music_vault/metadata/service.py` | Transactional metadata authority for precedence, materialization, locks, manual/confirmed/high-confidence changes, history, undo, and rollback snapshots. |
 | `music_vault/metadata/matching.py` | Provider-query normalization, recording/release scoring, risk detection, ambiguity policy, and typed field-level decisions. |
@@ -80,7 +89,9 @@ saved source selection in Sync Center
   -> origin-aware managed-playlist materialization
   -> targeted Mutagen/source observations
   -> metadata precedence and effective field materialization
-  -> schema-v5 SQLite library, source, provenance, history, and remediation state
+  -> optional consent-gated Discogs-first/MusicBrainz-secondary field ensemble
+  -> schema-v6 SQLite library, structured credits, source, provenance, history,
+     remediation, and resumable intelligence state
   -> PySide6 browsing and the existing QMediaPlayer playback pipeline
 ```
 
@@ -90,9 +101,11 @@ Enabled sources run sequentially; every source is imported and reconciled
 before the next starts, allowing overlapping video identities to reuse one
 canonical track and valid media file. Only complete enumeration can remove a
 source occurrence. yt-dlp and FFmpeg perform authorized acquisition and audio
-processing. Mutagen reads media metadata and
-embedded artwork. MusicBrainz and Cover Art Archive are optional enrichment
-services. When separately enabled by the user, artist-photo lookup uses
+processing. Mutagen reads media metadata and embedded artwork. Discogs is the
+preferred automatic catalogue authority only after personal-token setup and
+explicit consent; MusicBrainz remains secondary corroboration/fallback and an
+explicit manual candidate source. Cover Art Archive remains an optional
+artwork source. When separately enabled by the user, artist-photo lookup uses
 MusicBrainz identity followed by public Wikidata, Wikipedia, or Wikimedia
 image metadata. None of these external services owns the local Music Vault
 library.
@@ -196,6 +209,26 @@ non-empty older database. It seeds conservative state and observations without
 provider access, media-tag reads, fabricated canonical dates, or history.
 Schema version 4 adds only persisted remediation job/item/cache structures.
 
+Schema version 6 extends editable field state with `original_release_date`,
+`version_type`, and `version_label`, while materialized track fields retain
+Discogs release/master/position identity and a non-deduplicating
+`recording_group_key`. `artists`, ordered `track_artist_credits`, and
+`track_release_context` distinguish people/groups, primary/featured roles,
+labels, original-song dates, and version-specific release context. Conservative
+migration creates one unsplit primary credit for a non-empty legacy artist
+string; it never guesses punctuation, group membership, uploader identity, or
+provider IDs.
+
+After consent, metadata intelligence queues a newly imported canonical track
+once and can resume an explicitly started existing-library job. Provider work
+runs outside import and GUI transactions. Discogs is preferred only when its
+match is strong and version-consistent; MusicBrainz corroborates or fills a
+credible fallback, while YouTube titles and uploader classes provide hints and
+provenance. Only unambiguous field-level confidence at the automatic threshold
+may update an unlocked field. Disagreement, release/date ambiguity, version
+conflict, and uncertain artist identity remain review-only. A recording-group
+key never merges media or changes source membership.
+
 The remediation coordinator keeps analysis separate from apply. Analysis
 snapshots state, uses cached/rate-limited provider candidates, and writes only
 private job/cache/report records. Apply rechecks the aggregate library revision,
@@ -292,6 +325,12 @@ packaged/source capture hook activates only when its explicit review environment
 variable and validated plan are present. Visible paths are neutralized before
 capture, the runtime is deleted afterward, and screenshot output remains an
 ignored local review artifact rather than product or personal data.
+
+`tools/dev/run_batch10_1_review.py` adds a bounded ten-scene metadata review
+using only generated names, fake local candidates, blank credential controls,
+and no-network enforcement. It exercises the real intelligence dashboard and
+structured-credit widget where applicable, records aggregate geometry/privacy
+checks, and deletes captures by default.
 
 ## Party Mode boundary
 

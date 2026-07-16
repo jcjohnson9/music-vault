@@ -64,6 +64,7 @@ HISTORY_MEDIA_SUFFIXES = AUDIO_SUFFIXES | {
     ".mp4",
 }
 PRIVATE_RUNTIME_NAMES = {
+    "discogs_token.txt",
     "music_vault.sqlite3",
     "music_vault_config.json",
     "music_vault_status.json",

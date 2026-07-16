@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+from music_vault.core.db import CURRENT_SCHEMA_VERSION
 from music_vault.core.library_browser import load_album_summaries, load_artist_summaries
 from music_vault.ui.media_grid import (
     MediaFilterProxyModel,
@@ -75,7 +76,10 @@ def test_synthetic_seed_has_large_safe_browser_dataset(tmp_path):
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
     try:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == CURRENT_SCHEMA_VERSION
+        )
     finally:
         connection.close()
 

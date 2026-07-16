@@ -106,6 +106,7 @@ def application_stylesheet() -> str:
     chevron_icon = _qss_asset_url("chevron-down.svg")
     return f"""
 QMainWindow,
+QDialog,
 QWidget#AppRoot {{
     background: {c['app_background']};
     color: {c['text_primary']};
@@ -639,21 +640,24 @@ QSplitter#SyncSourceSplitter::handle {{
     width: 10px;
 }}
 
-QTabWidget#SyncDetailTabs::pane {{
+QTabWidget#SyncDetailTabs::pane,
+QTabWidget#ArtistRoleTabs::pane {{
     border: 1px solid {c['border']};
     border-radius: 10px;
     background: {c['subtle_surface']};
     top: -1px;
 }}
 
-QTabWidget#SyncDetailTabs QTabBar::tab {{
+QTabWidget#SyncDetailTabs QTabBar::tab,
+QTabWidget#ArtistRoleTabs QTabBar::tab {{
     background: transparent;
     color: {c['text_secondary']};
     padding: 8px 12px;
     border-bottom: 2px solid transparent;
 }}
 
-QTabWidget#SyncDetailTabs QTabBar::tab:selected {{
+QTabWidget#SyncDetailTabs QTabBar::tab:selected,
+QTabWidget#ArtistRoleTabs QTabBar::tab:selected {{
     color: {c['text_primary']};
     border-bottom-color: {c['accent']};
 }}

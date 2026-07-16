@@ -35,6 +35,7 @@ DATABASE_EXTENSIONS = {".db", ".sqlite", ".sqlite3"}
 ARCHIVE_EXTENSIONS = {".7z", ".rar", ".tar", ".tgz", ".gz", ".zip"}
 ALLOWED_RUNTIME_ARCHIVES = {"_internal/base_library.zip"}
 FORBIDDEN_EXACT_NAMES = {
+    "discogs_token.txt",
     "youtube_api_key.txt",
     "music_vault_config.json",
     "music_vault_status.json",

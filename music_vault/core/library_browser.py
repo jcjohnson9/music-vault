@@ -52,9 +52,16 @@ class AlbumKey:
 @dataclass(frozen=True, slots=True)
 class ArtistKey:
     normalized_name: str
+    artist_id: int | None = None
+    provider_identity: str = ""
+    identity_key: str = ""
 
     @property
     def browser_key(self) -> str:
+        if self.artist_id is not None:
+            return _stable_browser_key("artist", ("artist_id", str(self.artist_id)))
+        if self.identity_key:
+            return _stable_browser_key("artist", (self.identity_key,))
         return _stable_browser_key("artist", (self.normalized_name,))
 
 
@@ -82,6 +89,9 @@ class ArtistSummary:
     display_name: str
     track_count: int
     image_state: str = "not_cached"
+    featured_track_count: int = 0
+    collaboration_track_count: int = 0
+    entity_type: str = "unknown"
 
     @property
     def browser_key(self) -> str:
@@ -95,6 +105,41 @@ class ArtistSummary:
     def sort_value(self) -> str:
         return self.key.normalized_name
 
+    @property
+    def primary_track_count(self) -> int:
+        """Return the ordinary-track count without breaking the legacy API."""
+
+        return self.track_count
+
+    @property
+    def featured_on_count(self) -> int:
+        return self.featured_track_count
+
+    @property
+    def collaboration_count(self) -> int:
+        return self.collaboration_track_count
+
+
+@dataclass(frozen=True, slots=True)
+class ArtistTrackSections:
+    """Tracks associated with one artist, separated by structured credit role."""
+
+    tracks: tuple[sqlite3.Row, ...] = ()
+    featured_on: tuple[sqlite3.Row, ...] = ()
+    collaborations: tuple[sqlite3.Row, ...] = ()
+
+    @property
+    def primary_tracks(self) -> tuple[sqlite3.Row, ...]:
+        return self.tracks
+
+    @property
+    def featured_tracks(self) -> tuple[sqlite3.Row, ...]:
+        return self.featured_on
+
+    @property
+    def collaboration_tracks(self) -> tuple[sqlite3.Row, ...]:
+        return self.collaborations
+
 
 @dataclass(frozen=True, slots=True)
 class BrowserRevision:
@@ -102,6 +147,10 @@ class BrowserRevision:
     max_track_id: int
     max_updated_at: str
     artwork_count: int
+    artist_count: int = 0
+    artist_credit_count: int = 0
+    max_artist_updated_at: str = ""
+    max_artist_credit_updated_at: str = ""
 
 
 class BrowserKind(str, Enum):
@@ -206,7 +255,7 @@ ORDER BY
     year_key
 """
 
-_ARTIST_SUMMARY_SQL = """
+_LEGACY_ARTIST_SUMMARY_SQL = """
 WITH normalized AS (
     SELECT
         id,
@@ -234,6 +283,140 @@ ORDER BY
     normalized_key
 """
 
+_ARTIST_SUMMARY_V6_SQL = """
+WITH structured_credits AS (
+    SELECT
+        a.id AS artist_id,
+        a.display_name,
+        a.normalized_name AS normalized_key,
+        a.entity_type,
+        a.discogs_artist_id,
+        a.musicbrainz_artist_id,
+        tac.track_id,
+        tac.role,
+        0 AS source_rank,
+        'artist:' || CAST(a.id AS TEXT) AS identity_key
+    FROM artists AS a
+    JOIN track_artist_credits AS tac ON tac.artist_id = a.id
+    WHERE tac.role IN ('primary', 'featured', 'collaborator')
+),
+legacy_fallback AS (
+    SELECT
+        NULL AS artist_id,
+        COALESCE(NULLIF(TRIM(t.artist), ''), 'Unknown Artist') AS display_name,
+        mv_normalize_identity(t.artist) AS normalized_key,
+        'unknown' AS entity_type,
+        NULL AS discogs_artist_id,
+        NULL AS musicbrainz_artist_id,
+        t.id AS track_id,
+        'primary' AS role,
+        1 AS source_rank,
+        'legacy:' || mv_normalize_identity(t.artist) AS identity_key
+    FROM tracks AS t
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM track_artist_credits AS existing_credit
+        WHERE existing_credit.track_id = t.id
+    )
+),
+combined AS (
+    SELECT * FROM structured_credits
+    UNION ALL
+    SELECT * FROM legacy_fallback
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY identity_key
+            ORDER BY
+                source_rank,
+                CASE WHEN artist_id IS NULL THEN 1 ELSE 0 END,
+                artist_id,
+                track_id
+        ) AS identity_rank
+    FROM combined
+)
+SELECT
+    identity_key,
+    MAX(CASE WHEN identity_rank = 1 THEN artist_id END) AS artist_id,
+    MAX(CASE WHEN identity_rank = 1 THEN normalized_key END) AS normalized_key,
+    MAX(CASE WHEN identity_rank = 1 THEN display_name END) AS display_name,
+    MAX(CASE WHEN identity_rank = 1 THEN entity_type END) AS entity_type,
+    MAX(CASE WHEN identity_rank = 1 THEN discogs_artist_id END)
+        AS discogs_artist_id,
+    MAX(CASE WHEN identity_rank = 1 THEN musicbrainz_artist_id END)
+        AS musicbrainz_artist_id,
+    COUNT(DISTINCT CASE WHEN role = 'primary' THEN track_id END) AS track_count,
+    COUNT(DISTINCT CASE WHEN role = 'featured' THEN track_id END)
+        AS featured_track_count,
+    COUNT(DISTINCT CASE WHEN role = 'collaborator' THEN track_id END)
+        AS collaboration_track_count
+FROM ranked
+GROUP BY identity_key
+ORDER BY
+    CASE WHEN normalized_key = '' THEN 1 ELSE 0 END,
+    normalized_key,
+    identity_key
+"""
+
+_ARTIST_TRACKS_V6_SQL = """
+WITH resolved_artist AS (
+    SELECT id
+    FROM artists
+    WHERE ? = 1
+      AND ((? IS NOT NULL AND id = ?)
+       OR (? IS NULL AND normalized_name = ?))
+    ORDER BY
+        CASE
+            WHEN NULLIF(TRIM(discogs_artist_id), '') IS NULL
+             AND NULLIF(TRIM(musicbrainz_artist_id), '') IS NULL
+            THEN 0 ELSE 1
+        END,
+        id
+    LIMIT 1
+),
+structured_tracks AS (
+    SELECT tac.track_id, tac.role
+    FROM resolved_artist AS a
+    JOIN track_artist_credits AS tac ON tac.artist_id = a.id
+    WHERE tac.role IN ('primary', 'featured', 'collaborator')
+),
+legacy_fallback AS (
+    SELECT t.id AS track_id, 'primary' AS role
+    FROM tracks AS t
+    WHERE ? IS NULL
+      AND mv_normalize_identity(t.artist) = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM track_artist_credits AS existing_credit
+          WHERE existing_credit.track_id = t.id
+      )
+),
+artist_tracks AS (
+    SELECT track_id, role FROM structured_tracks
+    UNION
+    SELECT track_id, role FROM legacy_fallback
+)
+SELECT
+    t.id, t.title, t.artist, t.album, t.album_artist, t.year, t.path,
+    t.cover_path, t.duration_seconds, t.created_at, t.source_kind,
+    t.source_video_id, t.source_upload_date,
+    artist_tracks.role AS artist_browser_role
+FROM artist_tracks
+JOIN tracks AS t ON t.id = artist_tracks.track_id
+ORDER BY
+    CASE artist_tracks.role
+        WHEN 'primary' THEN 0
+        WHEN 'featured' THEN 1
+        WHEN 'collaborator' THEN 2
+        ELSE 3
+    END,
+    t.album COLLATE NOCASE,
+    t.title COLLATE NOCASE,
+    t.id
+"""
+
 
 def configure_browser_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
@@ -244,6 +427,18 @@ def configure_browser_connection(conn: sqlite3.Connection) -> sqlite3.Connection
         deterministic=True,
     )
     return conn
+
+
+def _has_structured_artist_schema(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name IN ('artists', 'track_artist_credits')
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows} == {"artists", "track_artist_credits"}
 
 
 @contextmanager
@@ -279,11 +474,42 @@ def browser_revision(conn: sqlite3.Connection) -> BrowserRevision:
         FROM tracks
         """
     ).fetchone()
+    artist_count = 0
+    artist_credit_count = 0
+    max_artist_updated_at = ""
+    max_artist_credit_updated_at = ""
+    if _has_structured_artist_schema(conn):
+        artist_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS artist_count,
+                COALESCE(MAX(updated_at), '') AS max_artist_updated_at
+            FROM artists
+            """
+        ).fetchone()
+        credit_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS artist_credit_count,
+                COALESCE(MAX(updated_at), '') AS max_artist_credit_updated_at
+            FROM track_artist_credits
+            """
+        ).fetchone()
+        artist_count = int(artist_row["artist_count"])
+        artist_credit_count = int(credit_row["artist_credit_count"])
+        max_artist_updated_at = str(artist_row["max_artist_updated_at"])
+        max_artist_credit_updated_at = str(
+            credit_row["max_artist_credit_updated_at"]
+        )
     return BrowserRevision(
         track_count=int(row["track_count"]),
         max_track_id=int(row["max_track_id"]),
         max_updated_at=str(row["max_updated_at"]),
         artwork_count=int(row["artwork_count"]),
+        artist_count=artist_count,
+        artist_credit_count=artist_credit_count,
+        max_artist_updated_at=max_artist_updated_at,
+        max_artist_credit_updated_at=max_artist_credit_updated_at,
     )
 
 
@@ -319,11 +545,61 @@ def query_artist_summaries(
     image_states: Mapping[str, str] | None = None,
 ) -> tuple[ArtistSummary, ...]:
     configure_browser_connection(conn)
-    rows = conn.execute(_ARTIST_SUMMARY_SQL).fetchall()
+    structured = _has_structured_artist_schema(conn)
+    rows = conn.execute(
+        _ARTIST_SUMMARY_V6_SQL if structured else _LEGACY_ARTIST_SUMMARY_SQL
+    ).fetchall()
     states = image_states or {}
     summaries: list[ArtistSummary] = []
+    structured_name_counts: dict[str, int] = {}
+    if structured:
+        for row in rows:
+            if row["artist_id"] is None:
+                continue
+            name = str(row["normalized_key"])
+            structured_name_counts[name] = structured_name_counts.get(name, 0) + 1
     for row in rows:
-        key = ArtistKey(str(row["normalized_key"]))
+        discogs_id = (
+            str(row["discogs_artist_id"])
+            if structured and row["discogs_artist_id"] not in (None, "")
+            else ""
+        )
+        musicbrainz_id = (
+            str(row["musicbrainz_artist_id"])
+            if structured and row["musicbrainz_artist_id"] not in (None, "")
+            else ""
+        )
+        provider_identity = (
+            f"discogs:{discogs_id}"
+            if discogs_id
+            else (f"musicbrainz:{musicbrainz_id}" if musicbrainz_id else "")
+        )
+        normalized_name = str(row["normalized_key"])
+        stored_artist_id = (
+            int(row["artist_id"])
+            if structured and row["artist_id"] is not None
+            else None
+        )
+        artist_id = stored_artist_id if (
+            stored_artist_id is not None
+            and (
+                bool(provider_identity)
+                or structured_name_counts.get(normalized_name, 0) > 1
+            )
+        ) else None
+        identity_key = (
+            str(row["identity_key"])
+            if structured
+            and stored_artist_id is None
+            and normalized_name in structured_name_counts
+            else ""
+        )
+        key = ArtistKey(
+            normalized_name,
+            artist_id=artist_id,
+            provider_identity=provider_identity,
+            identity_key=identity_key,
+        )
         state = states.get(key.browser_key, states.get(key.normalized_name, "not_cached"))
         summaries.append(
             ArtistSummary(
@@ -331,6 +607,13 @@ def query_artist_summaries(
                 display_name=str(row["display_name"]),
                 track_count=int(row["track_count"]),
                 image_state=str(state),
+                featured_track_count=(
+                    int(row["featured_track_count"]) if structured else 0
+                ),
+                collaboration_track_count=(
+                    int(row["collaboration_track_count"]) if structured else 0
+                ),
+                entity_type=(str(row["entity_type"]) if structured else "unknown"),
             )
         )
     return tuple(summaries)
@@ -365,6 +648,8 @@ def query_artist_tracks(
     key: ArtistKey,
 ) -> tuple[sqlite3.Row, ...]:
     configure_browser_connection(conn)
+    if _has_structured_artist_schema(conn):
+        return _query_artist_track_sections_v6(conn, key).tracks
     return tuple(
         conn.execute(
             f"""
@@ -376,6 +661,56 @@ def query_artist_tracks(
             (key.normalized_name,),
         ).fetchall()
     )
+
+
+def _query_artist_track_sections_v6(
+    conn: sqlite3.Connection,
+    key: ArtistKey,
+) -> ArtistTrackSections:
+    rows = conn.execute(
+        _ARTIST_TRACKS_V6_SQL,
+        (
+            int(not key.identity_key.startswith("legacy:")),
+            key.artist_id,
+            key.artist_id,
+            key.artist_id,
+            key.normalized_name,
+            key.artist_id,
+            key.normalized_name,
+        ),
+    ).fetchall()
+    by_role: dict[str, list[sqlite3.Row]] = {
+        "primary": [],
+        "featured": [],
+        "collaborator": [],
+    }
+    for row in rows:
+        role = str(row["artist_browser_role"])
+        if role in by_role:
+            by_role[role].append(row)
+    return ArtistTrackSections(
+        tracks=tuple(by_role["primary"]),
+        featured_on=tuple(by_role["featured"]),
+        collaborations=tuple(by_role["collaborator"]),
+    )
+
+
+def query_artist_track_sections(
+    conn: sqlite3.Connection,
+    key: ArtistKey,
+) -> ArtistTrackSections:
+    """Load an artist page in one set-based query, partitioned by credit role.
+
+    Schema-v6 credits are authoritative. Tracks with no structured credits use
+    the materialized artist string as a compatibility fallback, which also
+    keeps the blank-artist ``Unknown Artist`` card available. Older databases
+    retain their original single-section behavior.
+    """
+
+    configure_browser_connection(conn)
+    if not _has_structured_artist_schema(conn):
+        return ArtistTrackSections(tracks=query_artist_tracks(conn, key))
+    return _query_artist_track_sections_v6(conn, key)
 
 
 def load_album_summaries(db_path: str | Path) -> tuple[AlbumSummary, ...]:
@@ -406,6 +741,14 @@ def load_artist_tracks(
 ) -> tuple[sqlite3.Row, ...]:
     with open_readonly_database(db_path) as conn:
         return query_artist_tracks(conn, key)
+
+
+def load_artist_track_sections(
+    db_path: str | Path,
+    key: ArtistKey,
+) -> ArtistTrackSections:
+    with open_readonly_database(db_path) as conn:
+        return query_artist_track_sections(conn, key)
 
 
 def invalidation_plan(

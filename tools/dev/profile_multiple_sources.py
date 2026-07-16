@@ -350,7 +350,7 @@ def profile_case(
             "elapsed_seconds": round(elapsed_seconds, 3),
         }
         if not (
-            schema == CURRENT_SCHEMA_VERSION == 5
+            schema == CURRENT_SCHEMA_VERSION == 6
             and integrity == "ok"
             and source_item_count == membership_count
             and distinct_identity_count == unique_video_count

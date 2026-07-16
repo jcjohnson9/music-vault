@@ -23,9 +23,14 @@ from music_vault.metadata.schema import (
     seed_existing_metadata,
 )
 from music_vault.metadata.remediation_schema import create_remediation_schema
+from music_vault.metadata.artist_credits import seed_existing_artist_credits
+from music_vault.metadata.intelligence_schema import (
+    create_metadata_intelligence_schema,
+    seed_existing_metadata_field_extensions,
+)
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -302,6 +307,31 @@ class MusicVaultDB:
         if integrity is None or str(integrity[0]).casefold() != "ok":
             raise RuntimeError("The database failed its post-migration integrity check.")
 
+    def _verify_existing_table_counts_preserved(
+        self,
+        baseline: dict[str, int],
+    ) -> None:
+        """Reject a migration that loses rows from any pre-existing table."""
+
+        current = self._aggregate_counts(self.conn)
+        missing_tables = sorted(set(baseline) - set(current))
+        reduced = sorted(
+            table
+            for table, count in baseline.items()
+            if table in current and current[table] < count
+        )
+        if missing_tables or reduced:
+            details: list[str] = []
+            if missing_tables:
+                details.append("missing tables: " + ", ".join(missing_tables))
+            if reduced:
+                details.append("reduced row counts: " + ", ".join(reduced))
+            raise RuntimeError(
+                "The database migration did not preserve prior state ("
+                + "; ".join(details)
+                + ")."
+            )
+
     def migrate(self) -> None:
         version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
         if version > CURRENT_SCHEMA_VERSION:
@@ -320,11 +350,15 @@ class MusicVaultDB:
                 create_metadata_schema(self.conn)
                 create_remediation_schema(self.conn)
                 create_sync_schema(self.conn)
+                create_metadata_intelligence_schema(self.conn)
+                seed_existing_metadata_field_extensions(self.conn)
+                seed_existing_artist_credits(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
                 self._verify_database_integrity()
             return
 
         if version < CURRENT_SCHEMA_VERSION:
+            baseline_counts = self._aggregate_counts(self.conn)
             if self._has_user_data():
                 self._create_pre_migration_backup(CURRENT_SCHEMA_VERSION)
 
@@ -343,7 +377,11 @@ class MusicVaultDB:
                 create_sync_schema(self.conn)
                 seed_existing_playlist_origins(self.conn)
                 backfill_source_track_identities(self.conn)
+                create_metadata_intelligence_schema(self.conn)
+                seed_existing_metadata_field_extensions(self.conn)
+                seed_existing_artist_credits(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+                self._verify_existing_table_counts_preserved(baseline_counts)
                 self._verify_database_integrity()
             return
 
@@ -351,8 +389,12 @@ class MusicVaultDB:
         # prerelease database can acquire recovery-only columns and indexes.
         if version == CURRENT_SCHEMA_VERSION:
             with self.conn:
+                create_metadata_schema(self.conn)
                 create_remediation_schema(self.conn)
                 create_sync_schema(self.conn)
+                create_metadata_intelligence_schema(self.conn)
+                seed_existing_metadata_field_extensions(self.conn)
+                seed_existing_artist_credits(self.conn)
                 self._verify_database_integrity()
 
     def upsert_track(
@@ -451,6 +493,7 @@ class MusicVaultDB:
                 self.register_source_identity(
                     "youtube", effective_external_id, track_id, commit=False
                 )
+            seed_existing_artist_credits(self.conn, (track_id,))
             return track_id
 
         if commit:
@@ -464,7 +507,16 @@ class MusicVaultDB:
 
         effective: dict[str, object] = {
             name: fields[name]
-            for name in ("title", "artist", "album", "album_artist", "release_date")
+            for name in (
+                "title",
+                "artist",
+                "album",
+                "album_artist",
+                "release_date",
+                "original_release_date",
+                "version_type",
+                "version_label",
+            )
             if name in fields
         }
         if "release_date" not in effective and "year" in fields:
@@ -480,6 +532,10 @@ class MusicVaultDB:
             "source_kind",
             "source_video_id",
             "source_upload_date",
+            "discogs_release_id",
+            "discogs_master_id",
+            "discogs_track_position",
+            "recording_group_key",
         }
         updates = {key: fields[key] for key in direct_allowed if key in fields}
         if "source_kind" in updates:
@@ -517,7 +573,9 @@ class MusicVaultDB:
             "id, title, artist, album, album_artist, release_date, year, path, "
             "cover_path, duration_seconds, created_at, source_kind, source_video_id, "
             "source_upload_date, musicbrainz_recording_id, musicbrainz_release_id, "
-            "metadata_updated_at"
+            "metadata_updated_at, original_release_date, version_type, version_label, "
+            "discogs_release_id, discogs_master_id, discogs_track_position, "
+            "recording_group_key"
         )
 
     def list_tracks(self) -> list[sqlite3.Row]:
@@ -629,32 +687,25 @@ class MusicVaultDB:
 
             existing_id = int(existing["track_id"])
             if existing_id == int(track_id):
-                self.conn.execute(
-                    f"""
-                    UPDATE {SOURCE_TRACK_IDENTITIES_TABLE}
-                    SET updated_at=?
-                    WHERE source_kind=? AND external_track_id=?
-                    """,
-                    (timestamp, normalized_kind, normalized_external_id),
-                )
                 return existing_id
 
             winner = min((existing, candidate), key=self._identity_claim_key)
             canonical_id = int(winner["id"])
             conflicting_id = int(track_id) if canonical_id == existing_id else existing_id
-            self.conn.execute(
-                f"""
-                UPDATE {SOURCE_TRACK_IDENTITIES_TABLE}
-                SET track_id=?, updated_at=?
-                WHERE source_kind=? AND external_track_id=?
-                """,
-                (
-                    canonical_id,
-                    timestamp,
-                    normalized_kind,
-                    normalized_external_id,
-                ),
-            )
+            if canonical_id != existing_id:
+                self.conn.execute(
+                    f"""
+                    UPDATE {SOURCE_TRACK_IDENTITIES_TABLE}
+                    SET track_id=?, updated_at=?
+                    WHERE source_kind=? AND external_track_id=?
+                    """,
+                    (
+                        canonical_id,
+                        timestamp,
+                        normalized_kind,
+                        normalized_external_id,
+                    ),
+                )
             self.conn.execute(
                 f"""
                 UPDATE {SOURCE_IDENTITY_CONFLICTS_TABLE}

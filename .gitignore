@@ -40,6 +40,7 @@ data/*
 
 # Explicit runtime/private paths (defense in depth)
 data/youtube_api_key.txt
+data/discogs_token.txt
 data/music_vault.sqlite3*
 data/music_vault_config.json
 data/music_vault_status.json*

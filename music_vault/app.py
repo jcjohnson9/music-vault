@@ -84,7 +84,7 @@ from music_vault.core.library_browser import (
     load_album_summaries,
     load_artist_summaries,
     query_album_tracks,
-    query_artist_tracks,
+    query_artist_track_sections,
 )
 from music_vault.core.playback_errors import playback_error_message
 from music_vault.core.playback_state import (
@@ -102,6 +102,7 @@ from music_vault.core.paths import (
     data_directory_source,
     database_path,
     default_downloads_dir,
+    discogs_token_path,
     icon_path,
     path_resolution_source,
     portable_root,
@@ -121,6 +122,17 @@ from music_vault.core.sync_sources import (
 from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
 from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
 from music_vault.metadata.service import MetadataChangeResult, MetadataService
+from music_vault.metadata.intelligence_settings import (
+    DISCOGS_CONSENT_VERSION,
+    METADATA_INTELLIGENCE_CONSENT_VERSION,
+    METADATA_INTELLIGENCE_DEFAULTS,
+    DiscogsTokenStore,
+    normalize_metadata_intelligence_settings,
+)
+from music_vault.metadata.intelligence import (
+    AUTOMATIC_IMPORT_JOB_ID,
+    MetadataIntelligenceService,
+)
 from music_vault.metadata.artist_images import (
     ArtistIdentity,
     ArtistImageCache,
@@ -150,6 +162,7 @@ from music_vault.ui.media_grid import (
 )
 from music_vault.ui.metadata_editor import MetadataEditorDialog
 from music_vault.ui.metadata_remediation import MetadataRemediationDialog
+from music_vault.ui.metadata_tasks import MetadataTaskResult, MetadataTaskRunner
 from music_vault.ui.onboarding import (
     FirstRunWizard,
     OnboardingResult,
@@ -188,6 +201,11 @@ from music_vault.ui.thumbnail_cache import ThumbnailCache, make_thumbnail_key
 NOW_PLAYING_ROLE = int(Qt.UserRole) + 1
 VOLUME_SAVE_DEBOUNCE_MS = 500
 FFMPEG_SETUP_URL = "https://github.com/jcjohnson9/music-vault#requirements"
+DISCOGS_TOKEN_SETUP_URL = "https://www.discogs.com/settings/developers"
+DISCOGS_NOTICE = (
+    "This application uses Discogs’ API but is not affiliated with, sponsored or "
+    "endorsed by Discogs. “Discogs” is a trademark of Zink Media, LLC."
+)
 
 
 def _config_supports_completion_inference(path: Path) -> bool:
@@ -256,6 +274,7 @@ class MusicVaultWindow(QMainWindow):
             status_file=app_status_path(),
         )
         self.config = self.load_config()
+        self.discogs_token_store = DiscogsTokenStore(discogs_token_path())
         self._last_ffmpeg_discovery: FFmpegDiscoveryResult | None = None
         if (
             runtime_evidence.established
@@ -285,6 +304,15 @@ class MusicVaultWindow(QMainWindow):
         self.sync_center_controller: SyncCenterController | None = None
         self._close_after_sync = False
         self.metadata_service = MetadataService(self.db)
+        self.metadata_intelligence_tasks = MetadataTaskRunner(self, max_workers=1)
+        self.metadata_intelligence_tasks.completed.connect(
+            self.on_metadata_intelligence_task_completed
+        )
+        self.metadata_intelligence_service = MetadataIntelligenceService(
+            self.db,
+            lambda: self.config,
+            token_store=self.discogs_token_store,
+        )
         self.artist_image_cache = ArtistImageCache()
         self.artist_image_service = ArtistImageService(
             create_artist_image_provider(),
@@ -374,6 +402,7 @@ class MusicVaultWindow(QMainWindow):
         self.load_playlists()
         self.refresh_settings_status()
         self.on_multi_source_status_transition({})
+        QTimer.singleShot(0, self.wake_metadata_intelligence)
 
 
     def config_file_path(self) -> Path:
@@ -409,6 +438,7 @@ class MusicVaultWindow(QMainWindow):
             "onboarding_completed": False,
             **PARTY_MODE_DEFAULTS,
             **LYRICS_DEFAULTS,
+            **METADATA_INTELLIGENCE_DEFAULTS,
         }
 
     def load_config(self) -> dict:
@@ -444,6 +474,7 @@ class MusicVaultWindow(QMainWindow):
             party_source.pop("party_mode_config_version", None)
         config.update(normalize_party_mode_settings(party_source))
         config.update(normalize_lyrics_settings(config))
+        config.update(normalize_metadata_intelligence_settings(config))
         if needs_party_migration:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1023,6 +1054,14 @@ class MusicVaultWindow(QMainWindow):
         table_hint = QLabel("Double-click a track to play")
         table_hint.setObjectName("MutedLabel")
         table_header.addWidget(table_title)
+        self.artist_section_selector = QComboBox()
+        self.artist_section_selector.setObjectName("ArtistSectionSelector")
+        self.artist_section_selector.setAccessibleName("Artist track section")
+        self.artist_section_selector.currentIndexChanged.connect(
+            self.on_artist_section_changed
+        )
+        self.artist_section_selector.hide()
+        table_header.addWidget(self.artist_section_selector)
         table_header.addStretch(1)
         table_header.addWidget(table_hint)
 
@@ -1445,6 +1484,117 @@ class MusicVaultWindow(QMainWindow):
             str(self.config.get("ffmpeg_location") or "")
         )
 
+        metadata_title = QLabel("Metadata Intelligence")
+        metadata_title.setObjectName("CardTitle")
+        metadata_description = QLabel(
+            "Consent-gated Discogs-first catalogue matching can enrich new imports "
+            "in the background. MusicBrainz remains an optional secondary provider."
+        )
+        metadata_description.setObjectName("MutedLabel")
+        metadata_description.setWordWrap(True)
+
+        discogs_notice = QLabel(DISCOGS_NOTICE)
+        discogs_notice.setObjectName("StatusLine")
+        discogs_notice.setWordWrap(True)
+
+        discogs_token_label = QLabel("Personal Discogs Token")
+        discogs_token_label.setObjectName("MutedLabel")
+        self.settings_discogs_token = QLineEdit()
+        self.settings_discogs_token.setObjectName("SearchBox")
+        self.settings_discogs_token.setEchoMode(QLineEdit.Password)
+        self.settings_discogs_token.setPlaceholderText(
+            "Configured tokens are never displayed; enter a new token to replace it"
+        )
+        self.settings_discogs_token.setAccessibleName("Personal Discogs token")
+
+        discogs_actions = QHBoxLayout()
+        save_discogs_token_btn = self.make_action_button(
+            "Save Token", "settings", self.save_discogs_token
+        )
+        remove_discogs_token_btn = self.make_action_button(
+            "Remove Token", "remove", self.remove_discogs_token,
+            object_name="DangerButton",
+        )
+        test_discogs_btn = self.make_action_button(
+            "Test Connection", "refresh", self.test_discogs_connection
+        )
+        discogs_guide_btn = self.make_action_button(
+            "Open Discogs Token Setup Guide", "settings", self.open_discogs_token_guide
+        )
+        discogs_actions.addWidget(save_discogs_token_btn)
+        discogs_actions.addWidget(remove_discogs_token_btn)
+        discogs_actions.addWidget(test_discogs_btn)
+        discogs_actions.addWidget(discogs_guide_btn)
+        discogs_actions.addStretch(1)
+
+        self.discogs_provider_status = QLabel()
+        self.discogs_provider_status.setObjectName("StatusLine")
+        self.discogs_provider_status.setWordWrap(True)
+
+        intelligence_settings = normalize_metadata_intelligence_settings(self.config)
+        self.settings_metadata_intelligence = QCheckBox(
+            "Enable Automatic Metadata Intelligence"
+        )
+        self.settings_metadata_intelligence.setChecked(
+            intelligence_settings["metadata_intelligence_enabled"]
+        )
+        self.settings_metadata_intelligence.clicked.connect(
+            self.on_metadata_intelligence_setting_clicked
+        )
+        self.settings_metadata_discogs = QCheckBox("Use Discogs")
+        self.settings_metadata_discogs.setChecked(
+            intelligence_settings["metadata_discogs_enabled"]
+        )
+        self.settings_metadata_musicbrainz = QCheckBox(
+            "Use MusicBrainz as Secondary Provider"
+        )
+        self.settings_metadata_musicbrainz.setChecked(
+            intelligence_settings["metadata_musicbrainz_secondary_enabled"]
+        )
+        self.settings_metadata_writeback = QCheckBox(
+            "Automatically Write High-Confidence Text Tags"
+        )
+        self.settings_metadata_writeback.setChecked(
+            intelligence_settings["metadata_writeback_enabled"]
+        )
+        self.settings_metadata_artwork = QCheckBox(
+            "Automatically Fill Missing Artwork"
+        )
+        self.settings_metadata_artwork.setChecked(
+            intelligence_settings["metadata_fill_missing_artwork_enabled"]
+        )
+        self.settings_metadata_scan_existing = QCheckBox(
+            "Scan Existing Library After Setup"
+        )
+        self.settings_metadata_scan_existing.setChecked(
+            intelligence_settings["metadata_scan_existing_after_setup"]
+        )
+        intelligence_options = QGridLayout()
+        intelligence_options.addWidget(self.settings_metadata_intelligence, 0, 0, 1, 2)
+        intelligence_options.addWidget(self.settings_metadata_discogs, 1, 0)
+        intelligence_options.addWidget(self.settings_metadata_musicbrainz, 1, 1)
+        intelligence_options.addWidget(self.settings_metadata_writeback, 2, 0)
+        intelligence_options.addWidget(self.settings_metadata_artwork, 2, 1)
+        intelligence_options.addWidget(self.settings_metadata_scan_existing, 3, 0, 1, 2)
+
+        metadata_actions = QHBoxLayout()
+        analyze_existing_btn = self.make_action_button(
+            "Analyze and Fix Existing Library",
+            "metadata",
+            self.start_existing_library_intelligence,
+        )
+        metadata_dashboard_btn = self.make_action_button(
+            "Open Metadata Intelligence Dashboard",
+            "metadata",
+            self.open_metadata_intelligence_dashboard,
+        )
+        metadata_actions.addWidget(analyze_existing_btn)
+        metadata_actions.addWidget(metadata_dashboard_btn)
+        metadata_actions.addStretch(1)
+        self.metadata_intelligence_status = QLabel()
+        self.metadata_intelligence_status.setObjectName("StatusLine")
+        self.metadata_intelligence_status.setWordWrap(True)
+
         party_mode_title = QLabel("Party Mode")
         party_mode_title.setObjectName("CardTitle")
         party_mode_description = QLabel(
@@ -1706,6 +1856,17 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(self.settings_quality)
         settings_layout.addWidget(ffmpeg_location_label)
         settings_layout.addWidget(self.settings_ffmpeg_location)
+        settings_layout.addSpacing(10)
+        settings_layout.addWidget(metadata_title)
+        settings_layout.addWidget(metadata_description)
+        settings_layout.addWidget(discogs_notice)
+        settings_layout.addWidget(discogs_token_label)
+        settings_layout.addWidget(self.settings_discogs_token)
+        settings_layout.addLayout(discogs_actions)
+        settings_layout.addWidget(self.discogs_provider_status)
+        settings_layout.addLayout(intelligence_options)
+        settings_layout.addLayout(metadata_actions)
+        settings_layout.addWidget(self.metadata_intelligence_status)
         settings_layout.addSpacing(10)
         settings_layout.addWidget(party_mode_title)
         settings_layout.addWidget(party_mode_description)
@@ -2094,6 +2255,8 @@ class MusicVaultWindow(QMainWindow):
     def load_library(self, tracks=None, title: str | None = None, subtitle: str | None = None) -> None:
         self._remember_browser_scroll()
         self._active_browser_kind = None
+        if hasattr(self, "artist_section_selector") and self.current_view_kind != "artist_tracks":
+            self.artist_section_selector.hide()
         if hasattr(self, "library_content_stack"):
             self.library_content_stack.setCurrentIndex(0)
 
@@ -2393,11 +2556,16 @@ class MusicVaultWindow(QMainWindow):
     def _artist_media_item(self, summary: ArtistSummary) -> MediaItem:
         # Artist cards deliberately start with no track cover. A dedicated
         # artist-image cache may supply an artwork path later.
+        details = [self._track_count_text(summary.track_count)]
+        if summary.featured_track_count:
+            details.append(f"{summary.featured_track_count} featured")
+        if summary.collaboration_track_count:
+            details.append(f"{summary.collaboration_track_count} collaboration")
         return MediaItem(
             key=summary.browser_key,
             kind=MediaKind.ARTIST,
             title=summary.display_name,
-            subtitle=self._track_count_text(summary.track_count),
+            subtitle=" • ".join(details),
             artwork_path=None,
             image_state=MediaImageState.MISSING,
         )
@@ -2724,11 +2892,48 @@ class MusicVaultWindow(QMainWindow):
         if not isinstance(summary, ArtistSummary):
             return
         self._remember_browser_scroll()
-        rows = query_artist_tracks(self.db.conn, summary.key)
+        sections = query_artist_track_sections(self.db.conn, summary.key)
         self.current_view_kind = "artist_tracks"
         self.current_playlist_name = summary.display_name
         self._detail_browser_context = ("artist_tracks", summary.key, summary.display_name)
-        self.load_library(rows, summary.display_name, "Artist view")
+        selector = self.artist_section_selector
+        previous = selector.blockSignals(True)
+        try:
+            selector.clear()
+            selector.addItem("Tracks", "tracks")
+            if sections.featured_on:
+                selector.addItem("Featured On", "featured_on")
+            if sections.collaborations:
+                selector.addItem("Collaborations", "collaborations")
+            default_index = 0
+            if not sections.tracks and sections.featured_on:
+                default_index = selector.findData("featured_on")
+            elif not sections.tracks and sections.collaborations:
+                default_index = selector.findData("collaborations")
+            selector.setCurrentIndex(max(0, default_index))
+        finally:
+            selector.blockSignals(previous)
+        selector.setVisible(selector.count() > 1)
+        section = str(selector.currentData() or "tracks")
+        rows = getattr(sections, section, sections.tracks)
+        self.load_library(
+            rows,
+            summary.display_name,
+            f"Artist view • {selector.currentText() or 'Tracks'}",
+        )
+
+    def on_artist_section_changed(self, _index: int) -> None:
+        if self.current_view_kind != "artist_tracks":
+            return
+        context = self._detail_browser_context
+        if not context or context[0] != "artist_tracks":
+            return
+        _kind, key, label = context
+        sections = query_artist_track_sections(self.db.conn, key)
+        section = str(self.artist_section_selector.currentData() or "tracks")
+        rows = getattr(sections, section, sections.tracks)
+        section_label = self.artist_section_selector.currentText() or "Tracks"
+        self.load_library(rows, label, f"Artist view • {section_label}")
 
     def refresh_artwork(self) -> None:
         updated = refresh_covers_for_library(self.db)
@@ -2754,12 +2959,17 @@ class MusicVaultWindow(QMainWindow):
                 rows = (
                     query_album_tracks(self.db.conn, key)
                     if kind == "album_tracks"
-                    else query_artist_tracks(self.db.conn, key)
+                    else getattr(
+                        query_artist_track_sections(self.db.conn, key),
+                        str(self.artist_section_selector.currentData() or "tracks"),
+                    )
                 )
                 self.load_library(
                     rows,
                     label,
-                    "Album view" if kind == "album_tracks" else "Artist view",
+                    "Album view"
+                    if kind == "album_tracks"
+                    else f"Artist view • {self.artist_section_selector.currentText() or 'Tracks'}",
                 )
                 return
 
@@ -2929,6 +3139,7 @@ class MusicVaultWindow(QMainWindow):
         count = import_folder(self.db, folder)
         if count:
             self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
+            self.wake_metadata_intelligence()
         self.refresh_current_view()
 
         QMessageBox.information(self, "Import complete", f"Imported or refreshed {count} audio files.")
@@ -3065,6 +3276,7 @@ class MusicVaultWindow(QMainWindow):
         result.finish_imports(imported_count)
         if imported_count:
             self.invalidate_browser_data(BrowserInvalidationReason.YOUTUBE_IMPORT)
+            self.wake_metadata_intelligence()
         for failure in result.failures:
             if not failure.video_id:
                 continue
@@ -4136,6 +4348,7 @@ class MusicVaultWindow(QMainWindow):
                 if count:
                     self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
                     self.refresh_current_view()
+                    self.wake_metadata_intelligence()
             except (OSError, RuntimeError, ValueError) as exc:
                 QMessageBox.warning(
                     self,
@@ -4398,6 +4611,223 @@ class MusicVaultWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
+    def open_discogs_token_guide(self) -> None:
+        QDesktopServices.openUrl(QUrl(DISCOGS_TOKEN_SETUP_URL))
+
+    def save_discogs_token(self) -> None:
+        try:
+            self.discogs_token_store.save(self.settings_discogs_token.text())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Discogs token", sanitize_error_text(exc))
+            return
+        self.settings_discogs_token.clear()
+        self.refresh_metadata_intelligence_status()
+        self.write_app_status()
+        QMessageBox.information(
+            self,
+            "Discogs token",
+            "The personal Discogs token was saved in the local runtime-data folder.",
+        )
+
+    def remove_discogs_token(self) -> None:
+        try:
+            removed = self.discogs_token_store.remove()
+        except OSError:
+            QMessageBox.warning(
+                self, "Discogs token", "The local Discogs token could not be removed."
+            )
+            return
+        self.settings_discogs_token.clear()
+        self.config["metadata_discogs_enabled"] = False
+        self.config["metadata_fill_missing_artwork_enabled"] = False
+        self.save_config()
+        self.refresh_metadata_intelligence_status()
+        self.write_app_status()
+        QMessageBox.information(
+            self,
+            "Discogs token",
+            "The local Discogs token was removed." if removed else "No Discogs token was stored.",
+        )
+
+    def test_discogs_connection(self) -> None:
+        token = self.discogs_token_store.read()
+        if not token:
+            QMessageBox.information(
+                self,
+                "Discogs connection",
+                "Save a personal Discogs token before testing the connection.",
+            )
+            return
+        if self.metadata_intelligence_tasks.pending_count:
+            QMessageBox.information(
+                self, "Discogs connection", "A metadata provider request is already active."
+            )
+            return
+        self.discogs_provider_status.setText("Discogs: Testing connection…")
+
+        def request(cancel_event):
+            from music_vault.metadata.providers.discogs import DiscogsProvider
+
+            provider = DiscogsProvider(token=token)
+            return provider.test_connection(cancel_event=cancel_event)
+
+        self.metadata_intelligence_tasks.submit("discogs_connection", request)
+
+    def wake_metadata_intelligence(self) -> None:
+        if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+            return
+        settings = normalize_metadata_intelligence_settings(self.config)
+        if not settings["metadata_intelligence_enabled"]:
+            return
+        if self.metadata_intelligence_tasks.pending_count:
+            return
+        self.metadata_intelligence_tasks.submit(
+            "metadata_automatic_imports",
+            lambda cancel: self.metadata_intelligence_service.process_automatic_queue(
+                cancel_event=cancel
+            ),
+        )
+
+    def on_metadata_intelligence_task_completed(self, result: MetadataTaskResult) -> None:
+        if result.kind == "discogs_connection":
+            if result.error:
+                self.discogs_provider_status.setText(
+                    "Discogs: Unavailable (credential and provider details were sanitized)"
+                )
+                QMessageBox.warning(
+                    self,
+                    "Discogs connection",
+                    "Discogs could not be reached or did not accept the personal token.",
+                )
+            else:
+                self.discogs_provider_status.setText("Discogs: Ready")
+                QMessageBox.information(
+                    self, "Discogs connection", "The personal Discogs connection is ready."
+                )
+            self.write_app_status()
+            return
+        if result.kind in {"metadata_existing_library", "metadata_automatic_imports"}:
+            self.refresh_metadata_intelligence_status()
+            self.invalidate_browser_data(BrowserInvalidationReason.METADATA_ENRICHMENT)
+            self.refresh_current_view()
+            if self.current_track_id is not None:
+                track = self.db.get_track(self.current_track_id)
+                if track is not None:
+                    self.now_title.setText(track["title"] or Path(track["path"]).stem)
+                    self.now_artist.setText(track["artist"] or "Unknown Artist")
+                    self.set_cover_art(track["cover_path"])
+                    if self.party_mode_window is not None and self.party_mode_active:
+                        self.party_mode_window.refresh_from_host(force=True)
+            self.write_app_status()
+
+    def on_metadata_intelligence_setting_clicked(self, checked: bool) -> None:
+        if not checked:
+            return
+        current = normalize_metadata_intelligence_settings(self.config)
+        if (
+            current["metadata_intelligence_consent_version"]
+            >= METADATA_INTELLIGENCE_CONSENT_VERSION
+        ):
+            return
+        answer = QMessageBox.question(
+            self,
+            "Enable Metadata Intelligence?",
+            "When enabled, Music Vault may send the current or parsed title, artist, "
+            "album hint, duration, and version hint to the providers you select. It "
+            "does not send local paths, playlists, API keys, lyrics, or source labels.\n\n"
+            "Do you consent to these provider lookups?",
+        )
+        if answer != QMessageBox.Yes:
+            self.settings_metadata_intelligence.setChecked(False)
+            return
+        self.config["metadata_intelligence_consent_version"] = (
+            METADATA_INTELLIGENCE_CONSENT_VERSION
+        )
+        self.config["metadata_discogs_consent_version"] = DISCOGS_CONSENT_VERSION
+
+    def start_existing_library_intelligence(self) -> None:
+        settings = normalize_metadata_intelligence_settings(self.config)
+        if not settings["metadata_intelligence_enabled"]:
+            QMessageBox.information(
+                self,
+                "Metadata Intelligence",
+                "Enable Metadata Intelligence and save Settings before starting a scan.",
+            )
+            return
+        service = getattr(self, "metadata_intelligence_service", None)
+        if service is None:
+            QMessageBox.warning(
+                self, "Metadata Intelligence", "The metadata job service is unavailable."
+            )
+            return
+        if self.metadata_intelligence_tasks.pending_count:
+            QMessageBox.information(
+                self, "Metadata Intelligence", "A metadata provider task is already active."
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Analyze existing library?",
+            "Analyze each canonical track once in the background? Only high-confidence, "
+            "unlocked fields may be applied; uncertain items remain for review.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        def analyze(cancel_event):
+            return service.analyze_existing_library(cancel_event=cancel_event)
+
+        self.metadata_intelligence_tasks.submit("metadata_existing_library", analyze)
+        self.refresh_metadata_intelligence_status()
+
+    def open_metadata_intelligence_dashboard(self) -> None:
+        from music_vault.ui.metadata_intelligence import MetadataIntelligenceDialog
+
+        dialog = MetadataIntelligenceDialog(
+            self.db,
+            getattr(self, "metadata_intelligence_service", None),
+            self,
+        )
+        dialog.edit_track_requested.connect(self.open_metadata_editor_for_track)
+        dialog.review_applied.connect(self.on_metadata_review_applied)
+        dialog.resume_requested.connect(self.resume_metadata_intelligence_job)
+        dialog.exec()
+
+    def resume_metadata_intelligence_job(self, job_id: str, job_kind: str) -> None:
+        if self.metadata_intelligence_tasks.pending_count:
+            return
+        persisted_id = str(job_id)
+        persisted_kind = str(job_kind)
+        if persisted_kind == "new_import" and persisted_id == AUTOMATIC_IMPORT_JOB_ID:
+            task_kind = "metadata_automatic_imports"
+            work = lambda cancel: self.metadata_intelligence_service.process_automatic_queue(
+                job_id=persisted_id,
+                cancel_event=cancel,
+            )
+        elif persisted_kind == "existing_library":
+            task_kind = "metadata_existing_library"
+            work = lambda cancel: self.metadata_intelligence_service.analyze_existing_library(
+                job_id=persisted_id,
+                cancel_event=cancel,
+            )
+        else:
+            return
+        self.metadata_intelligence_tasks.submit(task_kind, work)
+
+    def on_metadata_review_applied(self, track_id: int) -> None:
+        self.invalidate_browser_data(BrowserInvalidationReason.METADATA_ENRICHMENT)
+        self.refresh_current_view()
+        if self.current_track_id == int(track_id):
+            track = self.db.get_track(track_id)
+            if track is not None:
+                self.now_title.setText(track["title"] or Path(track["path"]).stem)
+                self.now_artist.setText(track["artist"] or "Unknown Artist")
+                self.set_cover_art(track["cover_path"])
+                if self.party_mode_window is not None and self.party_mode_active:
+                    self.party_mode_window.refresh_from_host(force=True)
+        self.refresh_metadata_intelligence_status()
+        self.write_app_status()
+
     def save_settings_from_ui(self) -> None:
         data_dir().mkdir(parents=True, exist_ok=True)
 
@@ -4474,6 +4904,60 @@ class MusicVaultWindow(QMainWindow):
             }
         )
         self.config.update(lyrics_settings)
+        intelligence_enabled = self.settings_metadata_intelligence.isChecked()
+        consent_version = int(
+            self.config.get("metadata_intelligence_consent_version") or 0
+        )
+        if (
+            intelligence_enabled
+            and consent_version < METADATA_INTELLIGENCE_CONSENT_VERSION
+        ):
+            intelligence_enabled = False
+            self.settings_metadata_intelligence.setChecked(False)
+        discogs_enabled = bool(
+            intelligence_enabled
+            and self.settings_metadata_discogs.isChecked()
+            and self.discogs_token_store.configured()
+            and int(self.config.get("metadata_discogs_consent_version") or 0)
+            >= DISCOGS_CONSENT_VERSION
+        )
+        writeback_enabled = bool(
+            intelligence_enabled and self.settings_metadata_writeback.isChecked()
+        )
+        if writeback_enabled and self.config.get("metadata_writeback_enabled") is not True:
+            answer = QMessageBox.question(
+                self,
+                "Enable automatic text-tag writeback?",
+                "High-confidence text metadata may update supported media tags using "
+                "verified full-file backups, temporary-copy writeback, readback, and "
+                "unchanged-audio checks. Discogs artwork is never embedded automatically.\n\n"
+                "Enable verified text-tag writeback?",
+            )
+            if answer != QMessageBox.Yes:
+                writeback_enabled = False
+                self.settings_metadata_writeback.setChecked(False)
+        intelligence_settings = normalize_metadata_intelligence_settings(
+            {
+                "metadata_intelligence_enabled": intelligence_enabled,
+                "metadata_discogs_enabled": discogs_enabled,
+                "metadata_musicbrainz_secondary_enabled": bool(
+                    intelligence_enabled and self.settings_metadata_musicbrainz.isChecked()
+                ),
+                "metadata_writeback_enabled": writeback_enabled,
+                "metadata_fill_missing_artwork_enabled": bool(
+                    discogs_enabled and self.settings_metadata_artwork.isChecked()
+                ),
+                "metadata_scan_existing_after_setup": bool(
+                    intelligence_enabled
+                    and self.settings_metadata_scan_existing.isChecked()
+                ),
+                "metadata_intelligence_consent_version": consent_version,
+                "metadata_discogs_consent_version": self.config.get(
+                    "metadata_discogs_consent_version", 0
+                ),
+            }
+        )
+        self.config.update(intelligence_settings)
         self.save_config()
 
         if self.party_mode_window is not None:
@@ -4488,6 +4972,10 @@ class MusicVaultWindow(QMainWindow):
         self.write_app_status()
 
         QMessageBox.information(self, "Settings saved", "Music Vault settings were saved.")
+        if intelligence_settings["metadata_scan_existing_after_setup"]:
+            QTimer.singleShot(0, self.start_existing_library_intelligence)
+        else:
+            QTimer.singleShot(0, self.wake_metadata_intelligence)
 
     def open_data_folder(self) -> None:
         folder = data_dir()
@@ -4537,6 +5025,50 @@ class MusicVaultWindow(QMainWindow):
         if self.sync_center_controller is not None:
             self.sync_center_controller.refresh()
         self.refresh_settings_status()
+
+    def refresh_metadata_intelligence_status(self) -> None:
+        if not hasattr(self, "discogs_provider_status"):
+            return
+        token_ready = self.discogs_token_store.configured()
+        settings = normalize_metadata_intelligence_settings(self.config)
+        self.discogs_provider_status.setText(
+            "Discogs: Token configured" if token_ready else "Discogs: Personal token missing"
+        )
+        total = analyzed = applied = review = 0
+        job_status = "not started"
+        try:
+            columns = {
+                str(row[1])
+                for row in self.db.conn.execute(
+                    "PRAGMA table_info(metadata_intelligence_items)"
+                )
+            }
+            state_column = "state" if "state" in columns else "status"
+            counts = self.db.conn.execute(
+                f"""
+                SELECT COUNT(*),
+                       SUM(CASE WHEN {state_column} NOT IN ('created', 'queued', 'pending') THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN {state_column} IN ('applied', 'complete') THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN {state_column} IN ('needs_review', 'review', 'ambiguous') THEN 1 ELSE 0 END)
+                FROM metadata_intelligence_items
+                """
+            ).fetchone()
+            if counts is not None:
+                total, analyzed, applied, review = (int(value or 0) for value in counts)
+            job = self.db.conn.execute(
+                "SELECT status FROM metadata_intelligence_jobs "
+                "ORDER BY created_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            if job is not None:
+                job_status = str(job[0]).replace("_", " ")
+        except Exception:
+            pass
+        self.metadata_intelligence_status.setText(
+            f"Automatic Intelligence: {'Enabled' if settings['metadata_intelligence_enabled'] else 'Disabled'}\n"
+            f"Current Job: {job_status.title()}\n"
+            f"Total: {total}  •  Analyzed: {analyzed}  •  Applied: {applied}  •  "
+            f"Review Queue Count: {review}"
+        )
 
 
     def refresh_settings_status(self) -> None:
@@ -4628,6 +5160,8 @@ class MusicVaultWindow(QMainWindow):
                 f"Application Source: {path_resolution_source()}"
             )
 
+        self.refresh_metadata_intelligence_status()
+
         if hasattr(self, "settings_download_folder"):
             self.settings_download_folder.setText(str(download_folder.resolve()))
 
@@ -4653,6 +5187,33 @@ class MusicVaultWindow(QMainWindow):
                 )
             finally:
                 self.settings_artist_images_enabled.blockSignals(previous)
+        intelligence_settings = normalize_metadata_intelligence_settings(self.config)
+        intelligence_checks = (
+            ("settings_metadata_intelligence", "metadata_intelligence_enabled"),
+            ("settings_metadata_discogs", "metadata_discogs_enabled"),
+            (
+                "settings_metadata_musicbrainz",
+                "metadata_musicbrainz_secondary_enabled",
+            ),
+            ("settings_metadata_writeback", "metadata_writeback_enabled"),
+            (
+                "settings_metadata_artwork",
+                "metadata_fill_missing_artwork_enabled",
+            ),
+            (
+                "settings_metadata_scan_existing",
+                "metadata_scan_existing_after_setup",
+            ),
+        )
+        for attribute, key in intelligence_checks:
+            widget = getattr(self, attribute, None)
+            if widget is None:
+                continue
+            previous = widget.blockSignals(True)
+            try:
+                widget.setChecked(bool(intelligence_settings[key]))
+            finally:
+                widget.blockSignals(previous)
         party_settings = normalize_party_mode_settings(self.config)
         party_controls = (
             (
@@ -4767,6 +5328,7 @@ class MusicVaultWindow(QMainWindow):
                 pass
         self._shutdown_party_audio_thread()
         self.flush_pending_volume_save()
+        self.metadata_intelligence_tasks.close()
         self.browser_summary_loader.close()
         self.thumbnail_cache.close()
         self.artist_image_service.shutdown()

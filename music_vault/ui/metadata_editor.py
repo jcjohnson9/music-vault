@@ -8,6 +8,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -38,7 +39,11 @@ from music_vault.metadata.musicbrainz_enricher import (
     MetadataCandidate,
     MusicBrainzProvider,
 )
-from music_vault.metadata.schema import EDITABLE_METADATA_FIELDS, normalize_release_date
+from music_vault.metadata.artist_credits import ArtistCreditInput, ArtistCreditService
+from music_vault.metadata.schema import (
+    VERSION_TYPES,
+    normalize_release_date,
+)
 from music_vault.metadata.service import (
     EffectiveMetadataSnapshot,
     MetadataAction,
@@ -47,6 +52,7 @@ from music_vault.metadata.service import (
     MetadataService,
 )
 from music_vault.ui.icons import ui_icon
+from music_vault.ui.artist_credit_editor import ArtistCreditEditor
 from music_vault.ui.metadata_tasks import MetadataTaskResult, MetadataTaskRunner
 
 
@@ -56,8 +62,20 @@ FIELD_LABELS = {
     "album": "Album",
     "album_artist": "Album Artist",
     "release_date": "Release Date",
+    "original_release_date": "Original Song Release Date",
+    "version_type": "Version Type",
+    "version_label": "Version Label",
     "artwork": "Artwork",
 }
+
+
+LEGACY_TEXT_FIELDS = (
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "release_date",
+)
 
 
 def _display_value(value: str | None) -> str:
@@ -83,7 +101,7 @@ class MetadataFieldEditor(QFrame):
         self.value_edit.setObjectName(f"MetadataValue_{state.field_name}")
         self.value_edit.setAccessibleName(FIELD_LABELS[state.field_name])
         self.value_edit.textEdited.connect(self._manual_text_edited)
-        if state.field_name == "release_date":
+        if state.field_name in {"release_date", "original_release_date"}:
             self.value_edit.setPlaceholderText("YYYY, YYYY-MM, or YYYY-MM-DD")
 
         provenance = state.provenance.replace("_", " ").title()
@@ -167,6 +185,110 @@ class MetadataFieldEditor(QFrame):
         if value is None:
             return MetadataAction.clear()
         return MetadataAction.set(value)
+
+
+class VersionTypeFieldEditor(QFrame):
+    """Constrained metadata editor for the normalized version taxonomy."""
+
+    field_name = "version_type"
+
+    def __init__(self, state: MetadataFieldState, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("MetadataFieldCard")
+        self.initial_value = state.value
+        self.pending_action: MetadataAction | None = None
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(6)
+        label = QLabel(FIELD_LABELS[self.field_name])
+        label.setObjectName("MetadataFieldLabel")
+        self.value_combo = QComboBox()
+        self.value_combo.setObjectName("MetadataValue_version_type")
+        self.value_combo.setAccessibleName(FIELD_LABELS[self.field_name])
+        self.value_combo.addItem("Not set", "")
+        for value in VERSION_TYPES:
+            self.value_combo.addItem(value.replace("_", " ").title(), value)
+        self.value_combo.currentIndexChanged.connect(self._manual_value_changed)
+
+        self.provenance_badge = QLabel("")
+        self.provenance_badge.setObjectName("MetadataBadge")
+        self.lock_badge = QLabel("")
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setObjectName("GhostButton")
+        self.clear_button.clicked.connect(self._clear)
+        self.unlock_button = QPushButton("Unlock")
+        self.unlock_button.setObjectName("GhostButton")
+        self.unlock_button.clicked.connect(self._unlock)
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.setObjectName("GhostButton")
+        self.reset_button.clicked.connect(self._reset)
+
+        layout.addWidget(label, 0, 0)
+        layout.addWidget(self.provenance_badge, 0, 1)
+        layout.addWidget(self.lock_badge, 0, 2)
+        layout.addWidget(self.value_combo, 1, 0, 1, 3)
+        buttons = QHBoxLayout()
+        for button in (self.clear_button, self.unlock_button, self.reset_button):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons, 2, 0, 1, 3)
+        self.load_state(state)
+
+    def _select_value(self, value: str | None) -> None:
+        index = self.value_combo.findData(value or "")
+        self.value_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def load_state(self, state: MetadataFieldState) -> None:
+        self.initial_value = state.value
+        self.pending_action = None
+        previous = self.value_combo.blockSignals(True)
+        try:
+            self._select_value(state.value)
+        finally:
+            self.value_combo.blockSignals(previous)
+        self.provenance_badge.setText(state.provenance.replace("_", " ").title())
+        self.lock_badge.setText("Locked" if state.is_locked else "Unlocked")
+        self.lock_badge.setObjectName(
+            "MetadataLockBadgeLocked" if state.is_locked else "MetadataBadge"
+        )
+        self.unlock_button.setEnabled(state.is_locked)
+        self.lock_badge.style().unpolish(self.lock_badge)
+        self.lock_badge.style().polish(self.lock_badge)
+
+    def _manual_value_changed(self, _index: int) -> None:
+        self.pending_action = None
+        self.lock_badge.setText("Manual edit • Locked")
+        self.lock_badge.setObjectName("MetadataLockBadgeLocked")
+
+    def _clear(self) -> None:
+        previous = self.value_combo.blockSignals(True)
+        try:
+            self._select_value(None)
+        finally:
+            self.value_combo.blockSignals(previous)
+        self.pending_action = MetadataAction.clear()
+        self.lock_badge.setText("Manual clear • Locked")
+        self.lock_badge.setObjectName("MetadataLockBadgeLocked")
+
+    def _unlock(self) -> None:
+        self.pending_action = MetadataAction.unlock()
+        self.lock_badge.setText("Will unlock")
+        self.lock_badge.setObjectName("MetadataBadge")
+
+    def _reset(self) -> None:
+        self.pending_action = MetadataAction.reset()
+        self.lock_badge.setText("Reset to automatic")
+        self.lock_badge.setObjectName("MetadataBadge")
+
+    def action_for_save(self) -> MetadataAction | None:
+        if self.pending_action is not None:
+            return self.pending_action
+        value = str(self.value_combo.currentData() or "")
+        if value == (self.initial_value or ""):
+            return None
+        return MetadataAction.set(value) if value else MetadataAction.clear()
 
 
 class ArtworkFieldEditor(QFrame):
@@ -323,6 +445,7 @@ class MetadataEditorDialog(QDialog):
         self.service = service
         self.track_id = int(track_id)
         self.snapshot = service.snapshot(track_id)
+        self.artist_credit_service = ArtistCreditService(service.conn)
         self.musicbrainz_provider = musicbrainz_provider or MusicBrainzProvider()
         self.cover_provider = cover_provider or CoverArtArchiveProvider()
         self.task_runner = MetadataTaskRunner(self)
@@ -388,12 +511,46 @@ class MetadataEditorDialog(QDialog):
         layout.setContentsMargins(4, 8, 4, 8)
         layout.setSpacing(10)
         self.field_editors: dict[str, MetadataFieldEditor] = {}
-        for field_name in EDITABLE_METADATA_FIELDS:
-            if field_name == "artwork":
-                continue
+        for field_name in LEGACY_TEXT_FIELDS:
             editor = MetadataFieldEditor(self.snapshot.fields[field_name])
             self.field_editors[field_name] = editor
             layout.addWidget(editor)
+
+        version_group = QGroupBox("Release date and version identity")
+        version_layout = QVBoxLayout(version_group)
+        version_note = QLabel(
+            "The version-specific release date stays separate from the original song date."
+        )
+        version_note.setObjectName("MutedLabel")
+        version_note.setWordWrap(True)
+        version_layout.addWidget(version_note)
+        self.original_release_date_editor = MetadataFieldEditor(
+            self.snapshot.fields["original_release_date"]
+        )
+        self.version_type_editor = VersionTypeFieldEditor(
+            self.snapshot.fields["version_type"]
+        )
+        self.version_label_editor = MetadataFieldEditor(
+            self.snapshot.fields["version_label"]
+        )
+        self.intelligence_field_editors = {
+            "original_release_date": self.original_release_date_editor,
+            "version_type": self.version_type_editor,
+            "version_label": self.version_label_editor,
+        }
+        version_layout.addWidget(self.original_release_date_editor)
+        version_layout.addWidget(self.version_type_editor)
+        version_layout.addWidget(self.version_label_editor)
+        layout.addWidget(version_group)
+
+        self.artist_credit_editor = ArtistCreditEditor(
+            self.artist_credit_service,
+            self.track_id,
+        )
+        self.artist_credit_editor.credits_changed.connect(
+            self._sync_artist_display_from_credits
+        )
+        layout.addWidget(self.artist_credit_editor)
         self.artwork_editor = ArtworkFieldEditor(self.snapshot.fields["artwork"])
         layout.addWidget(self.artwork_editor)
         self.file_writeback_note = QLabel(
@@ -411,9 +568,10 @@ class MetadataEditorDialog(QDialog):
     def _build_sources_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        context = QGroupBox("Source context • read only")
+        context = QGroupBox("Source, release, and provider context • read only")
         context_layout = QGridLayout(context)
         self.source_context_labels: dict[str, QLabel] = {}
+        provider_context = self._provider_context()
         source_rows = (
             ("source_kind", "Source kind", self.snapshot.source_kind or "Local / unknown"),
             (
@@ -432,6 +590,28 @@ class MetadataEditorDialog(QDialog):
                 "MusicBrainz release",
                 self.snapshot.musicbrainz_release_id or "Not confirmed",
             ),
+            (
+                "discogs_release_id",
+                "Discogs release",
+                provider_context["discogs_release_id"],
+            ),
+            (
+                "discogs_master_id",
+                "Discogs master",
+                provider_context["discogs_master_id"],
+            ),
+            (
+                "discogs_track_position",
+                "Discogs track position",
+                provider_context["discogs_track_position"],
+            ),
+            ("label_context", "Label context", provider_context["label_context"]),
+            ("release_context", "Release context", provider_context["release_context"]),
+            (
+                "provider_agreement",
+                "Provider agreement",
+                provider_context["provider_agreement"],
+            ),
         )
         for row, (key, label, value) in enumerate(source_rows):
             key_label = QLabel(label)
@@ -443,6 +623,22 @@ class MetadataEditorDialog(QDialog):
             context_layout.addWidget(value_label, row, 1)
             self.source_context_labels[key] = value_label
         self.source_upload_date_label = self.source_context_labels["source_upload_date"]
+        self.discogs_attribution_label = QLabel()
+        self.discogs_attribution_label.setObjectName("DiscogsAttributionLink")
+        self.discogs_attribution_label.setTextFormat(Qt.TextFormat.RichText)
+        self.discogs_attribution_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.discogs_attribution_label.setOpenExternalLinks(True)
+        self.discogs_attribution_label.setAccessibleName("Data provided by Discogs")
+        self._refresh_discogs_attribution(provider_context)
+        context_layout.addWidget(
+            self.discogs_attribution_label,
+            len(source_rows),
+            0,
+            1,
+            2,
+        )
         upload_note = QLabel(
             "A source upload date describes the source publication. It is never treated as the canonical music release date."
         )
@@ -462,16 +658,107 @@ class MetadataEditorDialog(QDialog):
         layout.addWidget(self.observations_table, 1)
         return tab
 
+    def _provider_context(self) -> dict[str, str]:
+        not_available = "Not available"
+        values = {
+            "discogs_release_id": not_available,
+            "discogs_master_id": not_available,
+            "discogs_track_position": not_available,
+            "label_context": not_available,
+            "release_context": not_available,
+            "provider_agreement": "Not analyzed",
+        }
+        conn = self.service.conn
+        track = conn.execute(
+            "SELECT discogs_release_id,discogs_master_id,discogs_track_position "
+            "FROM tracks WHERE id=?",
+            (self.track_id,),
+        ).fetchone()
+        if track is not None:
+            values["discogs_release_id"] = str(track[0] or not_available)
+            values["discogs_master_id"] = str(track[1] or not_available)
+            values["discogs_track_position"] = str(track[2] or not_available)
+
+        release_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='track_release_context'"
+        ).fetchone()
+        if release_table is not None:
+            release = conn.execute(
+                "SELECT * FROM track_release_context WHERE track_id=?",
+                (self.track_id,),
+            ).fetchone()
+            if release is not None:
+                keys = set(release.keys())
+                release_id = release["discogs_release_id"] if "discogs_release_id" in keys else None
+                master_id = release["discogs_master_id"] if "discogs_master_id" in keys else None
+                if release_id:
+                    values["discogs_release_id"] = str(release_id)
+                if master_id:
+                    values["discogs_master_id"] = str(master_id)
+                label_parts = [
+                    str(release[key]).strip()
+                    for key in ("label_name", "catalog_number")
+                    if key in keys and release[key] not in (None, "")
+                ]
+                if label_parts:
+                    values["label_context"] = " • ".join(label_parts)
+                release_parts = [
+                    str(release[key]).strip()
+                    for key in (
+                        "release_title",
+                        "release_format",
+                        "release_country",
+                        "release_date",
+                        "original_release_date",
+                    )
+                    if key in keys and release[key] not in (None, "")
+                ]
+                if release_parts:
+                    values["release_context"] = " • ".join(release_parts)
+
+        item_table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='metadata_intelligence_items'"
+        ).fetchone()
+        if item_table is not None:
+            item = conn.execute(
+                "SELECT provider_agreement FROM metadata_intelligence_items "
+                "WHERE track_id=? ORDER BY updated_at DESC,id DESC LIMIT 1",
+                (self.track_id,),
+            ).fetchone()
+            if item is not None and item[0]:
+                values["provider_agreement"] = str(item[0]).replace("_", " ").title()
+        return values
+
+    def _refresh_discogs_attribution(self, context: dict[str, str]) -> None:
+        release_id = context.get("discogs_release_id", "")
+        master_id = context.get("discogs_master_id", "")
+        if release_id.isdigit():
+            url = f"https://www.discogs.com/release/{release_id}"
+        elif master_id.isdigit():
+            url = f"https://www.discogs.com/master/{master_id}"
+        else:
+            self.discogs_attribution_label.clear()
+            self.discogs_attribution_label.setHidden(True)
+            return
+        self.discogs_attribution_label.setText(
+            f'<a href="{url}">Data provided by Discogs</a>'
+        )
+        self.discogs_attribution_label.setHidden(False)
+
     def _refresh_sources_tab(self) -> None:
+        provider_context = self._provider_context()
         values = {
             "source_kind": self.snapshot.source_kind or "Local / unknown",
             "source_upload_date": self.snapshot.source_upload_date or "Not available",
             "source_video_id": self.snapshot.source_video_id or "Not available",
             "musicbrainz_recording_id": self.snapshot.musicbrainz_recording_id or "Not confirmed",
             "musicbrainz_release_id": self.snapshot.musicbrainz_release_id or "Not confirmed",
+            **provider_context,
         }
         for key, label in getattr(self, "source_context_labels", {}).items():
             label.setText(values[key])
+        self._refresh_discogs_attribution(provider_context)
 
         observations = self.service.observations(self.track_id)
         self.observations_table.setRowCount(len(observations))
@@ -575,9 +862,20 @@ class MetadataEditorDialog(QDialog):
         self.refresh_history()
         return tab
 
+    def _all_field_editors(self) -> dict[str, object]:
+        return {**self.field_editors, **self.intelligence_field_editors}
+
+    def _sync_artist_display_from_credits(self) -> None:
+        try:
+            display = self.artist_credit_editor.display_artist(allow_incomplete=True)
+        except (RuntimeError, ValueError):
+            return
+        if display:
+            self.field_editors["artist"].value_edit.setText(display)
+
     def _validate_manual(self) -> dict[str, MetadataAction]:
         actions: dict[str, MetadataAction] = {}
-        for field_name, editor in self.field_editors.items():
+        for field_name, editor in self._all_field_editors().items():
             action = editor.action_for_save()
             if action is not None:
                 actions[field_name] = action
@@ -592,15 +890,31 @@ class MetadataEditorDialog(QDialog):
         )
         if not str(resulting_title or "").strip():
             raise ValueError("Title cannot be empty.")
-        release_action = actions.get("release_date")
-        if release_action is not None and release_action.action == "set":
-            normalize_release_date(release_action.value)
+        for field_name in ("release_date", "original_release_date"):
+            release_action = actions.get(field_name)
+            if release_action is not None and release_action.action == "set":
+                normalize_release_date(release_action.value)
         return actions
 
     def save_manual_changes(self) -> None:
         self.validation_label.clear()
         try:
             actions = self._validate_manual()
+            credit_inputs: tuple[ArtistCreditInput, ...] | None = None
+            credit_dirty = self.artist_credit_editor.is_dirty()
+            artist_action = actions.get("artist")
+            if credit_dirty:
+                credit_inputs = self.artist_credit_editor.credit_inputs()
+                actions["artist"] = MetadataAction.set(
+                    self.artist_credit_editor.display_artist()
+                )
+            elif artist_action is not None and artist_action.action == "set":
+                artist_name = str(artist_action.value or "").strip()
+                if not artist_name:
+                    raise ValueError("At least one primary artist credit is required.")
+                credit_inputs = (ArtistCreditInput(artist_name, role="primary"),)
+            elif artist_action is not None and artist_action.action == "clear":
+                raise ValueError("At least one primary artist credit is required.")
             art_action = self.artwork_editor.pending_action
             if art_action is not None:
                 if art_action.action == "prepared_artwork":
@@ -611,7 +925,35 @@ class MetadataEditorDialog(QDialog):
                     actions["artwork"] = MetadataAction.set(str(stored))
                 else:
                     actions["artwork"] = art_action
-            result = self.service.apply_actions(self.track_id, actions)
+            before = self.snapshot
+            with self.service.conn:
+                result = self.service.apply_actions(
+                    self.track_id,
+                    actions,
+                    commit=False,
+                )
+                if credit_inputs is not None:
+                    self.artist_credit_service.replace_track_credits(
+                        self.track_id,
+                        credit_inputs,
+                        provenance="manual",
+                        is_manual=True,
+                        is_locked=True,
+                        actor="user",
+                        reason="manual_artist_credit_edit",
+                        commit=False,
+                    )
+            after = self.service.snapshot(self.track_id)
+            changed_fields = set(result.changed_fields)
+            if credit_inputs is not None:
+                changed_fields.add("artist")
+            result = MetadataChangeResult(
+                self.track_id,
+                result.change_group_id,
+                frozenset(changed_fields),
+                before,
+                after,
+            )
         except (ValueError, ArtworkError) as exc:
             self.validation_label.setText(str(exc))
             return
@@ -628,6 +970,9 @@ class MetadataEditorDialog(QDialog):
         self.snapshot = snapshot or self.service.snapshot(self.track_id)
         for field_name, editor in self.field_editors.items():
             editor.load_state(self.snapshot.fields[field_name])
+        for field_name, editor in self.intelligence_field_editors.items():
+            editor.load_state(self.snapshot.fields[field_name])
+        self.artist_credit_editor.load_credits()
         self.artwork_editor.load_state(self.snapshot.fields["artwork"])
         self._refresh_sources_tab()
         self.refresh_history()

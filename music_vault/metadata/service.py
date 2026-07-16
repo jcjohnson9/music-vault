@@ -13,6 +13,7 @@ from .schema import (
     MATERIALIZED_COLUMNS,
     OBSERVATION_FIELDS,
     normalize_release_date,
+    normalize_version_type,
     observation_key,
     release_year,
     utc_now,
@@ -24,12 +25,16 @@ PROVENANCE_PRIORITY = {
     "filename": 5,
     "youtube": 10,
     "youtube_thumbnail": 10,
+    "youtube_title_parsed": 30,
     "embedded": 40,
     "musicbrainz": 60,
     "cover_art_archive": 60,
+    "discogs": 75,
     "musicbrainz_high_confidence": 70,
     "cover_art_archive_high_confidence": 70,
+    "discogs_high_confidence": 85,
     "provider_confirmed": 80,
+    "discogs_confirmed": 95,
     "musicbrainz_confirmed": 90,
     "manual": 100,
 }
@@ -85,6 +90,9 @@ class ApprovedMetadataSnapshot:
     album: str | None
     album_artist: str | None
     release_date: str | None
+    original_release_date: str | None
+    version_type: str | None
+    version_label: str | None
     artwork: str | None
     provenance: Mapping[str, str]
     locked_fields: frozenset[str]
@@ -114,6 +122,15 @@ class MetadataAction:
     @classmethod
     def reset(cls) -> "MetadataAction":
         return cls("reset", None)
+
+
+@dataclass(frozen=True)
+class AutomaticMetadataField:
+    value: object
+    confidence: float | None
+    provider: str | None = None
+    provider_reference: str | None = None
+    conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -220,8 +237,10 @@ class MetadataService:
 
     @staticmethod
     def _normalized_value(field_name: str, value: object) -> str | None:
-        if field_name == "release_date":
+        if field_name in {"release_date", "original_release_date"}:
             return normalize_release_date(value)
+        if field_name == "version_type":
+            return normalize_version_type(value)
         return _clean_optional(value)
 
     def _track(self, track_id: int) -> sqlite3.Row:
@@ -415,7 +434,7 @@ class MetadataService:
             """,
             (int(track_id), field_name),
         ).fetchall()
-        if field_name == "release_date":
+        if field_name in {"release_date", "original_release_date"}:
             valid_rows: list[sqlite3.Row] = []
             for row in rows:
                 try:
@@ -599,6 +618,56 @@ class MetadataService:
             [*assignments.values(), int(track_id)],
         )
 
+    def _reconcile_artist_credits(
+        self,
+        track_id: int,
+        state: MetadataFieldState,
+        changed_at: str,
+    ) -> None:
+        """Keep the structured artist fallback aligned with flat-field edits.
+
+        ``ArtistCreditService`` installs its structured rows before it
+        materializes the matching display string, so an exact formatted match
+        is retained.  Legacy/manual flat-field edits instead receive one
+        conservative unsplit credit, preserving the Batch 10.1 migration rule
+        and preventing the Artist browser from showing stale identities.
+        """
+
+        exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='track_artist_credits'"
+        ).fetchone()
+        if exists is None:
+            return
+
+        from .artist_credits import ArtistCreditService, seed_existing_artist_credits
+
+        credits = ArtistCreditService(self.conn).track_credits(track_id)
+        formatted = ArtistCreditService.formatted_credit(credits) if credits else None
+        target = _clean_optional(state.value)
+        if formatted == target and credits:
+            self.conn.execute(
+                """
+                UPDATE track_artist_credits
+                SET is_manual=?, is_locked=?, updated_at=?
+                WHERE track_id=?
+                """,
+                (
+                    int(state.is_manual),
+                    int(state.is_locked),
+                    changed_at,
+                    int(track_id),
+                ),
+            )
+            return
+
+        self.conn.execute(
+            "DELETE FROM track_artist_credits WHERE track_id=?",
+            (int(track_id),),
+        )
+        if target is not None:
+            seed_existing_artist_credits(self.conn, (int(track_id),))
+
     def _commit_changes(
         self,
         *,
@@ -636,6 +705,12 @@ class MetadataService:
             )
             new_states[field_name] = stamped
         self._materialize(track_id, new_states, changed_at)
+        if "artist" in new_states:
+            self._reconcile_artist_credits(
+                track_id,
+                new_states["artist"],
+                changed_at,
+            )
         return identifier
 
     def record_source_observations(
@@ -662,12 +737,18 @@ class MetadataService:
                 field_name = str(raw_name).strip()
                 if field_name not in OBSERVATION_FIELDS:
                     raise ValueError(f"Unsupported observation field: {field_name}")
-                if field_name == "release_date" and provider_name.startswith("youtube"):
+                if (
+                    field_name in {"release_date", "original_release_date"}
+                    and provider_name.startswith("youtube")
+                ):
                     continue
 
                 observation_value = _clean_optional(raw_value)
                 effective_value = observation_value
-                if field_name == "release_date" and observation_value is not None:
+                if (
+                    field_name in {"release_date", "original_release_date"}
+                    and observation_value is not None
+                ):
                     try:
                         effective_value = normalize_release_date(observation_value)
                     except ValueError:
@@ -724,8 +805,20 @@ class MetadataService:
                 if old.is_locked:
                     continue
                 incoming_priority = PROVENANCE_PRIORITY.get(provenance, 0)
-                if old.value is not None and incoming_priority < _priority(old):
-                    continue
+                if old.value is not None:
+                    current_priority = _priority(old)
+                    if incoming_priority < current_priority:
+                        continue
+                    if (
+                        incoming_priority == current_priority
+                        and old.confidence is not None
+                        and score is not None
+                        and score < old.confidence
+                    ):
+                        # A later observation from the same authority is useful
+                        # evidence, but it must not silently downgrade a
+                        # stronger effective field winner.
+                        continue
                 new = MetadataFieldState(
                     field_name=field_name,
                     value=effective_value,
@@ -750,6 +843,102 @@ class MetadataService:
             track_id=int(track_id),
             change_group_id=group_id,
             changed_fields=frozenset(pending),
+            before=before,
+            after=after,
+        )
+
+    def apply_automatic_fields(
+        self,
+        track_id: int,
+        fields: Mapping[
+            str,
+            AutomaticMetadataField | Mapping[str, object] | object,
+        ],
+        *,
+        provider: str = "discogs",
+        provider_reference: str | Mapping[str, str | None] | None = None,
+        confidence: float | Mapping[str, float | None] | None = None,
+        minimum_confidence: float = 85.0,
+        actor: str = "metadata_intelligence",
+        reason: str = "high_confidence_automatic_metadata",
+        commit: bool = True,
+    ) -> MetadataChangeResult:
+        """Record every normalized candidate but apply only safe field-level winners."""
+
+        threshold = float(minimum_confidence)
+        if not 0 <= threshold <= 100:
+            raise ValueError("Automatic metadata threshold must be between 0 and 100.")
+        before = self.snapshot(track_id)
+        changed: set[str] = set()
+        group_id = str(uuid.uuid4())
+        used_group = False
+        with self._transaction(commit=commit):
+            for raw_name, raw_candidate in fields.items():
+                field_name = self._validate_field(raw_name)
+                candidate_provider = str(provider or "unknown")
+                candidate_reference = (
+                    provider_reference.get(field_name)
+                    if isinstance(provider_reference, Mapping)
+                    else provider_reference
+                )
+                candidate_confidence = (
+                    confidence.get(field_name)
+                    if isinstance(confidence, Mapping)
+                    else confidence
+                )
+                conflict = False
+                if isinstance(raw_candidate, AutomaticMetadataField):
+                    value = raw_candidate.value
+                    candidate_confidence = raw_candidate.confidence
+                    candidate_provider = raw_candidate.provider or candidate_provider
+                    candidate_reference = (
+                        raw_candidate.provider_reference
+                        if raw_candidate.provider_reference is not None
+                        else candidate_reference
+                    )
+                    conflict = raw_candidate.conflict
+                elif isinstance(raw_candidate, Mapping):
+                    value = raw_candidate.get("value")
+                    candidate_confidence = raw_candidate.get(
+                        "confidence", candidate_confidence
+                    )
+                    candidate_provider = str(
+                        raw_candidate.get("provider") or candidate_provider
+                    )
+                    candidate_reference = raw_candidate.get(
+                        "provider_reference", candidate_reference
+                    )
+                    conflict = bool(raw_candidate.get("conflict"))
+                else:
+                    value = raw_candidate
+                score = (
+                    float(candidate_confidence)
+                    if candidate_confidence is not None
+                    else None
+                )
+                if score is not None and not 0 <= score <= 100:
+                    raise ValueError("Field confidence must be between 0 and 100.")
+                apply_effective = score is not None and score >= threshold and not conflict
+                result = self.record_source_observations(
+                    track_id,
+                    provider=candidate_provider,
+                    values={field_name: value},
+                    provider_reference=_clean_optional(candidate_reference),
+                    confidence=score,
+                    apply_effective=apply_effective,
+                    actor=actor,
+                    reason=reason,
+                    change_group_id=group_id,
+                    commit=False,
+                )
+                if result.changed:
+                    used_group = True
+                    changed.update(result.changed_fields)
+        after = self.snapshot(track_id)
+        return MetadataChangeResult(
+            track_id=int(track_id),
+            change_group_id=group_id if used_group else None,
+            changed_fields=frozenset(changed),
             before=before,
             after=after,
         )
@@ -880,7 +1069,11 @@ class MetadataService:
         reason: str = "approved_provider",
         commit: bool = True,
     ) -> MetadataChangeResult:
-        if provenance not in {"provider_confirmed", "musicbrainz_confirmed"}:
+        if provenance not in {
+            "provider_confirmed",
+            "musicbrainz_confirmed",
+            "discogs_confirmed",
+        }:
             raise ValueError("Approved metadata requires a confirmed provenance.")
         before = self.snapshot(track_id)
         track = self._track(track_id)
@@ -897,7 +1090,13 @@ class MetadataService:
                     if isinstance(provider_reference, Mapping)
                     else provider_reference
                 )
-                provider = "musicbrainz" if provenance == "musicbrainz_confirmed" else "confirmed_provider"
+                provider = (
+                    "musicbrainz"
+                    if provenance == "musicbrainz_confirmed"
+                    else "discogs"
+                    if provenance == "discogs_confirmed"
+                    else "confirmed_provider"
+                )
                 self._write_observation(
                     track_id=track_id,
                     provider=provider,
@@ -999,7 +1198,10 @@ class MetadataService:
                     continue
                 reference = (
                     release_id
-                    if field_name in {"album", "album_artist", "release_date", "artwork"}
+                    if field_name in {
+                        "album", "album_artist", "release_date",
+                        "original_release_date", "version_type", "version_label", "artwork",
+                    }
                     else recording_id
                 )
                 provider = "cover_art_archive" if field_name == "artwork" else "musicbrainz"
@@ -1088,7 +1290,10 @@ class MetadataService:
                     continue
                 reference = (
                     release_id
-                    if field_name in {"album", "album_artist", "release_date", "artwork"}
+                    if field_name in {
+                        "album", "album_artist", "release_date",
+                        "original_release_date", "version_type", "version_label", "artwork",
+                    }
                     else recording_id
                 )
                 provenance = (
@@ -1333,6 +1538,9 @@ class MetadataService:
             album=snapshot.value("album"),
             album_artist=snapshot.value("album_artist"),
             release_date=snapshot.value("release_date"),
+            original_release_date=snapshot.value("original_release_date"),
+            version_type=snapshot.value("version_type"),
+            version_label=snapshot.value("version_label"),
             artwork=snapshot.value("artwork"),
             provenance=MappingProxyType(
                 {name: state.provenance for name, state in snapshot.fields.items()}

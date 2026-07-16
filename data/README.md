@@ -8,7 +8,8 @@ contain no user library or credentials.
 
 Never commit user databases, API keys, configuration, status files, download
 archives, failed-item records, media, cover art, artist images, metadata reports,
-backups, logs, lyrics, lyric-provider results, saved source definitions, source
+backups, logs, lyrics, lyric-provider results, Discogs tokens/results/images,
+metadata-intelligence jobs, saved source definitions, source
 URLs/labels/titles, source-item memberships, run history, destination mappings,
 or private playlist information from this directory.
 
@@ -19,10 +20,18 @@ does not represent a Watchtower integration.
 
 The portable release contains the `music-vault.portable.json` root marker but
 does not contain a populated data folder. On first launch, Music Vault creates
-only the selected runtime directories and an empty schema-v4 database. Local
-import/playback works without an API key or FFmpeg. Optional YouTube setup keeps
+only the selected runtime directories and an empty current-schema database.
+Local import/playback works without an API key or FFmpeg. Optional YouTube setup keeps
 the key in `youtube_api_key.txt`; it is never stored in JSON configuration or
 bundled into a release. The command-line FFmpeg tools are installed separately.
+
+Optional Discogs-first metadata intelligence stores a personal credential only
+in `discogs_token.txt`. That file is not JSON configuration, is never printed or
+placed in App Status, and must never be committed or bundled. Accepted catalogue
+fields and private resumable-job evidence live in SQLite. Raw API responses are
+memory-only and short-lived. Validated gap-only artwork is content-addressed
+under `covers/discogs/`; provider-cache files, images, and attribution metadata
+remain private runtime data and are excluded from public artifacts.
 
 Schema version 4 keeps effective metadata, source observations, provenance,
 confidence, field locks, and grouped change history inside the private SQLite
@@ -37,7 +46,7 @@ files and schema-migration backups must never be committed or included in a publ
 build. Clear, reset, and undo do not automatically delete older cover files.
 
 The current v1.1.0 development line advances new and migrated local databases
-to schema version 5. It adds saved synchronization sources, durable
+to schema version 6. Schema version 5 adds saved synchronization sources, durable
 playlist-item occurrences, source runs, global video-to-track identities,
 identity-conflict diagnostics, and manual/source playlist origins. These tables
 may reveal private source and library organization and belong only in the local
@@ -45,6 +54,20 @@ database. New source downloads use
 `youtube_downloads/sources/<stable-storage-key>/`; existing media remains where
 it is and is reused rather than moved. Source archive, remote removal, and safe
 detachment do not delete media.
+
+Schema version 6 adds structured artists and ordered track credits, normalized
+release/label context, original-versus-version dates, version identity,
+recording grouping, and resumable metadata-intelligence jobs. It preserves the
+materialized artist text, every canonical track, media path, source occurrence,
+playlist origin, and order. Labels and YouTube uploaders remain release/source
+provenance rather than artist entities. Version grouping never merges or
+deletes separate media.
+
+Discogs artwork can fill only a missing, corrupt, or explicit-placeholder gap.
+It never automatically replaces a valid existing cover and is never embedded
+into an audio file automatically. Text-tag writeback, when separately enabled,
+uses the existing verified full-file backup, temporary-copy, readback, and
+unchanged-audio checks.
 
 Private remediation reports live under `metadata_reports/<job-id>/`. Provider
 cache rows remain in the SQLite database, and per-job original media backups
