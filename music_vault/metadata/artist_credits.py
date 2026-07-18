@@ -12,6 +12,11 @@ from .intelligence_schema import ARTIST_CREDIT_ROLES, ARTIST_ENTITY_TYPES
 
 
 _SPACE_RE = re.compile(r"\s+")
+_REPAIR_ALIAS_KINDS = (
+    "corrected_version_suffix",
+    "legacy_credit_string",
+    "display_variant",
+)
 
 
 def normalize_artist_name(value: object) -> str:
@@ -83,6 +88,34 @@ def _artist_from_row(row: sqlite3.Row) -> Artist:
     )
 
 
+def _repair_alias_candidate(
+    conn: sqlite3.Connection,
+    normalized_alias: str,
+) -> tuple[sqlite3.Row | None, bool]:
+    """Resolve only explicit repair aliases, failing closed on ambiguity."""
+
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artist_aliases'"
+    ).fetchone()
+    if table is None:
+        return None, False
+    rows = conn.execute(
+        """
+        SELECT artist.*
+        FROM artist_aliases alias
+        JOIN artists artist ON artist.id=alias.artist_id
+        WHERE alias.normalized_alias=?
+          AND alias.alias_kind IN (?, ?, ?)
+        ORDER BY artist.id
+        """,
+        (normalized_alias, *_REPAIR_ALIAS_KINDS),
+    ).fetchall()
+    candidates = {int(row["id"]): row for row in rows}
+    if len(candidates) == 1:
+        return next(iter(candidates.values())), False
+    return None, len(candidates) > 1
+
+
 def seed_existing_artist_credits(
     conn: sqlite3.Connection,
     track_ids: Iterable[int] | None = None,
@@ -119,17 +152,24 @@ def seed_existing_artist_credits(
         display = _display_name(row["artist"])
         normalized = normalize_artist_name(display)
         timestamp = str(row["field_updated_at"] or row["updated_at"] or "1970-01-01T00:00:00Z")
-        artist_row = conn.execute(
-            """
-            SELECT id FROM artists
-            WHERE normalized_name=?
-              AND NULLIF(TRIM(discogs_artist_id), '') IS NULL
-              AND NULLIF(TRIM(musicbrainz_artist_id), '') IS NULL
-            ORDER BY id
-            LIMIT 1
-            """,
-            (normalized,),
-        ).fetchone()
+        artist_row, alias_ambiguous = _repair_alias_candidate(conn, normalized)
+        if alias_ambiguous:
+            # The legacy display string remains available on the track, but
+            # an ambiguous alias must never silently recreate or mis-credit an
+            # artist identity.
+            continue
+        if artist_row is None:
+            artist_row = conn.execute(
+                """
+                SELECT id FROM artists
+                WHERE normalized_name=?
+                  AND NULLIF(TRIM(discogs_artist_id), '') IS NULL
+                  AND NULLIF(TRIM(musicbrainz_artist_id), '') IS NULL
+                ORDER BY id
+                LIMIT 1
+                """,
+                (normalized,),
+            ).fetchone()
         if artist_row is None:
             artist_id = int(
                 conn.execute(
@@ -227,6 +267,24 @@ class ArtistCreditService:
             raise ValueError("Provider IDs resolve to conflicting artist identities.")
 
         candidate = provider_candidates[0] if provider_candidates else None
+        candidate_from_alias = False
+        if candidate is not None:
+            alias_candidate, alias_ambiguous = _repair_alias_candidate(
+                self.conn, normalized
+            )
+            if alias_ambiguous:
+                raise ValueError("Artist repair alias resolves to multiple identities.")
+            if alias_candidate is not None:
+                if int(alias_candidate["id"]) != int(candidate["id"]):
+                    raise ValueError(
+                        "Provider identity conflicts with a corrected artist alias."
+                    )
+                candidate_from_alias = True
+        if candidate is None and discogs_id is None and musicbrainz_id is None:
+            candidate, alias_ambiguous = _repair_alias_candidate(self.conn, normalized)
+            if alias_ambiguous:
+                raise ValueError("Artist repair alias resolves to multiple identities.")
+            candidate_from_alias = candidate is not None
         if candidate is None and discogs_id is None and musicbrainz_id is None:
             # Name-only edits use (or create) one deterministic provider-free
             # fallback.  A new provider identity deliberately does not claim a
@@ -259,27 +317,41 @@ class ArtistCreditService:
         with self._transaction(commit=commit):
             if candidate is not None:
                 artist_id = int(candidate["id"])
-                self.conn.execute(
-                    """
-                    UPDATE artists SET
-                        display_name=?, normalized_name=?, sort_name=?,
-                        entity_type=CASE WHEN entity_type='unknown' THEN ? ELSE entity_type END,
-                        discogs_artist_id=COALESCE(discogs_artist_id, ?),
-                        musicbrainz_artist_id=COALESCE(musicbrainz_artist_id, ?),
-                        updated_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        display,
-                        normalized,
-                        normalized,
-                        kind,
-                        discogs_id,
-                        musicbrainz_id,
-                        now,
-                        artist_id,
-                    ),
-                )
+                if candidate_from_alias:
+                    # A corrected legacy spelling is lookup evidence, not a
+                    # request to rename the canonical artist back to the
+                    # malformed display string.
+                    self.conn.execute(
+                        """
+                        UPDATE artists SET
+                            entity_type=CASE WHEN entity_type='unknown' THEN ? ELSE entity_type END,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (kind, now, artist_id),
+                    )
+                else:
+                    self.conn.execute(
+                        """
+                        UPDATE artists SET
+                            display_name=?, normalized_name=?, sort_name=?,
+                            entity_type=CASE WHEN entity_type='unknown' THEN ? ELSE entity_type END,
+                            discogs_artist_id=COALESCE(discogs_artist_id, ?),
+                            musicbrainz_artist_id=COALESCE(musicbrainz_artist_id, ?),
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            display,
+                            normalized,
+                            normalized,
+                            kind,
+                            discogs_id,
+                            musicbrainz_id,
+                            now,
+                            artist_id,
+                        ),
+                    )
             else:
                 artist_id = int(
                     self.conn.execute(

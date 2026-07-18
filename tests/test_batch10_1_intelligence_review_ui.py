@@ -167,7 +167,7 @@ def test_review_filters_cover_states_and_every_ambiguity_reason(
     )
     assert {
         dialog.table.item(row, 0).text() for row in range(dialog.table.rowCount())
-    } == {"Review", "Ready"}
+    } == {"Needs Review"}
 
 
 def test_normalized_proposal_renders_provider_facts_without_raw_json(

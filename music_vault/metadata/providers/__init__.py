@@ -70,6 +70,11 @@ class ProviderReleaseCandidate:
     provider_score: float = 0.0
     release_id: str | None = None
     master_id: str | None = None
+    # A provider-qualified, stable family identity (for example,
+    # ``catalogue:family-id``).  This is intentionally distinct from an
+    # edition-specific release ID and is used only when the provider has
+    # explicitly supplied release-family evidence.
+    release_family_id: str | None = None
     track_position: str | None = None
     recording_id: str | None = None
     label: str | None = None
@@ -117,6 +122,7 @@ class ProviderReleaseCandidate:
             "provider_score": self.provider_score,
             "release_id": self.release_id,
             "master_id": self.master_id,
+            "release_family_id": self.release_family_id,
             "track_position": self.track_position,
             "recording_id": self.recording_id,
             "label": self.label,

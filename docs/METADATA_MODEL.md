@@ -86,6 +86,53 @@ cover, instrumental, demo, radio/extended, sped-up/slowed, nightcore, mashup,
 re-recording, soundtrack, YouTube-exclusive, and unknown identities;
 `version_label` preserves useful detail such as venue, mix, or remaster text.
 
+## Canonical albums and artist identity
+
+Schema version 7 adds a browser-identity layer without changing materialized
+track metadata. `canonical_albums` represents a durable album/master family;
+`track_album_memberships` retains each track's release ID, edition label/date,
+position, provenance, provider reference, and confidence. Identity priority is
+Discogs master, MusicBrainz release group, accepted provider release family,
+then conservative normalized base title plus canonical album artist and album
+kind. Ordinary year, country, format, and cover differences do not create a
+new top-level card.
+
+Album kind protects genuinely distinct works: studio, live, soundtrack, score,
+cast, compilation, greatest-hits, remix, EP, single, and demo identities do not
+collapse merely because their titles resemble each other. The membership layer
+never rewrites `tracks.album`, `tracks.album_artist`, release dates, or
+`cover_path`.
+
+`artist_aliases` retains safe display/provider/legacy variants while
+`artist_relationships` stores verified facts such as `member_of`. Provider IDs
+or strong saved evidence may justify consolidation; conflicting IDs,
+person/group ambiguity, and unrelated same-name artists remain separate.
+Credit role, order, join phrase, provenance, confidence, manual/lock authority,
+portrait provenance, and history survive any safe reassignment. See
+[Canonical Media Browser](CANONICAL_MEDIA_BROWSER.md).
+
+Artist pages partition one set-based result into **Tracks**, **Featured On**,
+**Collaborations**, and verified **Group Appearances**. A group track is not
+presented as a member's solo track. Punctuation does not prove a band split,
+and `Various Artists`, labels, distributors, or uploaders never become
+performer cards from release/source context alone.
+
+## Field-level review outcomes
+
+`Needs Review` is limited to critical song, primary-artist, structured-credit,
+version, severe-duration, or conflicting-provider uncertainty. Accepted
+identity with missing album, year, exact edition, artwork, label, catalogue
+number, or country becomes `Applied with Gaps`. Strong source-title identity
+with no critical conflict and no credible catalogue match becomes `Accepted
+Source Fallback`; unsupported release fields remain blank.
+
+Stored normalized evidence can be reclassified in bounded batches without a
+provider request. High-confidence safe gap fields may apply, medium-confidence
+fields remain unapplied, critical conflicts stay in review, and job aggregate
+counts reconcile. Soundtrack title/performer identity may apply while an exact
+edition remains a gap; soundtracks, scores, casts, and sequel entries retain
+distinct album kinds.
+
 ## Authority and precedence
 
 Automatic observations use a centralized precedence policy:
@@ -179,6 +226,11 @@ arbitrary external file path as the permanent cover, and clear/reset/undo does
 not delete older artwork files. Track artwork remains separate from Batch 5's
 optional artist-photo cache under `data/artist_images/`.
 
+A canonical album card chooses one representative existing valid track cover
+for display only. Manual/locked and existing local or embedded art outrank
+provider/fallback art. That selection never copies a path to another track,
+replaces valid artwork, deletes alternate covers, or writes an audio tag.
+
 ## Schema migration
 
 SQLite schema version 3 adds the two materialized track columns and the field,
@@ -201,6 +253,30 @@ intelligence jobs/items. Its conservative backfill preserves the exact legacy
 artist display string as one unsplit primary unknown entity, respects existing
 field authority, and performs no provider request or media write. The verified
 SQLite backup/integrity/idempotence rules remain in force.
+
+Schema version 7 additively introduces canonical albums/memberships, artist
+aliases/relationships, and expanded intelligence outcomes. Backfill groups only
+safe edition variants, creates conservative credits/aliases, and reclassifies
+stored evidence without provider access. It preserves every track, media path,
+`cover_path`, source/playlist membership, lock, observation, history row, job,
+provider record, and separate version. A verified backup precedes non-empty
+schema-6 migration; integrity, foreign-key, index, idempotence, and aggregate
+preservation checks remain mandatory.
+
+Each database instance exposes process-local startup facts: whether it
+initialized a new database, whether it actually migrated, the source and target
+schema versions, and the migration backup path. An old backup cannot make a
+later current-schema open report a migration. If an upgrade occurred, the
+central runtime policy defers optional metadata-intelligence, portrait, lyric,
+and other provider work for the rest of that process. This adds no metadata
+field, history event, observation, job failure, or persisted configuration
+change; the next ordinary non-migration process may resume queued work.
+
+Acceptance no-secret/no-network states use the same process-local policy and
+are checked before credential reads and transport construction. App Status
+preserves its versioned consumer contract and exports only an aggregate
+deferred boolean and safe reason, never a credential, query, identity, URL, or
+item-level result.
 
 ## Existing-library remediation
 

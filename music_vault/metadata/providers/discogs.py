@@ -20,6 +20,7 @@ from typing import Any
 
 import requests
 
+from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.metadata.artist_images import validate_public_url
 from music_vault.metadata.matching import text_similarity
 from music_vault.metadata.schema import normalize_release_date
@@ -583,11 +584,20 @@ class DiscogsProvider:
             raise DiscogsProviderError("discogs_token_required")
         if len(self._token) > 512 or "\r" in self._token or "\n" in self._token:
             raise DiscogsProviderError("discogs_token_invalid")
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.session = session
+        if self.session is not None:
+            self.session.trust_env = False
         self.resolver = resolver
         self.rate_limiter = rate_limiter
         self.cache = cache or _MemoryResponseCache()
+
+    def _network_session(self) -> requests.Session:
+        if not runtime_policy_for().allows_provider_construction(token_backed=True):
+            raise DiscogsProviderError("provider_work_deferred")
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        return self.session
 
     @staticmethod
     def _cache_key(path: str, params: Mapping[str, Any] | None) -> tuple[Any, ...]:
@@ -648,6 +658,9 @@ class DiscogsProvider:
             return cached
 
         self._check_cancelled(cancel_event, stale_check)
+        # Check policy before endpoint validation performs DNS resolution.
+        # Cached results above remain usable without constructing a transport.
+        session = self._network_session()
         try:
             endpoint = validate_public_url(
                 f"{DISCOGS_API_ROOT}{path}",
@@ -661,7 +674,7 @@ class DiscogsProvider:
             self._check_cancelled(cancel_event, stale_check)
             self.rate_limiter.wait(cancel_event)
             try:
-                response = self.session.get(
+                response = session.get(
                     endpoint,
                     params=bounded_params or None,
                     headers={

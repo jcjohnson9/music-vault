@@ -13,7 +13,7 @@ provides the user interface, Qt Multimedia provides playback through
 | `run.py` | Source entry point that creates and starts the application. |
 | `music_vault/version.py` | Authoritative application name, current-tree version, release channel, public user agent, and Windows resource values. |
 | `music_vault/app.py` | Main PySide6 window, view orchestration, playback, queue, settings, Sync Center integration, and status updates. |
-| `music_vault/core/db.py` | Versioned additive SQLite migrations, failure history, and compatibility library/playlist APIs. |
+| `music_vault/core/db.py` | Versioned additive SQLite migrations, process-local migration/initialization startup state, failure history, and compatibility library/playlist APIs. |
 | `music_vault/core/sync_schema.py` | Schema-v5 saved-source, source-item/run, global source identity/conflict, playlist-origin, index, and additive backfill definitions. |
 | `music_vault/core/sync_sources.py` | YouTube playlist identity normalization, stable storage keys, persistent source CRUD/order/destination/archive operations, and source-card projections. |
 | `music_vault/core/playlist_membership.py` | Central origin-aware materialization of source-managed and manual playlist membership into the compatibility `playlist_tracks` table. |
@@ -22,10 +22,11 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/core/youtube_sync.py` | Public/unlisted API enumeration, authoritative video-ID reconciliation, and anonymous yt-dlp/FFmpeg acquisition. |
 | `music_vault/core/sync_result.py` | Typed synchronization outcome shared by engine, UI, status, logging, and tests. |
 | `music_vault/core/safety.py` | Secret redaction, video-ID extraction, source-date normalization, and safe output paths. |
+| `music_vault/core/runtime_policy.py` | Central process-local migration-startup, acceptance no-secret/no-network, lazy-provider, background-work, and safe-status decisions. |
 | `music_vault/core/playback_state.py` | Pure volume normalization/config filtering and track-ID-to-table-row helpers. |
 | `music_vault/core/audio_analysis.py` | Bounded PCM conversion, spectral features, smoothing, beat detection, and latest-buffer analysis for Party Mode. |
 | `music_vault/core/musical_motion.py` | Bounded tempo estimation, smooth beat/bar/phrase phase, missed-beat continuation, and deterministic sparse accent scheduling. |
-| `music_vault/core/library_browser.py` | SQL-aggregated album/artist summaries, stable browser identities, exact track lookup, revision fingerprints, and summary-cache invalidation. |
+| `music_vault/core/library_browser.py` | SQL-aggregated canonical album/artist summaries, role-separated artist sections, exact track lookup, revision fingerprints, and summary-cache invalidation. |
 | `music_vault/core/paths.py` | Central source, portable-marker, selected runtime-data, asset, and frozen-application path resolution. |
 | `music_vault/core/ffmpeg.py` | Bounded discovery and validation of a complete external `ffmpeg.exe`/`ffprobe.exe` pair. |
 | `music_vault/core/desktop_shortcut.py` | Non-admin portable desktop-shortcut inspection, conflict handling, and creation. |
@@ -53,6 +54,11 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/metadata/artist_images.py` | Provider-neutral artist-photo resolution, confidence checks, safe public networking, runtime cache/provenance, and background request service. |
 | `music_vault/metadata/schema.py` | Schema-v3 field/observation/history tables, release-date validation, conservative migration seeding, and required indexes. |
 | `music_vault/metadata/intelligence_schema.py` | Schema-v6 artist entities, ordered track credits, release context, and resumable intelligence-job state. |
+| `music_vault/metadata/canonical_albums.py` | Schema-v7 canonical album memberships, conservative edition/kind identity, artist aliases/relationships, backfill, and representative-cover selection. |
+| `music_vault/metadata/artist_consolidation.py` | Dry-run and transactional safe artist merge planning, deterministic canonical selection, credit/alias/relationship preservation, and conflict reporting. |
+| `music_vault/metadata/review_policy.py` | Offline field-level classification for critical review, applied-with-gaps, and source-fallback outcomes. |
+| `music_vault/metadata/review_reclassification.py` | Bounded, resumable reclassification of saved review evidence without constructing provider clients. |
+| `music_vault/metadata/soundtrack.py` | Conservative soundtrack/score/cast context classification and distinct-work safeguards. |
 | `music_vault/metadata/intelligence.py` | Consent-gated Discogs-first, MusicBrainz-secondary field ensemble, automatic import queue, and resumable library analysis. |
 | `music_vault/metadata/artist_credits.py` | Conservative legacy seeding plus provider/manual structured-credit persistence and display materialization. |
 | `music_vault/metadata/title_parser.py` | Comparison-only extraction of YouTube title, credit, and version hints without rewriting stored metadata. |
@@ -90,8 +96,8 @@ saved source selection in Sync Center
   -> targeted Mutagen/source observations
   -> metadata precedence and effective field materialization
   -> optional consent-gated Discogs-first/MusicBrainz-secondary field ensemble
-  -> schema-v6 SQLite library, structured credits, source, provenance, history,
-     remediation, and resumable intelligence state
+  -> schema-v7 SQLite library, canonical albums/artists, structured credits,
+     source, provenance, history, remediation, and resumable intelligence state
   -> PySide6 browsing and the existing QMediaPlayer playback pipeline
 ```
 
@@ -154,6 +160,39 @@ and separately configured FFmpeg tools handle authorized media processing.
 MusicBrainz and Cover Art
 Archive can provide metadata and artwork. The application should continue to
 separate these integrations from local library ownership and persistence.
+
+## Startup quiescence boundary
+
+`MusicVaultDB` exposes whether that instance initialized a new database or
+actually upgraded an older one, including the source/target schema and the
+verified backup path. These values live only in the Python process. The
+presence of a backup from an earlier run does not make a current-schema open
+look like a new migration.
+
+After database construction, `MusicVaultWindow` creates one immutable
+`RuntimePolicy` from that startup result and the acceptance no-secret/no-network
+environment controls. A migration-startup process suppresses the automatic
+metadata-intelligence wake and every automatic artist-photo dispatch for its
+remaining lifetime. Acceptance no-secret mode blocks secret-backed provider
+construction before a credential file can be opened; acceptance no-network
+mode blocks optional provider construction before transport creation. These
+states are not saved into config, so the next ordinary non-migration launch can
+resume enabled provider work and persisted jobs without manual reconfiguration.
+
+Provider transports are lazy across Discogs metadata/artwork, MusicBrainz,
+Cover Art Archive, LRCLIB, YouTube synchronization, and the artist-image chain.
+The artist-image service can still resolve an existing valid cached portrait
+without a token or network; a blocked miss is not queued and does not rewrite
+the cache manifest or create negative evidence. Local browsing, playback,
+cached/local lyrics, queue behavior, and Party Mode remain outside this
+optional-external-work gate.
+
+App Status keeps its versioned shape and adds only the aggregate
+`provider_work_deferred` boolean and a safe reason from `migration_startup`,
+`acceptance_no_network`, or `acceptance_no_secrets`. Acceptance tooling captures
+aggregate table/file digests, credential size/timestamp metadata only, a safe
+network-attempt report, and a verified SQLite backup. It never emits library
+identities or credential contents.
 
 ## Portable release and first-run boundary
 
@@ -259,11 +298,13 @@ short debounce with a final close-time flush.
 
 Albums and Artists use lightweight immutable summaries rather than
 materializing every track and constructing a QWidget tree per card. Album
-identity combines trimmed/case-folded album title, album artist with a
-conservative track-artist fallback, and canonical year. Artist identity trims
-and case-folds the complete credit without splitting collaborations or
-guessing canonical people. The same keys drive exact track lookup, preventing
-same-title releases from collapsing merely because their titles match.
+identity prefers Discogs master, MusicBrainz release-group, and accepted
+release-family identity before a conservative base-title, canonical album
+artist, and album-kind fallback. Year, country, format, and `cover_path` do not
+enter the top-level key. Artist identity uses durable entities plus safe aliases
+and verified relationships; it never splits a band by punctuation or merges
+conflicting provider-backed same-name artists. The same canonical keys drive
+exact indexed track lookup.
 
 Summary work runs through a short-lived query-only SQLite connection and is
 applied only while its request token and library revision remain current.
@@ -277,14 +318,18 @@ requests coalesce.
 The committed profiler uses temporary current-schema synthetic databases and no
 network or personal files. A representative post-change run measured:
 
-| Synthetic scale | Albums query | Artists query | Album/artist summaries |
-| --- | ---: | ---: | ---: |
-| 300 tracks | 1.863 ms | 1.413 ms | 100 / 200 |
-| 1,000 tracks | 5.428 ms | 3.795 ms | 300 / 600 |
-| 5,000 tracks | 23.833 ms | 14.274 ms | 1,000 / 2,000 |
+| Synthetic scale | Albums query | Artists query | Review reclassification | Canonical album/artist summaries |
+| --- | ---: | ---: | ---: | ---: |
+| 300 tracks | 10.994 ms | 5.859 ms | 55.956 ms | 100 / 200 |
+| 1,000 tracks | 38.925 ms | 15.460 ms | 180.256 ms | 300 / 600 |
+| 5,000 tracks | 179.610 ms | 66.802 ms | 961.516 ms | 1,000 / 2,000 |
 
 Cached revisits were at most 0.007 ms, the grid created zero per-card QWidgets,
 and only the 25 visible/near-visible entries were considered for artwork.
+Album summaries used four constant SQL statements including schema probes and
+representative-cover selection; artist summaries used three. Canonical album
+membership lookup used its index. Alias, relationship, featured/collaboration,
+group-appearance, and 5,000-item review reclassification shapes were included.
 These measurements are development-machine evidence, not hard timing promises;
 structural profiler failures are gates while timing variance is informational.
 
@@ -331,6 +376,16 @@ using only generated names, fake local candidates, blank credential controls,
 and no-network enforcement. It exercises the real intelligence dashboard and
 structured-credit widget where applicable, records aggregate geometry/privacy
 checks, and deletes captures by default.
+
+`tools/dev/run_batch10_3_review.py` renders ten focused sanitized states from
+the production `MusicVaultWindow` album/artist grid and detail pages and the
+production metadata-intelligence dialog. Fictional rows are isolated in a
+disposable current-schema database. The canonical album, edition,
+artist-section, review-outcome, soundtrack, malformed-artist, and
+portrait-fallback states use 1280×720 and 1920×1080, including one explicit
+150% scale state. Networking and live credential/runtime access are blocked by
+contract; captures are validated for private markers and semantic evidence,
+then deleted by default.
 
 ## Party Mode boundary
 

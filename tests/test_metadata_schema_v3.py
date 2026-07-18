@@ -126,8 +126,8 @@ def test_v2_to_v3_migration_is_additive_backed_up_and_idempotent(tmp_path):
     path = _v2_database(tmp_path / "library.sqlite3")
     backups = tmp_path / "backups"
     db = MusicVaultDB(path, backup_dir=backups)
-    assert CURRENT_SCHEMA_VERSION == 6
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert CURRENT_SCHEMA_VERSION == 7
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
     assert db.last_migration_backup and db.last_migration_backup.is_file()
     with sqlite3.connect(db.last_migration_backup) as backup:
         assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

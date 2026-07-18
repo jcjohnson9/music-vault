@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from music_vault.core.db import MusicVaultDB
+from music_vault.core.runtime_policy import RuntimePolicy, runtime_policy_for
 from music_vault.core.safety import sanitize_error_text
 
 from .artist_credits import ArtistCreditInput, ArtistCreditService
+from .canonical_albums import upsert_track_canonical_album
 from .ensemble import FieldAction, MetadataEnsemble, build_metadata_ensemble
 from .intelligence_schema import MetadataIntelligenceJobStore
 from .intelligence_settings import (
@@ -20,6 +22,7 @@ from .intelligence_settings import (
 )
 from .musicbrainz_enricher import MusicBrainzProvider
 from .providers import ProviderQuery, ProviderReleaseCandidate
+from .review_policy import ReviewOutcome, classify_ensemble_outcome
 from .schema import EDITABLE_METADATA_FIELDS
 from .service import AutomaticMetadataField, MetadataService
 from .tag_writer import MediaBackup, SafeTagWriter, TagWriteError, TagWriteResult
@@ -38,6 +41,8 @@ class IntelligenceRunResult:
     no_match: int
     failed: int
     cancelled: bool = False
+    applied_with_gaps: int = 0
+    source_fallback: int = 0
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,7 @@ class MetadataIntelligenceService:
         musicbrainz_provider_factory: Callable[[], object] | None = None,
         tag_writer: SafeTagWriter | None = None,
         artwork_store_factory: Callable[[str], object] | None = None,
+        runtime_policy: RuntimePolicy | None = None,
     ) -> None:
         self.database = database
         self.db_path = Path(database.db_path).resolve()
@@ -96,6 +102,7 @@ class MetadataIntelligenceService:
         self.musicbrainz_provider_factory = musicbrainz_provider_factory
         self.tag_writer = tag_writer or SafeTagWriter()
         self.artwork_store_factory = artwork_store_factory
+        self.runtime_policy = runtime_policy or runtime_policy_for(database)
 
     def _settings(self) -> dict:
         source = self._config() if callable(self._config) else self._config
@@ -105,6 +112,8 @@ class MetadataIntelligenceService:
         return MusicVaultDB(self.db_path, backup_dir=self.backup_dir)
 
     def _discogs_provider(self, token: str):
+        if not self.runtime_policy.allows_provider_construction(token_backed=True):
+            raise RuntimeError("metadata_provider_work_deferred")
         if self.discogs_provider_factory is not None:
             return self.discogs_provider_factory(token)
         from .providers.discogs import DiscogsProvider
@@ -112,6 +121,8 @@ class MetadataIntelligenceService:
         return DiscogsProvider(token=token)
 
     def _musicbrainz_provider(self):
+        if not self.runtime_policy.allows_provider_construction(token_backed=False):
+            raise RuntimeError("metadata_provider_work_deferred")
         if self.musicbrainz_provider_factory is not None:
             return self.musicbrainz_provider_factory()
         return MusicBrainzProvider()
@@ -164,7 +175,7 @@ class MetadataIntelligenceService:
             return ProviderQuery(**kwargs)
 
     @staticmethod
-    def _current_values(snapshot, track) -> dict[str, object]:
+    def _current_values(snapshot, track, release_context=None) -> dict[str, object]:
         values = {
             name: snapshot.value(name)
             for name in EDITABLE_METADATA_FIELDS
@@ -178,6 +189,16 @@ class MetadataIntelligenceService:
             "musicbrainz_release_id",
         ):
             values[name] = track[name] if name in track.keys() else None
+        context_keys = set(release_context.keys()) if release_context is not None else set()
+        for name in (
+            "musicbrainz_release_group_id",
+            "provider_release_family_id",
+        ):
+            values[name] = (
+                release_context[name]
+                if release_context is not None and name in context_keys
+                else None
+            )
         return values
 
     @staticmethod
@@ -209,21 +230,18 @@ class MetadataIntelligenceService:
 
     @staticmethod
     def _review_reason(ensemble: MetadataEnsemble) -> str | None:
-        if ensemble.provider_disagreement:
-            return "provider_disagreement"
+        critical = {"title", "artist", "artist_credits", "version_type"}
+        if set(ensemble.provider_disagreement) & critical:
+            return "critical_provider_conflict"
         if "version_identity_conflict" in ensemble.reasons:
             return "version_conflict"
         for resolution in ensemble.fields:
             if resolution.action is not FieldAction.REVIEW:
                 continue
-            if resolution.field_name == "album":
-                return "album_ambiguity"
-            if resolution.field_name in {"release_date", "original_release_date"}:
-                return "date_ambiguity"
             if resolution.field_name in {"artist", "artist_credits"}:
                 return "artist_ambiguity"
-        if "youtube_exclusive_fallback" in ensemble.reasons:
-            return "youtube_exclusive"
+            if resolution.field_name == "title":
+                return "title_ambiguity"
         return None
 
     @staticmethod
@@ -252,6 +270,39 @@ class MetadataIntelligenceService:
             for name in names
             if getattr(candidate, name, None) not in (None, "")
         }
+        raw_credits = getattr(candidate, "artist_credits", ()) or ()
+        if isinstance(raw_credits, Sequence) and not isinstance(
+            raw_credits, (str, bytes, bytearray)
+        ):
+            credits: list[dict[str, object]] = []
+            for raw_credit in raw_credits:
+                credit = _as_mapping(raw_credit)
+                display_name = str(
+                    credit.get("name") or credit.get("display_name") or ""
+                ).strip()
+                if not display_name:
+                    continue
+                normalized: dict[str, object] = {
+                    "name": display_name,
+                    "role": str(credit.get("role") or "primary").strip().casefold(),
+                    "join_phrase": str(credit.get("join_phrase") or ""),
+                    "entity_type": str(
+                        credit.get("entity_type") or "unknown"
+                    ).strip().casefold(),
+                }
+                for identity_key in (
+                    "artist_id",
+                    "discogs_artist_id",
+                    "musicbrainz_artist_id",
+                ):
+                    identity = credit.get(identity_key)
+                    if identity not in (None, "") and isinstance(
+                        identity, (str, int)
+                    ) and not isinstance(identity, bool):
+                        normalized[identity_key] = str(identity).strip()
+                credits.append(normalized)
+            if credits:
+                summary["artist_credits"] = credits
         score = getattr(
             candidate,
             "provider_score",
@@ -271,6 +322,8 @@ class MetadataIntelligenceService:
         track_id: int,
         candidate: ProviderReleaseCandidate,
         ensemble: MetadataEnsemble,
+        *,
+        provider_release_family_id: str | None = None,
     ) -> None:
         if candidate.provider_score < 85 or ensemble.provider_disagreement:
             return
@@ -278,14 +331,19 @@ class MetadataIntelligenceService:
         db.conn.execute(
             """
             INSERT INTO track_release_context (
-                track_id, discogs_release_id, discogs_master_id, release_title,
+                track_id, discogs_release_id, discogs_master_id,
+                provider_release_family_id, release_title,
                 release_country, release_format, catalog_number, label_name,
                 release_date, original_release_date, provider_reference,
                 confidence, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_id) DO UPDATE SET
                 discogs_release_id=excluded.discogs_release_id,
                 discogs_master_id=excluded.discogs_master_id,
+                provider_release_family_id=COALESCE(
+                    excluded.provider_release_family_id,
+                    track_release_context.provider_release_family_id
+                ),
                 release_title=excluded.release_title,
                 release_country=excluded.release_country,
                 release_format=excluded.release_format,
@@ -300,6 +358,7 @@ class MetadataIntelligenceService:
                 int(track_id),
                 candidate.release_id,
                 candidate.master_id,
+                provider_release_family_id,
                 candidate.album,
                 candidate.country,
                 candidate.release_format,
@@ -330,6 +389,14 @@ class MetadataIntelligenceService:
             ),
             "recording_group_key": ensemble.recording_group_key,
         }
+        family_resolution = ensemble.field("provider_release_family_id")
+        provider_release_family_id = (
+            str(family_resolution.value).strip()
+            if family_resolution is not None
+            and family_resolution.safe_to_apply
+            and family_resolution.value not in (None, "")
+            else None
+        )
         db.conn.execute(
             """
             UPDATE tracks SET
@@ -342,7 +409,13 @@ class MetadataIntelligenceService:
             """,
             (*values.values(), int(track_id)),
         )
-        self._apply_release_context(db, track_id, candidate, ensemble)
+        self._apply_release_context(
+            db,
+            track_id,
+            candidate,
+            ensemble,
+            provider_release_family_id=provider_release_family_id,
+        )
 
     def _apply_musicbrainz_identity(
         self,
@@ -364,7 +437,19 @@ class MetadataIntelligenceService:
             if "musicbrainz_release_id" in safe_fields
             else None
         )
-        if recording_id in (None, "") and release_id in (None, ""):
+        release_group_resolution = ensemble.field("musicbrainz_release_group_id")
+        release_group_id = (
+            str(release_group_resolution.value).strip()
+            if release_group_resolution is not None
+            and release_group_resolution.safe_to_apply
+            and release_group_resolution.value not in (None, "")
+            else None
+        )
+        if (
+            recording_id in (None, "")
+            and release_id in (None, "")
+            and release_group_id in (None, "")
+        ):
             return
         db.conn.execute(
             """
@@ -376,6 +461,26 @@ class MetadataIntelligenceService:
             """,
             (recording_id, release_id, int(track_id)),
         )
+        if release_group_id not in (None, ""):
+            score = getattr(candidate, "provider_score", getattr(candidate, "score", None))
+            db.conn.execute(
+                """
+                INSERT INTO track_release_context (
+                    track_id,musicbrainz_release_group_id,release_title,
+                    provider_reference,confidence,updated_at
+                ) VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(track_id) DO UPDATE SET
+                    musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(track_id),
+                    release_group_id,
+                    getattr(candidate, "album", None),
+                    getattr(candidate, "provider_reference", None),
+                    float(score) if score is not None else None,
+                ),
+            )
 
     @staticmethod
     def _credit_inputs(candidate: ProviderReleaseCandidate) -> list[ArtistCreditInput]:
@@ -586,7 +691,11 @@ class MetadataIntelligenceService:
             and not discogs_candidates
             and not musicbrainz_candidates
         )
-        current = self._current_values(snapshot, track)
+        release_context = db.conn.execute(
+            "SELECT * FROM track_release_context WHERE track_id=?",
+            (int(item.track_id),),
+        ).fetchone()
+        current = self._current_values(snapshot, track, release_context)
         locked = {
             name for name, field in snapshot.fields.items() if field.is_locked
         }
@@ -739,6 +848,11 @@ class MetadataIntelligenceService:
                         confidence=credits_field.score,
                         commit=False,
                     )
+                # Build the album identity only after both durable release IDs
+                # and accepted structured credits are saved.  A fallback album
+                # must use the new primary credit, never the legacy combined
+                # artist display that the accepted evidence just replaced.
+                upsert_track_canonical_album(db.conn, int(item.track_id))
                 if settings.get("metadata_writeback_enabled") is True and result.changed:
                     file_write_result, committed_tags = self._write_tags(db, item, result)
         except TagWriteError:
@@ -764,25 +878,29 @@ class MetadataIntelligenceService:
                 self._restore_committed_tags(committed_tags)
             raise
 
-        review_reason = self._review_reason(ensemble)
-        if review_reason:
-            state = "review"
-        elif result.changed or any(field.safe_to_apply for field in ensemble.fields):
-            state = "applied"
-        elif youtube_exclusive:
-            state = "review"
-            review_reason = "youtube_exclusive"
-        elif provider_failures and not discogs_candidates and not musicbrainz_candidates:
-            state = "failed"
-            review_reason = "provider_unavailable"
-        else:
-            state = "no_match"
+        parsed_summary = self._parsed_summary(parsed, uploader)
+        decision = classify_ensemble_outcome(
+            ensemble,
+            current=current,
+            parsed_hints=parsed_summary,
+            changed=result.changed,
+            youtube_exclusive=youtube_exclusive,
+            provider_failures=provider_failures,
+            local_duration=(
+                float(track["duration_seconds"])
+                if track["duration_seconds"] is not None
+                else None
+            ),
+        )
+        state = decision.outcome.value
+        review_reason = decision.reason
+        proposals["_review_policy"] = decision.to_dict()
         candidate = ensemble.discogs_candidate
         mb = ensemble.musicbrainz_candidate
         store.mark_item(
             item.id,
             state,
-            parsed_hints=self._parsed_summary(parsed, uploader),
+            parsed_hints=parsed_summary,
             discogs_release_id=(candidate.release_id if candidate else None),
             discogs_master_id=(candidate.master_id if candidate else None),
             musicbrainz_recording_id=(
@@ -798,8 +916,21 @@ class MetadataIntelligenceService:
             applied_history_group=result.change_group_id,
             file_write_result=file_write_result,
             artwork_result=artwork_result,
-            error=(provider_failures[0] if state == "failed" and provider_failures else None),
+            error=(
+                provider_failures[0]
+                if decision.outcome is ReviewOutcome.FAILED and provider_failures
+                else None
+            ),
         )
+        if state in {"applied", "applied_with_gaps"}:
+            # Relationship evidence is already normalized and persisted above.
+            # This importer performs no provider lookup and rejects an invalid
+            # item without creating a partial member-of graph.
+            from .artist_relationships import (
+                import_accepted_saved_artist_relationships,
+            )
+
+            import_accepted_saved_artist_relationships(db, (item.id,))
         return state
 
     def _run_job(
@@ -811,7 +942,8 @@ class MetadataIntelligenceService:
     ) -> IntelligenceRunResult:
         store = MetadataIntelligenceJobStore(db)
         settings = self._settings()
-        processed = applied = review = no_match = failed = 0
+        processed = applied = applied_with_gaps = source_fallback = 0
+        review = no_match = failed = 0
         cancelled = False
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -831,12 +963,22 @@ class MetadataIntelligenceService:
                     error=sanitize_error_text(exc),
                 )
             processed += 1
-            applied += int(state == "applied")
+            applied += int(state in {"applied", "applied_with_gaps"})
+            applied_with_gaps += int(state == "applied_with_gaps")
+            source_fallback += int(state == "source_fallback")
             review += int(state == "review")
             no_match += int(state == "no_match")
             failed += int(state == "failed")
         return IntelligenceRunResult(
-            job_id, processed, applied, review, no_match, failed, cancelled
+            job_id,
+            processed,
+            applied,
+            review,
+            no_match,
+            failed,
+            cancelled,
+            applied_with_gaps,
+            source_fallback,
         )
 
     def process_automatic_queue(
@@ -847,6 +989,8 @@ class MetadataIntelligenceService:
     ) -> IntelligenceRunResult:
         if str(job_id) != AUTOMATIC_IMPORT_JOB_ID:
             raise ValueError("automatic_metadata_job_id_invalid")
+        if not self.runtime_policy.background_provider_work_allowed:
+            return IntelligenceRunResult(job_id, 0, 0, 0, 0, 0)
         if not self._settings()["metadata_intelligence_enabled"]:
             return IntelligenceRunResult(None, 0, 0, 0, 0, 0)
         db = self._worker_database()
@@ -871,6 +1015,8 @@ class MetadataIntelligenceService:
         job_id: str | None = None,
         cancel_event: threading.Event | None = None,
     ) -> IntelligenceRunResult:
+        if not self.runtime_policy.background_provider_work_allowed:
+            raise RuntimeError("metadata_provider_work_deferred")
         if not self._settings()["metadata_intelligence_enabled"]:
             raise RuntimeError("metadata_intelligence_disabled")
         db = self._worker_database()
@@ -974,6 +1120,8 @@ class MetadataIntelligenceService:
         return result
 
     def resume_job(self, job_id: str) -> None:
+        if not self.runtime_policy.background_provider_work_allowed:
+            raise RuntimeError("metadata_provider_work_deferred")
         store = MetadataIntelligenceJobStore(self.database)
         try:
             store.resume(job_id)

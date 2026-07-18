@@ -26,6 +26,40 @@ def normalize_identity(value: object) -> str:
     return " ".join(normalized.split()).casefold()
 
 
+_UNTRUSTED_ARTIST_PROVENANCE_EXACT = frozenset({"youtube"})
+_UNTRUSTED_ARTIST_PROVENANCE_MARKERS = (
+    "uploader",
+    "label",
+    "distributor",
+    "release_company",
+)
+
+
+def artist_credit_is_browser_visible(
+    provenance: object,
+    is_manual: object = False,
+    is_locked: object = False,
+) -> bool:
+    """Return whether stored artist evidence may create a performer card.
+
+    A raw YouTube import records its channel/label display as provenance
+    ``youtube``.  That is useful source metadata, but it is not accepted
+    performer identity.  Accepted title parsing, provider evidence, embedded
+    tags, and manual/locked corrections use distinct provenance and remain
+    visible.  Keeping this decision provenance-based avoids guessing from
+    channel-name suffixes and preserves the truly blank Unknown Artist card.
+    """
+
+    if bool(is_manual) or bool(is_locked):
+        return True
+    normalized = str(provenance or "").strip().casefold()
+    if normalized in _UNTRUSTED_ARTIST_PROVENANCE_EXACT:
+        return False
+    return not any(
+        marker in normalized for marker in _UNTRUSTED_ARTIST_PROVENANCE_MARKERS
+    )
+
+
 def _stable_browser_key(kind: str, parts: Sequence[str]) -> str:
     payload = json.dumps(
         [kind, *parts],
@@ -40,9 +74,14 @@ class AlbumKey:
     title_key: str
     artist_key: str
     year_key: str = ""
+    canonical_album_id: int | None = None
 
     @property
     def browser_key(self) -> str:
+        if self.canonical_album_id is not None:
+            return _stable_browser_key(
+                "album", ("canonical_album_id", str(self.canonical_album_id))
+            )
         return _stable_browser_key(
             "album",
             (self.title_key, self.artist_key, self.year_key),
@@ -73,6 +112,8 @@ class AlbumSummary:
     canonical_year: str | None
     track_count: int
     representative_cover_path: str | None
+    edition_count: int = 1
+    album_kind: str = "unknown"
 
     @property
     def browser_key(self) -> str:
@@ -91,6 +132,7 @@ class ArtistSummary:
     image_state: str = "not_cached"
     featured_track_count: int = 0
     collaboration_track_count: int = 0
+    group_appearance_track_count: int = 0
     entity_type: str = "unknown"
 
     @property
@@ -119,6 +161,10 @@ class ArtistSummary:
     def collaboration_count(self) -> int:
         return self.collaboration_track_count
 
+    @property
+    def group_appearance_count(self) -> int:
+        return self.group_appearance_track_count
+
 
 @dataclass(frozen=True, slots=True)
 class ArtistTrackSections:
@@ -127,6 +173,7 @@ class ArtistTrackSections:
     tracks: tuple[sqlite3.Row, ...] = ()
     featured_on: tuple[sqlite3.Row, ...] = ()
     collaborations: tuple[sqlite3.Row, ...] = ()
+    group_appearances: tuple[sqlite3.Row, ...] = ()
 
     @property
     def primary_tracks(self) -> tuple[sqlite3.Row, ...]:
@@ -140,6 +187,10 @@ class ArtistTrackSections:
     def collaboration_tracks(self) -> tuple[sqlite3.Row, ...]:
         return self.collaborations
 
+    @property
+    def group_tracks(self) -> tuple[sqlite3.Row, ...]:
+        return self.group_appearances
+
 
 @dataclass(frozen=True, slots=True)
 class BrowserRevision:
@@ -151,6 +202,13 @@ class BrowserRevision:
     artist_credit_count: int = 0
     max_artist_updated_at: str = ""
     max_artist_credit_updated_at: str = ""
+    artist_alias_count: int = 0
+    artist_relationship_count: int = 0
+    max_artist_relationship_updated_at: str = ""
+    canonical_album_count: int = 0
+    album_membership_count: int = 0
+    max_canonical_album_updated_at: str = ""
+    max_album_membership_updated_at: str = ""
 
 
 class BrowserKind(str, Enum):
@@ -166,6 +224,7 @@ class BrowserInvalidationReason(str, Enum):
     ARTWORK_REFRESH = "artwork_refresh"
     FUTURE_METADATA = "future_metadata"
     ARTIST_IMAGE_CACHE = "artist_image_cache"
+    CANONICAL_CONSOLIDATION = "canonical_consolidation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +256,13 @@ _TRACK_SELECT = """
     id, title, artist, album, album_artist, year, path, cover_path,
     duration_seconds, created_at, source_kind, source_video_id,
     source_upload_date
+"""
+
+_QUALIFIED_TRACK_SELECT = """
+    tracks.id, tracks.title, tracks.artist, tracks.album, tracks.album_artist,
+    tracks.year, tracks.path, tracks.cover_path, tracks.duration_seconds,
+    tracks.created_at, tracks.source_kind, tracks.source_video_id,
+    tracks.source_upload_date
 """
 
 _ALBUM_SUMMARY_SQL = """
@@ -255,6 +321,52 @@ ORDER BY
     year_key
 """
 
+_UNMAPPED_ALBUM_SUMMARY_SQL = _ALBUM_SUMMARY_SQL.replace(
+    "    FROM tracks\n",
+    """    FROM tracks
+    WHERE NOT EXISTS (
+        SELECT 1 FROM track_album_memberships membership
+        WHERE membership.track_id=tracks.id
+    )
+""",
+    1,
+)
+
+_CANONICAL_ALBUM_SUMMARY_SQL = """
+SELECT
+    album.id AS canonical_album_id,
+    album.canonical_key,
+    album.normalized_title AS title_key,
+    album.normalized_album_artist AS artist_key,
+    album.title AS album_title,
+    album.album_artist_display AS album_artist,
+    CASE
+        WHEN album.original_release_date GLOB '[0-9][0-9][0-9][0-9]*'
+        THEN SUBSTR(album.original_release_date, 1, 4)
+    END AS canonical_year,
+    album.album_kind,
+    COUNT(DISTINCT membership.track_id) AS track_count,
+    COUNT(DISTINCT COALESCE(
+        NULLIF(TRIM(membership.discogs_release_id), ''),
+        CASE
+            WHEN NULLIF(TRIM(membership.edition_label), '') IS NOT NULL
+              OR NULLIF(TRIM(membership.edition_release_date), '') IS NOT NULL
+            THEN COALESCE(NULLIF(TRIM(membership.edition_label), ''), '')
+                 || char(31) ||
+                 COALESCE(
+                     NULLIF(TRIM(membership.edition_release_date), ''),
+                     ''
+                 )
+        END,
+        'base'
+    )) AS edition_count
+FROM canonical_albums AS album
+JOIN track_album_memberships AS membership
+  ON membership.canonical_album_id=album.id
+GROUP BY album.id
+ORDER BY album.normalized_title, album.normalized_album_artist, album.id
+"""
+
 _LEGACY_ARTIST_SUMMARY_SQL = """
 WITH normalized AS (
     SELECT
@@ -299,6 +411,10 @@ WITH structured_credits AS (
     FROM artists AS a
     JOIN track_artist_credits AS tac ON tac.artist_id = a.id
     WHERE tac.role IN ('primary', 'featured', 'collaborator')
+      AND mv_is_various_artists(a.display_name) = 0
+      AND mv_artist_credit_visible(
+          tac.provenance, tac.is_manual, tac.is_locked
+      ) = 1
 ),
 legacy_fallback AS (
     SELECT
@@ -313,11 +429,19 @@ legacy_fallback AS (
         1 AS source_rank,
         'legacy:' || mv_normalize_identity(t.artist) AS identity_key
     FROM tracks AS t
+    LEFT JOIN track_metadata_fields AS artist_field
+      ON artist_field.track_id=t.id AND artist_field.field_name='artist'
     WHERE NOT EXISTS (
         SELECT 1
         FROM track_artist_credits AS existing_credit
         WHERE existing_credit.track_id = t.id
     )
+      AND mv_is_various_artists(t.artist) = 0
+      AND mv_artist_credit_visible(
+          artist_field.provenance,
+          COALESCE(artist_field.is_manual, 0),
+          COALESCE(artist_field.is_locked, 0)
+      ) = 1
 ),
 combined AS (
     SELECT * FROM structured_credits
@@ -360,6 +484,124 @@ ORDER BY
     identity_key
 """
 
+_ARTIST_SUMMARY_V7_SQL = """
+WITH structured_credits AS (
+    SELECT
+        a.id AS artist_id,
+        a.display_name,
+        a.normalized_name AS normalized_key,
+        a.entity_type,
+        a.discogs_artist_id,
+        a.musicbrainz_artist_id,
+        tac.track_id,
+        tac.role,
+        0 AS source_rank,
+        'artist:' || CAST(a.id AS TEXT) AS identity_key
+    FROM artists AS a
+    JOIN track_artist_credits AS tac ON tac.artist_id = a.id
+    WHERE tac.role IN ('primary', 'featured', 'collaborator')
+      AND mv_is_various_artists(a.display_name) = 0
+      AND mv_artist_credit_visible(
+          tac.provenance, tac.is_manual, tac.is_locked
+      ) = 1
+),
+group_credits AS (
+    SELECT
+        member.id AS artist_id,
+        member.display_name,
+        member.normalized_name AS normalized_key,
+        member.entity_type,
+        member.discogs_artist_id,
+        member.musicbrainz_artist_id,
+        group_credit.track_id,
+        'group_appearance' AS role,
+        0 AS source_rank,
+        'artist:' || CAST(member.id AS TEXT) AS identity_key
+    FROM artist_relationships AS relation
+    JOIN artists AS member ON member.id=relation.subject_artist_id
+    JOIN track_artist_credits AS group_credit
+      ON group_credit.artist_id=relation.related_artist_id
+     AND group_credit.role='primary'
+    WHERE relation.relationship_kind='member_of'
+      AND mv_is_various_artists(member.display_name) = 0
+      AND mv_artist_credit_visible(
+          group_credit.provenance,
+          group_credit.is_manual,
+          group_credit.is_locked
+      ) = 1
+),
+legacy_fallback AS (
+    SELECT
+        NULL AS artist_id,
+        COALESCE(NULLIF(TRIM(t.artist), ''), 'Unknown Artist') AS display_name,
+        mv_normalize_identity(t.artist) AS normalized_key,
+        'unknown' AS entity_type,
+        NULL AS discogs_artist_id,
+        NULL AS musicbrainz_artist_id,
+        t.id AS track_id,
+        'primary' AS role,
+        1 AS source_rank,
+        'legacy:' || mv_normalize_identity(t.artist) AS identity_key
+    FROM tracks AS t
+    LEFT JOIN track_metadata_fields AS artist_field
+      ON artist_field.track_id=t.id AND artist_field.field_name='artist'
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM track_artist_credits AS existing_credit
+        WHERE existing_credit.track_id = t.id
+    )
+      AND mv_is_various_artists(t.artist) = 0
+      AND mv_artist_credit_visible(
+          artist_field.provenance,
+          COALESCE(artist_field.is_manual, 0),
+          COALESCE(artist_field.is_locked, 0)
+      ) = 1
+),
+combined AS (
+    SELECT * FROM structured_credits
+    UNION ALL
+    SELECT * FROM group_credits
+    UNION ALL
+    SELECT * FROM legacy_fallback
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY identity_key
+            ORDER BY
+                source_rank,
+                CASE WHEN artist_id IS NULL THEN 1 ELSE 0 END,
+                artist_id,
+                track_id
+        ) AS identity_rank
+    FROM combined
+)
+SELECT
+    identity_key,
+    MAX(CASE WHEN identity_rank = 1 THEN artist_id END) AS artist_id,
+    MAX(CASE WHEN identity_rank = 1 THEN normalized_key END) AS normalized_key,
+    MAX(CASE WHEN identity_rank = 1 THEN display_name END) AS display_name,
+    MAX(CASE WHEN identity_rank = 1 THEN entity_type END) AS entity_type,
+    MAX(CASE WHEN identity_rank = 1 THEN discogs_artist_id END)
+        AS discogs_artist_id,
+    MAX(CASE WHEN identity_rank = 1 THEN musicbrainz_artist_id END)
+        AS musicbrainz_artist_id,
+    COUNT(DISTINCT CASE WHEN role = 'primary' THEN track_id END) AS track_count,
+    COUNT(DISTINCT CASE WHEN role = 'featured' THEN track_id END)
+        AS featured_track_count,
+    COUNT(DISTINCT CASE WHEN role = 'collaborator' THEN track_id END)
+        AS collaboration_track_count,
+    COUNT(DISTINCT CASE WHEN role = 'group_appearance' THEN track_id END)
+        AS group_appearance_track_count
+FROM ranked
+GROUP BY identity_key
+ORDER BY
+    CASE WHEN normalized_key = '' THEN 1 ELSE 0 END,
+    normalized_key,
+    identity_key
+"""
+
 _ARTIST_TRACKS_V6_SQL = """
 WITH resolved_artist AS (
     SELECT id
@@ -381,10 +623,15 @@ structured_tracks AS (
     FROM resolved_artist AS a
     JOIN track_artist_credits AS tac ON tac.artist_id = a.id
     WHERE tac.role IN ('primary', 'featured', 'collaborator')
+      AND mv_artist_credit_visible(
+          tac.provenance, tac.is_manual, tac.is_locked
+      ) = 1
 ),
 legacy_fallback AS (
     SELECT t.id AS track_id, 'primary' AS role
     FROM tracks AS t
+    LEFT JOIN track_metadata_fields AS artist_field
+      ON artist_field.track_id=t.id AND artist_field.field_name='artist'
     WHERE ? IS NULL
       AND mv_normalize_identity(t.artist) = ?
       AND NOT EXISTS (
@@ -392,6 +639,11 @@ legacy_fallback AS (
           FROM track_artist_credits AS existing_credit
           WHERE existing_credit.track_id = t.id
       )
+      AND mv_artist_credit_visible(
+          artist_field.provenance,
+          COALESCE(artist_field.is_manual, 0),
+          COALESCE(artist_field.is_locked, 0)
+      ) = 1
 ),
 artist_tracks AS (
     SELECT track_id, role FROM structured_tracks
@@ -417,13 +669,119 @@ ORDER BY
     t.id
 """
 
+_ARTIST_TRACKS_V7_SQL = """
+WITH resolved_artist AS (
+    SELECT id
+    FROM artists
+    WHERE ? = 1
+      AND ((? IS NOT NULL AND id = ?)
+       OR (? IS NULL AND normalized_name = ?))
+    ORDER BY
+        CASE
+            WHEN NULLIF(TRIM(discogs_artist_id), '') IS NULL
+             AND NULLIF(TRIM(musicbrainz_artist_id), '') IS NULL
+            THEN 0 ELSE 1
+        END,
+        id
+    LIMIT 1
+),
+structured_tracks AS (
+    SELECT tac.track_id, tac.role
+    FROM resolved_artist AS a
+    JOIN track_artist_credits AS tac ON tac.artist_id = a.id
+    WHERE tac.role IN ('primary', 'featured', 'collaborator')
+      AND mv_artist_credit_visible(
+          tac.provenance, tac.is_manual, tac.is_locked
+      ) = 1
+),
+group_tracks AS (
+    SELECT group_credit.track_id, 'group_appearance' AS role
+    FROM resolved_artist AS a
+    JOIN artist_relationships AS relation
+      ON relation.subject_artist_id=a.id
+     AND relation.relationship_kind='member_of'
+    JOIN track_artist_credits AS group_credit
+      ON group_credit.artist_id=relation.related_artist_id
+     AND group_credit.role='primary'
+    WHERE mv_artist_credit_visible(
+        group_credit.provenance,
+        group_credit.is_manual,
+        group_credit.is_locked
+    ) = 1
+),
+legacy_fallback AS (
+    SELECT t.id AS track_id, 'primary' AS role
+    FROM tracks AS t
+    LEFT JOIN track_metadata_fields AS artist_field
+      ON artist_field.track_id=t.id AND artist_field.field_name='artist'
+    WHERE ? IS NULL
+      AND mv_normalize_identity(t.artist) = ?
+      AND NOT EXISTS (
+          SELECT 1
+          FROM track_artist_credits AS existing_credit
+          WHERE existing_credit.track_id = t.id
+      )
+      AND mv_is_various_artists(t.artist) = 0
+      AND mv_artist_credit_visible(
+          artist_field.provenance,
+          COALESCE(artist_field.is_manual, 0),
+          COALESCE(artist_field.is_locked, 0)
+      ) = 1
+),
+artist_tracks AS (
+    SELECT track_id, role FROM structured_tracks
+    UNION
+    SELECT track_id, role FROM group_tracks
+    UNION
+    SELECT track_id, role FROM legacy_fallback
+)
+SELECT
+    t.id, t.title, t.artist, t.album, t.album_artist, t.year, t.path,
+    t.cover_path, t.duration_seconds, t.created_at, t.source_kind,
+    t.source_video_id, t.source_upload_date,
+    artist_tracks.role AS artist_browser_role
+FROM artist_tracks
+JOIN tracks AS t ON t.id = artist_tracks.track_id
+ORDER BY
+    CASE artist_tracks.role
+        WHEN 'primary' THEN 0
+        WHEN 'featured' THEN 1
+        WHEN 'collaborator' THEN 2
+        WHEN 'group_appearance' THEN 3
+        ELSE 4
+    END,
+    t.album COLLATE NOCASE,
+    t.title COLLATE NOCASE,
+    t.id
+"""
+
 
 def configure_browser_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    from music_vault.metadata.soundtrack import is_various_artists
+
     conn.row_factory = sqlite3.Row
     conn.create_function(
         "mv_normalize_identity",
         1,
         normalize_identity,
+        deterministic=True,
+    )
+    conn.create_function(
+        "mv_is_various_artists",
+        1,
+        lambda value: int(is_various_artists(value)),
+        deterministic=True,
+    )
+    conn.create_function(
+        "mv_artist_credit_visible",
+        3,
+        lambda provenance, is_manual, is_locked: int(
+            artist_credit_is_browser_visible(
+                provenance,
+                is_manual,
+                is_locked,
+            )
+        ),
         deterministic=True,
     )
     return conn
@@ -439,6 +797,40 @@ def _has_structured_artist_schema(conn: sqlite3.Connection) -> bool:
         """
     ).fetchall()
     return {str(row[0]) for row in rows} == {"artists", "track_artist_credits"}
+
+
+def _has_canonical_artist_schema(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name IN (
+              'artists', 'track_artist_credits',
+              'artist_aliases', 'artist_relationships'
+          )
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows} == {
+        "artists",
+        "track_artist_credits",
+        "artist_aliases",
+        "artist_relationships",
+    }
+
+
+def _has_canonical_album_schema(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type='table'
+          AND name IN ('canonical_albums', 'track_album_memberships')
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows} == {
+        "canonical_albums",
+        "track_album_memberships",
+    }
 
 
 @contextmanager
@@ -478,6 +870,13 @@ def browser_revision(conn: sqlite3.Connection) -> BrowserRevision:
     artist_credit_count = 0
     max_artist_updated_at = ""
     max_artist_credit_updated_at = ""
+    artist_alias_count = 0
+    artist_relationship_count = 0
+    max_artist_relationship_updated_at = ""
+    canonical_album_count = 0
+    album_membership_count = 0
+    max_canonical_album_updated_at = ""
+    max_album_membership_updated_at = ""
     if _has_structured_artist_schema(conn):
         artist_row = conn.execute(
             """
@@ -501,6 +900,48 @@ def browser_revision(conn: sqlite3.Connection) -> BrowserRevision:
         max_artist_credit_updated_at = str(
             credit_row["max_artist_credit_updated_at"]
         )
+        if _has_canonical_artist_schema(conn):
+            alias_row = conn.execute(
+                "SELECT COUNT(*) AS alias_count FROM artist_aliases"
+            ).fetchone()
+            relationship_columns = {
+                str(item[1])
+                for item in conn.execute("PRAGMA table_info('artist_relationships')")
+            }
+            updated_expression = (
+                "COALESCE(MAX(updated_at), '')"
+                if "updated_at" in relationship_columns
+                else "COALESCE(MAX(created_at), '')"
+            )
+            relationship_row = conn.execute(
+                "SELECT COUNT(*) AS relationship_count, "
+                + updated_expression
+                + " AS max_relationship_updated_at FROM artist_relationships"
+            ).fetchone()
+            artist_alias_count = int(alias_row["alias_count"])
+            artist_relationship_count = int(relationship_row["relationship_count"])
+            max_artist_relationship_updated_at = str(
+                relationship_row["max_relationship_updated_at"]
+            )
+    if _has_canonical_album_schema(conn):
+        canonical_row = conn.execute(
+            """
+            SELECT COUNT(*) AS album_count,
+                   COALESCE(MAX(updated_at), '') AS max_updated_at
+            FROM canonical_albums
+            """
+        ).fetchone()
+        membership_row = conn.execute(
+            """
+            SELECT COUNT(*) AS membership_count,
+                   COALESCE(MAX(updated_at), '') AS max_updated_at
+            FROM track_album_memberships
+            """
+        ).fetchone()
+        canonical_album_count = int(canonical_row["album_count"])
+        album_membership_count = int(membership_row["membership_count"])
+        max_canonical_album_updated_at = str(canonical_row["max_updated_at"])
+        max_album_membership_updated_at = str(membership_row["max_updated_at"])
     return BrowserRevision(
         track_count=int(row["track_count"]),
         max_track_id=int(row["max_track_id"]),
@@ -510,13 +951,55 @@ def browser_revision(conn: sqlite3.Connection) -> BrowserRevision:
         artist_credit_count=artist_credit_count,
         max_artist_updated_at=max_artist_updated_at,
         max_artist_credit_updated_at=max_artist_credit_updated_at,
+        artist_alias_count=artist_alias_count,
+        artist_relationship_count=artist_relationship_count,
+        max_artist_relationship_updated_at=max_artist_relationship_updated_at,
+        canonical_album_count=canonical_album_count,
+        album_membership_count=album_membership_count,
+        max_canonical_album_updated_at=max_canonical_album_updated_at,
+        max_album_membership_updated_at=max_album_membership_updated_at,
     )
 
 
 def query_album_summaries(conn: sqlite3.Connection) -> tuple[AlbumSummary, ...]:
     configure_browser_connection(conn)
-    rows = conn.execute(_ALBUM_SUMMARY_SQL).fetchall()
-    return tuple(
+    canonical = _has_canonical_album_schema(conn)
+    canonical_rows = (
+        conn.execute(_CANONICAL_ALBUM_SUMMARY_SQL).fetchall() if canonical else ()
+    )
+    legacy_rows = conn.execute(
+        _UNMAPPED_ALBUM_SUMMARY_SQL if canonical else _ALBUM_SUMMARY_SQL
+    ).fetchall()
+    covers: Mapping[int, str] = {}
+    if canonical:
+        from music_vault.metadata.canonical_albums import representative_album_covers
+
+        covers = representative_album_covers(
+            conn, (int(row["canonical_album_id"]) for row in canonical_rows)
+        )
+    summaries: list[AlbumSummary] = [
+        AlbumSummary(
+            key=AlbumKey(
+                title_key=str(row["title_key"]),
+                artist_key=str(row["artist_key"]),
+                year_key=str(row["canonical_year"] or ""),
+                canonical_album_id=int(row["canonical_album_id"]),
+            ),
+            album_title=str(row["album_title"]),
+            album_artist=str(row["album_artist"]),
+            canonical_year=(
+                str(row["canonical_year"])
+                if row["canonical_year"] is not None
+                else None
+            ),
+            track_count=int(row["track_count"]),
+            representative_cover_path=covers.get(int(row["canonical_album_id"])),
+            edition_count=int(row["edition_count"]),
+            album_kind=str(row["album_kind"]),
+        )
+        for row in canonical_rows
+    ]
+    summaries.extend(
         AlbumSummary(
             key=AlbumKey(
                 title_key=str(row["title_key"]),
@@ -535,8 +1018,9 @@ def query_album_summaries(conn: sqlite3.Connection) -> tuple[AlbumSummary, ...]:
                 str(row["cover_path"]) if row["cover_path"] is not None else None
             ),
         )
-        for row in rows
+        for row in legacy_rows
     )
+    return tuple(sorted(summaries, key=lambda item: item.sort_value))
 
 
 def query_artist_summaries(
@@ -546,8 +1030,11 @@ def query_artist_summaries(
 ) -> tuple[ArtistSummary, ...]:
     configure_browser_connection(conn)
     structured = _has_structured_artist_schema(conn)
+    canonical = structured and _has_canonical_artist_schema(conn)
     rows = conn.execute(
-        _ARTIST_SUMMARY_V6_SQL if structured else _LEGACY_ARTIST_SUMMARY_SQL
+        _ARTIST_SUMMARY_V7_SQL
+        if canonical
+        else (_ARTIST_SUMMARY_V6_SQL if structured else _LEGACY_ARTIST_SUMMARY_SQL)
     ).fetchall()
     states = image_states or {}
     summaries: list[ArtistSummary] = []
@@ -613,6 +1100,11 @@ def query_artist_summaries(
                 collaboration_track_count=(
                     int(row["collaboration_track_count"]) if structured else 0
                 ),
+                group_appearance_track_count=(
+                    int(row["group_appearance_track_count"])
+                    if canonical
+                    else 0
+                ),
                 entity_type=(str(row["entity_type"]) if structured else "unknown"),
             )
         )
@@ -624,6 +1116,24 @@ def query_album_tracks(
     key: AlbumKey,
 ) -> tuple[sqlite3.Row, ...]:
     configure_browser_connection(conn)
+    if key.canonical_album_id is not None and _has_canonical_album_schema(conn):
+        return tuple(
+            conn.execute(
+                f"""
+                SELECT {_QUALIFIED_TRACK_SELECT}
+                FROM track_album_memberships membership
+                JOIN tracks ON tracks.id=membership.track_id
+                WHERE membership.canonical_album_id=?
+                ORDER BY
+                    COALESCE(membership.disc_number, 1),
+                    membership.track_position COLLATE NOCASE,
+                    tracks.artist COLLATE NOCASE,
+                    tracks.title COLLATE NOCASE,
+                    tracks.id
+                """,
+                (key.canonical_album_id,),
+            ).fetchall()
+        )
     return tuple(
         conn.execute(
             f"""
@@ -667,8 +1177,9 @@ def _query_artist_track_sections_v6(
     conn: sqlite3.Connection,
     key: ArtistKey,
 ) -> ArtistTrackSections:
+    canonical = _has_canonical_artist_schema(conn)
     rows = conn.execute(
-        _ARTIST_TRACKS_V6_SQL,
+        _ARTIST_TRACKS_V7_SQL if canonical else _ARTIST_TRACKS_V6_SQL,
         (
             int(not key.identity_key.startswith("legacy:")),
             key.artist_id,
@@ -683,6 +1194,7 @@ def _query_artist_track_sections_v6(
         "primary": [],
         "featured": [],
         "collaborator": [],
+        "group_appearance": [],
     }
     for row in rows:
         role = str(row["artist_browser_role"])
@@ -692,6 +1204,7 @@ def _query_artist_track_sections_v6(
         tracks=tuple(by_role["primary"]),
         featured_on=tuple(by_role["featured"]),
         collaborations=tuple(by_role["collaborator"]),
+        group_appearances=tuple(by_role["group_appearance"]),
     )
 
 
@@ -760,6 +1273,7 @@ def invalidation_plan(
         BrowserInvalidationReason.YOUTUBE_IMPORT,
         BrowserInvalidationReason.METADATA_ENRICHMENT,
         BrowserInvalidationReason.FUTURE_METADATA,
+        BrowserInvalidationReason.CANONICAL_CONSOLIDATION,
     }:
         return BrowserInvalidationPlan(True, True, True, False)
     if reason is BrowserInvalidationReason.REMOVE_MISSING:

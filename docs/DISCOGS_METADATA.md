@@ -105,6 +105,20 @@ in **Featured On** for the featured artist. It is not counted as a primary
 release for that featured artist. Collaborations remain independently
 filterable without altering playback or playlist context.
 
+Schema version 7 adds safe aliases and verified relationships around these
+credits. Provider-backed case/spacing/presentation variants can share one
+canonical artist card, but conflicting provider IDs and unrelated same-name
+artists remain separate. A verified `member_of` relationship creates **Group
+Appearances** without presenting a group recording as the member's solo track.
+Labels, distributors, uploaders, and `Various Artists` release context remain
+excluded from performer cards.
+
+Strong stored credit/version evidence can repair an old entity such as `Artist
+Live at Venue`: the canonical artist receives the credit, `Live` becomes
+`version_type`, and `Live at Venue` becomes `version_label`. The live media
+remains separate and no studio album/date is fabricated. Full-credit strings
+are split only from structured provider roles, never punctuation alone.
+
 ## Original date, version date, and version identity
 
 `release_date` describes the specific effective release/version and drives the
@@ -121,6 +135,14 @@ nightcore, mashup, re-recording, soundtrack, YouTube-exclusive, and unknown
 versions remain distinct tracks/media. `recording_group_key` can relate them
 without deduplication, deletion, or source-membership changes.
 
+Discogs master identity is also the strongest canonical album-family key.
+Releases under one master may contribute edition labels and dates to one
+top-level card; each track still retains its own release ID, fields, and
+`cover_path`. Without master evidence, Music Vault uses a conservative
+release-group/family or base-title + canonical album artist + album-kind key.
+Live albums, scores, soundtracks, cast recordings, remix albums, compilations,
+EPs, and singles remain distinct.
+
 ## New imports and the existing library
 
 After consent, a newly imported canonical track is queued once after its normal
@@ -136,12 +158,34 @@ repeated, no-match preserves current metadata, and aggregate counts reconcile.
 The dashboard filters high-confidence apply, needs review, provider/version/
 album/date/artist ambiguity, YouTube-exclusive, no-match, and failed outcomes.
 
+Schema-v7 outcome tuning keeps only critical title/artist/structured-credit/
+version/duration/provider conflicts in **Needs Review**. Missing album, exact
+edition, year, artwork, label, or catalogue number becomes **Applied with
+Gaps** when identity is safe. Strong source-title identity with no critical
+conflict can become **Accepted Source Fallback**. Existing items can be
+reclassified offline from saved normalized evidence without another provider
+query.
+
+Soundtrack-aware classification can accept a strong song and performer while
+leaving exact soundtrack edition or year as a gap. Soundtrack, score, cast,
+game/film/television context, and sequel entries remain distinct; `Various
+Artists` remains album context rather than an artist entity.
+
 Saving a token or synchronizing a source does not silently start a full-library
 scan. After the user enables the feature and grants consent, Music Vault may
 resume already-approved work or process canonical new-import items at launch.
 The initial existing-library scan remains an explicit Settings choice. Source
 playlist definitions, occurrences, origins, order, and media identity are
 outside the metadata job and remain unchanged.
+
+Provider construction is lazy. Starting Music Vault does not by itself read
+the Discogs token or construct a Discogs client. If the current process
+actually migrated the database, all optional provider work and the zero-delay
+metadata-intelligence wake are deferred for that process; queued jobs remain
+persisted and resumable on the next ordinary non-migration launch. Acceptance
+no-secret mode returns before token-file content is read, and acceptance
+no-network mode returns before a transport is created. Neither control rewrites
+the user's consent or provider settings.
 
 ## Safe text-tag writeback
 
@@ -177,6 +221,13 @@ Discogs catalogue text is provided under CC0. Discogs image content has
 separate restricted handling and must not be treated as CC0, republished as a
 project asset, or used as Music Vault branding.
 
+Canonical album grouping does not propagate a selected cover. A browser card
+may display the best existing valid cover among its member tracks, but no
+track's artwork path is copied, replaced, standardized, deleted, or embedded.
+Missing canonical artist portraits may use a high-confidence Discogs artist
+image before the existing strict Wikimedia chain, only after user opt-in;
+album artwork is never substituted as an artist portrait.
+
 ## Networking, rate limits, cache, and privacy
 
 Provider requests are sequential/bounded, cancellable, rate-aware, and use
@@ -185,6 +236,12 @@ public-address validation, disabled environment proxy inheritance, response
 structure validation, and sanitized errors. Music Vault honors provider rate
 headers and backs off rather than issuing an unbounded request queue. It does
 not inspect browser cookies.
+
+The centralized runtime policy is checked before provider factories and lazy
+transport sessions. Migration-startup, acceptance no-network, and applicable
+no-secret deferral therefore create no provider failure item, negative cache,
+or provider timestamp merely because work was ineligible in that process.
+App Status reports only the aggregate deferred flag and safe reason.
 
 Raw Discogs search/release/master/artist responses are held only in a private
 in-memory duplicate-suppression cache for no more than six hours; they are not

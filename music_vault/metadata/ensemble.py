@@ -107,8 +107,10 @@ _FIELD_ATTRS = {
     "discogs_release_id": "release_id",
     "discogs_master_id": "master_id",
     "discogs_track_position": "track_position",
+    "provider_release_family_id": "release_family_id",
     "musicbrainz_recording_id": "recording_id",
     "musicbrainz_release_id": "release_id",
+    "musicbrainz_release_group_id": "release_group_id",
     "artwork": "artwork",
 }
 _FIELD_ORDER = tuple(_FIELD_ATTRS)

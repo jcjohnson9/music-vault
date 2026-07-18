@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Aggregate-only gate for the explicitly authorized schema-5 to schema-6 run.
+"""Aggregate-only gate for schema-5 data migrating through the current schema.
 
 The baseline mode uses SQLite immutable read-only access and never constructs
 ``MusicVaultDB``.  This tool does not launch the application, access provider
@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from music_vault.core.sync_schema import required_sync_indexes  # noqa: E402
+from music_vault.core.db import CURRENT_SCHEMA_VERSION  # noqa: E402
 from music_vault.metadata.artist_credits import normalize_artist_name  # noqa: E402
 from music_vault.metadata.intelligence_schema import (  # noqa: E402
     required_intelligence_indexes,
@@ -35,7 +36,7 @@ from tools.dev import verify_batch10_live_migration as batch10_gate  # noqa: E40
 
 
 EXPECTED_PRE_SCHEMA = 5
-EXPECTED_POST_SCHEMA = 6
+EXPECTED_POST_SCHEMA = CURRENT_SCHEMA_VERSION
 BASELINE_FORMAT_VERSION = 2
 ACKNOWLEDGEMENT = "batch10.1-live-schema-5-to-6"
 
@@ -116,6 +117,8 @@ SAFE_STATUS_TOP_LEVEL = frozenset(
         "metadata_intelligence_applied",
         "metadata_intelligence_review_count",
         "discogs_ready",
+        "provider_work_deferred",
+        "provider_work_defer_reason",
         "paths",
     }
 )
@@ -815,7 +818,8 @@ def verify_migration(
         path
         for path in new_backups
         if re.fullmatch(
-            r"music_vault_pre_schema_v6_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.sqlite3",
+            rf"music_vault_pre_schema_v{EXPECTED_POST_SCHEMA}_"
+            r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.sqlite3",
             path.name,
         )
     ]
@@ -828,7 +832,9 @@ def verify_migration(
     )
 
     checks = {
-        "schema_is_6": int(current["database"]["schema_version"]) == EXPECTED_POST_SCHEMA,
+        "schema_is_current": (
+            int(current["database"]["schema_version"]) == EXPECTED_POST_SCHEMA
+        ),
         "all_preexisting_table_rows_and_values_preserved": all(preserved.values()),
         "tracks_preserved": preserved["tracks"],
         "playlists_preserved": preserved["playlists"],

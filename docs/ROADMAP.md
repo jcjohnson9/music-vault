@@ -217,7 +217,62 @@ quality implementation.
 
 **Status:** Complete on the v1.1.0 development line after schema, provider,
 privacy, automated regression, packaged synthetic, controlled migration, and
-delivery gates. Stable remains v1.0.0; Batch 11 remains next.
+delivery gates. Stable remains v1.0.0.
+
+## Batch 10.2 — Schema-6 Preservation Correction
+
+**Objective:** Preserve source-identity timestamps and prove the schema-5 to
+schema-6 transition without restoring or rewriting the live library.
+
+**Scope:** Make identical source mappings true no-ops, retain timestamp changes
+for genuine canonical remaps, correct field/artist preservation verification,
+and provide disposable migration proof plus a narrow timestamp-only live
+repair with verified rollback backups.
+
+**Non-goals:** No provider lookup, metadata remediation, media/tag change,
+source-membership change, sync change, or public release.
+
+**Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0.
+
+## Batch 10.3 — Canonical Media Browser and Review Tuning
+
+**Objective:** Present one safe canonical album/artist identity, preserve
+edition and credit roles, reduce manual review to critical uncertainty, and
+make Spacebar Play/Pause work safely across ordinary application pages.
+
+**Scope:** Schema-v7 canonical albums/memberships, artist aliases and verified
+relationships, transactional safe consolidation, version-as-artist repair,
+canonical Albums/Artists queries, private portrait fallback, **Tracks**,
+**Featured On**, **Collaborations**, and **Group Appearances**, field-level
+review outcomes, soundtrack policy, stored-evidence reclassification, and
+guarded Spacebar control.
+
+**Non-goals:** No track/media merge or deletion, artwork standardization,
+speculative artist/group relationship, provider request during migration,
+YouTube sync change, quality policy, tag rewrite, tag/release, or Batch 11 work.
+
+**Status:** Complete on the v1.1.0 development line after schema-v7 migration,
+consolidation, preservation, packaged UI, visual/performance, regression,
+publication-safety, and Batch 10.4 quiescence acceptance gates. Stable remains
+v1.0.0; Batch 11 remains next.
+
+## Batch 10.4 — Migration-Startup Quiescence and Post-Hoc Acceptance Recovery
+
+**Objective:** Keep database migration and optional external provider work in
+separate startup phases, then accept the retained schema-v7 library and private
+artist-photo cache through aggregate-only preservation checks.
+
+**Scope:** Process-local migration state, centralized no-secret/no-network and
+migration-startup policy, lazy provider construction, deferred background
+provider work, read-only cache validation, packaged two-launch proof, and one
+controlled quiescent live startup with a verified schema-v7 rollback backup.
+
+**Non-goals:** No repeat migration or restore, provider lookup during controlled
+acceptance, cache deletion, sync, remediation, playback change, media/tag write,
+new tag, or public release.
+
+**Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0;
+Batch 11 remains next.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original
 

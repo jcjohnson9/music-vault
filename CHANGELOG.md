@@ -7,6 +7,20 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Added
 
+- Added schema-v7 canonical albums and track memberships, edition metadata,
+  artist aliases, verified artist relationships, and durable indexes without
+  changing track rows, artwork paths, media files, source memberships, or
+  metadata history.
+- Added canonical artist-page sections for **Tracks**, **Featured On**,
+  **Collaborations**, and verified **Group Appearances**, plus a private
+  Discogs-to-Wikimedia portrait fallback for missing canonical portraits.
+- Added field-level **Applied with Gaps** and **Accepted Source Fallback**
+  outcomes, offline stored-evidence reclassification, soundtrack-aware
+  acceptance, and guarded application-wide Spacebar Play/Pause.
+- Added explicit process-local database startup state and a centralized runtime
+  policy for migration-startup, acceptance no-network, and acceptance
+  no-secret decisions.
+
 - Added schema-v6 structured artist entities/credits, release and label
   context, original-versus-version dates, normalized version identity, and
   resumable metadata-intelligence jobs without changing canonical track or
@@ -46,6 +60,21 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Changed
 
+- Album cards now use canonical master/release-family identity so ordinary
+  reissues, deluxe editions, years, formats, countries, and alternate covers do
+  not duplicate top-level albums. Representative artwork is browser-only and
+  never standardizes or replaces a track's `cover_path`.
+- Artist cards now use canonical entities and safe aliases. Conflicting
+  provider identities remain separate; labels, uploaders, and `Various
+  Artists` release context remain excluded from performer cards.
+- Review is now reserved for critical title/artist/credit/version/duration or
+  provider conflicts. Missing album, year, artwork, label, catalogue number,
+  or exact soundtrack edition is recorded as a secondary gap.
+- Optional provider clients and transports are now constructed lazily. A
+  process that performs a schema migration defers metadata-intelligence,
+  artist-photo, online-lyrics, and other optional provider work until the next
+  ordinary launch without changing saved provider settings or queued jobs.
+
 - Artist browsing now uses structured primary/featured/collaborator roles while
   preserving legacy display strings, bands/groups as single entities, and a
   distinct Featured On view.
@@ -63,6 +92,15 @@ Notable changes to Music Vault are documented here. The format follows
   membership and local playlist order.
 
 ### Security and privacy
+
+- Kept canonical album/artist identifiers, aliases, relationships, review
+  evidence, portrait cache content, and provider references in private runtime
+  storage. App Status remains aggregate-only, and the synthetic UI/performance
+  evidence blocks networking and deletes temporary captures/databases.
+- Acceptance no-secret mode now fails before YouTube API-key or Discogs-token
+  content reads, and no-network mode fails before optional provider transport
+  construction. App Status exports only a deferred boolean and one stable safe
+  reason; it exports no credential, query, identity, or provider item.
 
 - Kept the Discogs token in an ignored local secret file and out of config,
   App Status, logs, reports, manifests, packages, and source control. Raw

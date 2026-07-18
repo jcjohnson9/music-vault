@@ -330,7 +330,7 @@ def profile_case(root: Path, *, name: str, track_count: int) -> dict[str, object
         }
         metrics.update(_production_provider_guards())
         checks = {
-            "schema_is_6": schema == CURRENT_SCHEMA_VERSION == 6,
+            "schema_is_current": schema == CURRENT_SCHEMA_VERSION,
             "integrity_ok": integrity == "ok",
             "one_item_per_canonical_track": (
                 int(item_stats["item_count"]) == track_count

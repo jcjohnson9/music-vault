@@ -346,6 +346,101 @@ class FakeProviderTransport:
         return validate_image_payload(synthetic_png(), "image/png")
 
 
+class FakeCanonicalFallbackTransport:
+    def __init__(self, mode="wikidata"):
+        self.mode = mode
+        self.calls = []
+
+    def get_json(self, url, *, params=None):
+        parameters = dict(params or {})
+        self.calls.append(("json", url, parameters))
+        if url == f"https://musicbrainz.org/ws/2/artist/{ARTIST_ID_ONE}":
+            return {"id": ARTIST_ID_ONE, "name": "Canonical Artist", "relations": []}
+        if url == "https://musicbrainz.org/ws/2/artist/":
+            raise AssertionError("validated MBID must bypass MusicBrainz name search")
+        if url == "https://www.wikidata.org/w/api.php":
+            action = parameters.get("action")
+            if action == "wbsearchentities":
+                if self.mode == "wikipedia":
+                    return {"search": []}
+                return {
+                    "search": [
+                        {"id": "Q43", "label": "Canonical Artist Ensemble"},
+                        {"id": "Q42", "label": "Canonical Artist"},
+                    ]
+                }
+            if action == "wbgetentities":
+                provider_id = (
+                    ARTIST_ID_TWO if self.mode == "provider_conflict" else ARTIST_ID_ONE
+                )
+                claims = {
+                    "P434": [
+                        {
+                            "mainsnak": {
+                                "datavalue": {"value": provider_id}
+                            }
+                        }
+                    ]
+                }
+                if self.mode != "wikipedia":
+                    claims["P18"] = [
+                        {
+                            "mainsnak": {
+                                "datavalue": {"value": "Canonical Portrait.png"}
+                            }
+                        }
+                    ]
+                return {
+                    "entities": {
+                        "Q42": {
+                            "claims": claims,
+                            "sitelinks": {
+                                "enwiki": {"title": "Canonical Artist"}
+                            },
+                        }
+                    }
+                }
+        if url == "https://en.wikipedia.org/w/api.php":
+            assert self.mode == "wikipedia"
+            return {
+                "query": {
+                    "pages": [
+                        {
+                            "title": "Canonical Artist",
+                            "pageprops": {"wikibase_item": "Q42"},
+                            "thumbnail": {
+                                "source": "https://upload.wikimedia.org/canonical.png"
+                            },
+                            "fullurl": "https://en.wikipedia.org/wiki/Canonical_Artist",
+                        }
+                    ]
+                }
+            }
+        if url == "https://commons.wikimedia.org/w/api.php":
+            return {
+                "query": {
+                    "pages": [
+                        {
+                            "imageinfo": [
+                                {
+                                    "thumburl": "https://upload.wikimedia.org/canonical.png",
+                                    "descriptionurl": (
+                                        "https://commons.wikimedia.org/wiki/"
+                                        "File:Canonical_Portrait.png"
+                                    ),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        raise AssertionError((url, parameters))
+
+    def get_image(self, url):
+        self.calls.append(("image", url, {}))
+        return validate_image_payload(synthetic_png("Canonical Artist"), "image/png")
+
+
 def test_production_provider_resolves_only_high_confidence_identity():
     transport = FakeProviderTransport()
     provider = MusicBrainzWikimediaProvider(transport)  # type: ignore[arg-type]
@@ -357,6 +452,80 @@ def test_production_provider_resolves_only_high_confidence_identity():
     assert result.image_provider == "Wikimedia Commons"
     assert result.image_bytes
     assert is_safe_artist_source_url(result.source_page_url)
+
+
+def test_production_provider_uses_validated_musicbrainz_id_without_name_search():
+    transport = FakeProviderTransport()
+    provider = MusicBrainzWikimediaProvider(transport)  # type: ignore[arg-type]
+    provider._musicbrainz_rate.minimum_interval_seconds = 0
+    identity = ArtistIdentity.from_display_name(
+        "Exact Artist", musicbrainz_artist_id=ARTIST_ID_ONE
+    )
+    result = provider.resolve(identity)
+    assert result.status is ArtistImageStatus.RESOLVED
+    assert result.musicbrainz_artist_id == ARTIST_ID_ONE
+    musicbrainz_urls = [
+        url for kind, url, _params in transport.calls if kind == "json" and "musicbrainz.org" in url
+    ]
+    assert musicbrainz_urls == [
+        f"https://musicbrainz.org/ws/2/artist/{ARTIST_ID_ONE}"
+    ]
+
+
+def test_strict_direct_wikidata_fallback_uses_exact_label_and_provider_id():
+    transport = FakeCanonicalFallbackTransport()
+    provider = MusicBrainzWikimediaProvider(transport)  # type: ignore[arg-type]
+    provider._musicbrainz_rate.minimum_interval_seconds = 0
+    identity = ArtistIdentity.from_display_name(
+        "Canonical Artist", musicbrainz_artist_id=ARTIST_ID_ONE
+    )
+    result = provider.resolve(identity)
+    assert result.status is ArtistImageStatus.RESOLVED
+    assert result.musicbrainz_artist_id == ARTIST_ID_ONE
+    search_call = next(
+        call for call in transport.calls if call[2].get("action") == "wbsearchentities"
+    )
+    assert search_call[2]["search"] == "Canonical Artist"
+    entity_call = next(
+        call for call in transport.calls if call[2].get("action") == "wbgetentities"
+    )
+    assert entity_call[2]["ids"] == "Q42"
+    assert any(call[0] == "image" for call in transport.calls)
+
+
+def test_strict_direct_wikipedia_fallback_verifies_exact_page_provider_identity():
+    transport = FakeCanonicalFallbackTransport("wikipedia")
+    provider = MusicBrainzWikimediaProvider(transport)  # type: ignore[arg-type]
+    provider._musicbrainz_rate.minimum_interval_seconds = 0
+    result = provider.resolve(
+        ArtistIdentity.from_display_name(
+            "Canonical Artist", musicbrainz_artist_id=ARTIST_ID_ONE
+        )
+    )
+    assert result.status is ArtistImageStatus.RESOLVED
+    wikipedia_call = next(
+        call for call in transport.calls if "en.wikipedia.org" in call[1]
+    )
+    assert wikipedia_call[2]["titles"] == "Canonical Artist"
+    assert "pageprops" in wikipedia_call[2]["prop"]
+    assert any(
+        call[2].get("action") == "wbgetentities" and call[2].get("ids") == "Q42"
+        for call in transport.calls
+    )
+
+
+def test_strict_direct_fallback_rejects_conflicting_provider_identity():
+    transport = FakeCanonicalFallbackTransport("provider_conflict")
+    provider = MusicBrainzWikimediaProvider(transport)  # type: ignore[arg-type]
+    provider._musicbrainz_rate.minimum_interval_seconds = 0
+    result = provider.resolve(
+        ArtistIdentity.from_display_name(
+            "Canonical Artist", musicbrainz_artist_id=ARTIST_ID_ONE
+        )
+    )
+    assert result.status is ArtistImageStatus.NO_MATCH
+    assert not any(call[0] == "image" for call in transport.calls)
+    assert not any("en.wikipedia.org" in call[1] for call in transport.calls)
 
 
 def test_production_provider_rejects_ambiguous_without_image_requests():

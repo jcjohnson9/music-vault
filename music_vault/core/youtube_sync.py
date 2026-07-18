@@ -13,6 +13,7 @@ import yt_dlp
 
 from .ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
 from .paths import youtube_api_key_path
+from .runtime_policy import runtime_policy_for
 from .safety import (
     extract_source_video_id,
     normalize_source_upload_date,
@@ -100,6 +101,11 @@ class AuthorizedYouTubePlaylistSyncer:
         config: YouTubeSyncConfig,
         progress: Optional[ProgressCallback] = None,
     ) -> None:
+        policy = runtime_policy_for()
+        if not policy.network_allowed:
+            raise RuntimeError("youtube_sync_deferred_acceptance_no_network")
+        if not policy.secrets_allowed:
+            raise RuntimeError("youtube_sync_deferred_acceptance_no_secrets")
         self.config = config
         self.progress = progress or (lambda message: None)
         self._ffmpeg_discovery: FFmpegDiscoveryResult | None = None
@@ -119,6 +125,8 @@ class AuthorizedYouTubePlaylistSyncer:
         return playlist_id
 
     def _api_key(self) -> str:
+        if not runtime_policy_for().secrets_allowed:
+            raise RuntimeError("YouTube synchronization is unavailable in no-secret mode.")
         key_path = youtube_api_key_path()
         if not key_path.exists():
             raise RuntimeError("The YouTube Data API key file is missing.")

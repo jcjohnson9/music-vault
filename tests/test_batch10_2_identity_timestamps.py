@@ -183,7 +183,7 @@ def test_current_schema_reopen_keeps_identity_mapping_and_timestamps(tmp_path):
     db.close()
 
     reopened = MusicVaultDB(path)
-    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 6
+    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 7
     assert tuple(_identity_row(reopened)) == before
     assert reopened.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert reopened.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

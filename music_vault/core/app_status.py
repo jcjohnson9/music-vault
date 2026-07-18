@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +19,7 @@ from .paths import (
     youtube_api_key_path,
 )
 from .safety import sanitize_error_text
+from .runtime_policy import runtime_policy_for
 
 
 SCHEMA_VERSION = 1
@@ -54,6 +54,31 @@ MULTI_SOURCE_SYNC_FIELDS = (
     "last_sync_batch_item_failure_count",
 )
 SYNC_FIELDS = LEGACY_SYNC_FIELDS + OPTIONAL_SYNC_FIELDS + MULTI_SOURCE_SYNC_FIELDS
+PLAYBACK_FIELDS = (
+    "currently_playing",
+    "current_title",
+    "current_artist",
+    "current_album",
+    "is_playing",
+    "shuffle_enabled",
+    "autoplay_enabled",
+    "repeat_mode",
+    "queue_count",
+)
+PLAYBACK_IDENTITY_FIELDS = (
+    "currently_playing",
+    "current_title",
+    "current_artist",
+    "current_album",
+)
+PRIVATE_PATH_FIELDS = (
+    "project_root",
+    "data_dir",
+    "database",
+    "downloads",
+    "config",
+    "status_file",
+)
 
 
 def _utc_now() -> str:
@@ -77,7 +102,7 @@ def _missing_track_count(db) -> int:
 
 
 def _api_ready() -> bool:
-    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+    if not runtime_policy_for().secrets_allowed:
         return False
     try:
         return bool(youtube_api_key_path().read_text(encoding="utf-8", errors="ignore").strip())
@@ -85,14 +110,17 @@ def _api_ready() -> bool:
         return False
 
 
-def _discogs_ready() -> bool:
-    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+def _discogs_ready(db=None) -> bool:
+    policy = runtime_policy_for(db)
+    if policy.startup_provider_work_deferred:
         return False
     try:
-        # Read only enough local state to report readiness. The value is never
-        # returned, logged, or included in App Status.
-        return bool(discogs_token_path().read_text(encoding="utf-8", errors="ignore").strip())
-    except Exception:
+        path = discogs_token_path()
+        # Readiness/status must never open the credential.  A non-empty stored
+        # file is sufficient; actual provider dispatch reads and validates the
+        # value under the runtime policy.
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
         return False
 
 
@@ -113,7 +141,7 @@ def _metadata_intelligence_summary(db, config) -> dict:
         "metadata_intelligence_analyzed": 0,
         "metadata_intelligence_applied": 0,
         "metadata_intelligence_review_count": 0,
-        "discogs_ready": _discogs_ready(),
+        "discogs_ready": _discogs_ready(db),
     }
     try:
         job = db.conn.execute(
@@ -172,7 +200,17 @@ def _merge_section(payload: dict, section: str, values) -> None:
     if isinstance(values, dict) and isinstance(payload.get(section), dict):
         if section == "sync":
             values = _sanitize_sync_values(values)
+        elif section == "playback":
+            values = _sanitize_playback_values(values)
         payload[section].update(values)
+
+
+def _sanitize_playback_values(values: dict) -> dict:
+    """Retain aggregate playback state while suppressing track identity."""
+    sanitized = {key: value for key, value in values.items() if key in PLAYBACK_FIELDS}
+    for field in PLAYBACK_IDENTITY_FIELDS:
+        sanitized[field] = None
+    return sanitized
 
 
 def _sanitize_sync_values(values: dict) -> dict:
@@ -211,6 +249,7 @@ def write_app_status(db, config, extra=None) -> Path:
     ) or default_downloads_dir()
     api_ready = _api_ready()
     ffmpeg_ready = _ffmpeg_ready(config)
+    runtime_policy = runtime_policy_for(db)
 
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -255,6 +294,7 @@ def write_app_status(db, config, extra=None) -> Path:
         ),
         "lyrics_available": False,
         "lyrics_synchronized": False,
+        **runtime_policy.status_fields(),
         **_metadata_intelligence_summary(db, config),
         "paths": {
             "project_root": str(root),
@@ -283,9 +323,17 @@ def write_app_status(db, config, extra=None) -> Path:
             "metadata_intelligence_applied",
             "metadata_intelligence_review_count",
             "discogs_ready",
+            "provider_work_deferred",
+            "provider_work_defer_reason",
         ):
             if field in extra:
                 payload[field] = extra[field]
+
+    # Keep the established paths object and key names for compatibility, but
+    # never publish personal filesystem locations. This final enforcement is
+    # intentionally after all optional merging so callers cannot override it.
+    for field in PRIVATE_PATH_FIELDS:
+        payload["paths"][field] = None
 
     resolved_data_dir.mkdir(parents=True, exist_ok=True)
     temporary = status_file.with_name(f"{status_file.name}.tmp")

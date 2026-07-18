@@ -80,7 +80,9 @@ def test_album_summaries_group_by_full_identity_and_use_canonical_year(
         album="Shared Title",
         year="2001",
     )
-    second_cover = str(tmp_path / "cover-second.png")
+    second_cover_path = tmp_path / "cover-second.png"
+    second_cover_path.write_bytes(b"synthetic-cover")
+    second_cover = str(second_cover_path)
     second = _add_track(
         browser_db,
         tmp_path,
@@ -99,7 +101,7 @@ def test_album_summaries_group_by_full_identity_and_use_canonical_year(
         album="Shared Title",
         year="2001",
     )
-    _add_track(
+    fourth = _add_track(
         browser_db,
         tmp_path,
         "fourth",
@@ -119,13 +121,13 @@ def test_album_summaries_group_by_full_identity_and_use_canonical_year(
     summaries = query_album_summaries(browser_db.conn)
     shared = [summary for summary in summaries if summary.key.title_key == "shared title"]
 
-    assert len(shared) == 3
+    assert len(shared) == 2
     grouped = next(
         summary
         for summary in shared
-        if summary.key.artist_key == "artist a" and summary.key.year_key == "2001"
+        if summary.key.artist_key == "artist a"
     )
-    assert grouped.track_count == 2
+    assert grouped.track_count == 3
     assert grouped.album_title == "Shared Title"
     assert grouped.album_artist == "Artist A"
     assert grouped.canonical_year == "2001"
@@ -133,6 +135,7 @@ def test_album_summaries_group_by_full_identity_and_use_canonical_year(
     assert {row["id"] for row in load_album_tracks(browser_db.db_path, grouped.key)} == {
         first,
         second,
+        fourth,
     }
 
     upload_summary = next(
@@ -140,6 +143,39 @@ def test_album_summaries_group_by_full_identity_and_use_canonical_year(
     )
     assert upload_summary.canonical_year is None
     assert upload_summary.key.year_key == ""
+
+
+def test_canonical_album_edition_count_includes_date_only_reissues(
+    browser_db: MusicVaultDB,
+    tmp_path: Path,
+):
+    original = _add_track(
+        browser_db,
+        tmp_path,
+        "original-edition",
+        artist="Artist",
+        album="Record",
+        album_artist="Artist",
+    )
+    reissue = _add_track(
+        browser_db,
+        tmp_path,
+        "date-only-reissue",
+        artist="Artist",
+        album="Record",
+        album_artist="Artist",
+    )
+    browser_db.update_track_metadata(original, release_date="1990")
+    browser_db.update_track_metadata(reissue, release_date="2020")
+
+    summaries = [
+        summary
+        for summary in query_album_summaries(browser_db.conn)
+        if summary.album_title == "Record"
+    ]
+    assert len(summaries) == 1
+    assert summaries[0].track_count == 2
+    assert summaries[0].edition_count == 2
 
 
 def test_missing_album_identity_does_not_collide_with_literal_unknown_album(
@@ -165,6 +201,7 @@ def test_album_cover_selection_is_lowest_track_id_with_nonblank_cover(
 ):
     _add_track(browser_db, tmp_path, "one", artist="Artist", album="Album")
     expected = str(tmp_path / "first-cover.png")
+    Path(expected).write_bytes(b"first-cover")
     _add_track(
         browser_db,
         tmp_path,
@@ -242,9 +279,13 @@ def test_keys_are_stable_and_artist_image_state_can_be_overlaid(
     album = query_album_summaries(browser_db.conn)[0]
     artist = query_artist_summaries(browser_db.conn)[0]
 
-    assert album.key == AlbumKey("album", "artist", "1999")
-    assert album.browser_key == AlbumKey("album", "artist", "1999").browser_key
-    assert album.browser_key != AlbumKey("album", "artist", "2000").browser_key
+    assert album.key == AlbumKey("album", "artist", "1999", album.key.canonical_album_id)
+    assert album.browser_key == AlbumKey(
+        "album", "artist", "1999", album.key.canonical_album_id
+    ).browser_key
+    assert album.browser_key == AlbumKey(
+        "different", "display", "2000", album.key.canonical_album_id
+    ).browser_key
     assert artist.key == ArtistKey("artist")
 
     overlaid = query_artist_summaries(

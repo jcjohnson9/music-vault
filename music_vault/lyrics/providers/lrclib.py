@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 
+from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.version import APP_NAME, APP_VERSION, PROJECT_URL
 
 from ..models import (
@@ -121,9 +122,18 @@ class SafeLyricsTransport:
         session: requests.Session | None = None,
         resolver: Callable[..., Sequence[Any]] = socket.getaddrinfo,
     ) -> None:
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.session = session
+        if self.session is not None:
+            self.session.trust_env = False
         self.resolver = resolver
+
+    def _network_session(self) -> requests.Session:
+        if not runtime_policy_for().allows_provider_construction(token_backed=False):
+            raise LyricsUnavailableError("provider_work_deferred")
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        return self.session
 
     @staticmethod
     def _read_limited(response: Any) -> bytes:
@@ -157,13 +167,14 @@ class SafeLyricsTransport:
             "User-Agent": LRCLIB_USER_AGENT,
             "Accept": "application/json",
         }
-        prepared = self.session.prepare_request(requests.Request("GET", url, params=params, headers=headers))
+        session = self._network_session()
+        prepared = session.prepare_request(requests.Request("GET", url, params=params, headers=headers))
         current_url = str(prepared.url)
         for redirect_count in range(MAX_REDIRECTS + 1):
             current_url = validate_lrclib_url(current_url, resolver=self.resolver)
             prepared.url = current_url
             try:
-                response = self.session.send(
+                response = session.send(
                     prepared,
                     allow_redirects=False,
                     stream=True,
@@ -180,7 +191,7 @@ class SafeLyricsTransport:
                 if not location or redirect_count >= MAX_REDIRECTS:
                     raise LyricsUnavailableError("redirect_rejected")
                 current_url = urljoin(current_url, location)
-                prepared = self.session.prepare_request(requests.Request("GET", current_url, headers=headers))
+                prepared = session.prepare_request(requests.Request("GET", current_url, headers=headers))
                 continue
             if response.status_code == 404 and allow_not_found:
                 response.close()

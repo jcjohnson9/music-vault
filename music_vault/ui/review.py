@@ -74,6 +74,8 @@ METADATA_REVIEW_SCENES = (
 
 METADATA_INTELLIGENCE_REVIEW_SCENES = ("metadata_intelligence_smoke",)
 
+BATCH10_3_REVIEW_SCENES = ("batch10_3_smoke",)
+
 REMEDIATION_REVIEW_SCENES = (
     "remediation_empty",
     "remediation_analyzing",
@@ -138,6 +140,7 @@ SCENE_LABELS = {
     "metadata_long_values": "Metadata • Long Values",
     "metadata_currently_playing": "Metadata • Currently Playing",
     "metadata_intelligence_smoke": "Automatic Metadata Intelligence - Packaged Smoke",
+    "batch10_3_smoke": "Canonical Media Browser - Packaged Synthetic Smoke",
     "remediation_empty": "Remediation - Empty",
     "remediation_analyzing": "Remediation - Analyzing",
     "remediation_paused": "Remediation - Paused",
@@ -374,6 +377,16 @@ class ReviewNetworkAccessBlocked(RuntimeError):
     """Raised before explicitly reviewed Python code can access the network."""
 
 
+def _review_no_network_enabled() -> bool:
+    return any(
+        os.environ.get(name, "").strip() == "1"
+        for name in (
+            "MUSIC_VAULT_ACCEPTANCE_NO_NETWORK",
+            "MUSIC_VAULT_DISABLE_NETWORK",
+        )
+    )
+
+
 class _SyntheticReviewLyricsProvider:
     """Bounded provider used only by the isolated packaged Party Mode review."""
 
@@ -425,8 +438,8 @@ def _install_review_network_guard() -> None:
 
     if _REVIEW_NETWORK_GUARD_INSTALLED:
         return
-    if os.environ.get("MUSIC_VAULT_DISABLE_NETWORK", "").strip() != "1":
-        raise ReviewPlanError("Party Mode review requires the no-network guard.")
+    if not _review_no_network_enabled():
+        raise ReviewPlanError("Synthetic UI review requires the no-network guard.")
 
     guarded_events = {
         "socket.connect",
@@ -1385,6 +1398,7 @@ def validate_metadata_intelligence_review_behaviors(
 ) -> dict[str, object]:
     """Run representative Batch 10.1 behavior inside the isolated app process."""
 
+    from music_vault.core.runtime_policy import RuntimePolicy
     from music_vault.metadata.intelligence import MetadataIntelligenceService
     from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
 
@@ -1392,8 +1406,15 @@ def validate_metadata_intelligence_review_behaviors(
         raise ReviewPlanError("Metadata-intelligence review requires no-secret mode.")
     database_path = Path(str(window.db.db_path)).resolve()
     _ensure_under_runtime(database_path, plan.runtime_root, "intelligence database")
-    if int(window.db.conn.execute("PRAGMA user_version").fetchone()[0]) != 6:
-        raise ReviewPlanError("Metadata-intelligence review requires schema 6.")
+    from music_vault.core.db import CURRENT_SCHEMA_VERSION
+
+    if (
+        int(window.db.conn.execute("PRAGMA user_version").fetchone()[0])
+        != CURRENT_SCHEMA_VERSION
+    ):
+        raise ReviewPlanError(
+            "Metadata-intelligence review requires the current database schema."
+        )
     api_key = plan.runtime_root / "data" / "youtube_api_key.txt"
     discogs_token = plan.runtime_root / "data" / "discogs_token.txt"
     if api_key.exists() or discogs_token.exists():
@@ -1509,6 +1530,10 @@ def validate_metadata_intelligence_review_behaviors(
         musicbrainz_provider_factory=lambda: musicbrainz,
         tag_writer=tag_writer,
         artwork_store_factory=lambda _token: artwork_store,
+        # This isolated review injects only bounded synthetic providers. Keep
+        # the process-wide no-secret guard intact while allowing the explicit
+        # fake-provider matrix to exercise the orchestration path.
+        runtime_policy=RuntimePolicy(),
     )
     result = service.analyze_existing_library()
     rows = {key: window.db.get_track(track_id) for key, track_id in track_ids.items()}
@@ -1638,15 +1663,18 @@ def validate_metadata_intelligence_review_behaviors(
     )
     evidence: dict[str, object] = {
         "packaged_process": bool(getattr(sys, "frozen", False)),
-        "schema_6": True,
+            "schema_current": (
+                int(window.db.conn.execute("PRAGMA user_version").fetchone()[0])
+                == CURRENT_SCHEMA_VERSION
+            ),
         "exact_random_uploader_corrected": exact_corrected,
         "label_excluded_from_artist_credits": label_credit_count == 0,
         "group_and_featured_credits_structured": group_and_featured,
         "studio_live_tracks_remain_separate": studio_live_preserved,
         "unofficial_live_year_blank_original_date_separate": studio_live_preserved,
         "provider_conflict_requires_review": conflict_state == "review",
-        "youtube_exclusive_fallback_reviewed": (
-            exclusive_state == "review"
+        "youtube_exclusive_source_fallback": (
+            exclusive_state == "source_fallback"
             and rows["exclusive"]["version_type"] == "youtube_exclusive"
         ),
         "source_memberships_preserved": memberships_after == memberships_before,
@@ -1669,14 +1697,14 @@ def validate_metadata_intelligence_review_behaviors(
         "processed_count": result.processed,
     }
     required = (
-        "schema_6",
+            "schema_current",
         "exact_random_uploader_corrected",
         "label_excluded_from_artist_credits",
         "group_and_featured_credits_structured",
         "studio_live_tracks_remain_separate",
         "unofficial_live_year_blank_original_date_separate",
         "provider_conflict_requires_review",
-        "youtube_exclusive_fallback_reviewed",
+        "youtube_exclusive_source_fallback",
         "source_memberships_preserved",
         "network_guard_active",
         "no_secret_files",
@@ -3112,6 +3140,420 @@ def validate_batch10_multi_source_behaviors(
     return behaviors
 
 
+def validate_batch10_3_review_behaviors(
+    window: object,
+    plan: ReviewPlan,
+) -> dict[str, object]:
+    """Exercise Batch 10.3 through production queries, handlers, and widgets.
+
+    The schema-6 fixture is migrated before this hook runs.  This validator is
+    deliberately read-only apart from the application's normal aggregate App
+    Status write. Under the no-secret/no-network review policy, portrait
+    provider construction remains lazy and deferred; the separate Batch 10.4
+    second-launch smoke proves synthetic-provider resumption. Returned evidence
+    contains only booleans and counts.
+    """
+
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() != "1":
+        raise ReviewPlanError("Batch 10.3 smoke requires no-secret mode.")
+    if not _review_no_network_enabled():
+        raise ReviewPlanError("Batch 10.3 smoke requires the no-network guard.")
+    if not _REVIEW_NETWORK_GUARD_INSTALLED:
+        raise ReviewPlanError("Batch 10.3 smoke network guard is not installed.")
+    data_root = plan.runtime_root / "data"
+    for name in ("youtube_api_key.txt", "discogs_token.txt"):
+        if (data_root / name).exists():
+            raise ReviewPlanError("Batch 10.3 smoke found a credential file.")
+
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtMultimedia import QMediaPlayer
+    from PySide6.QtWidgets import QApplication, QAbstractButton, QLineEdit
+
+    from music_vault.app import should_handle_global_play_pause
+    from music_vault.core.db import CURRENT_SCHEMA_VERSION
+    from music_vault.core.library_browser import (
+        ArtistSummary,
+        query_album_summaries,
+        query_album_tracks,
+        query_artist_summaries,
+        query_artist_track_sections,
+    )
+    from music_vault.ui.metadata_intelligence import MetadataIntelligenceDialog
+
+    db = window.db
+    schema_version = int(db.conn.execute("PRAGMA user_version").fetchone()[0])
+    if schema_version != CURRENT_SCHEMA_VERSION:
+        raise ReviewPlanError("Batch 10.3 smoke requires the current schema.")
+
+    playback_before = _batch10_playback_snapshot(window)
+    media_players_before = tuple(window.findChildren(QMediaPlayer))
+
+    album_summaries = query_album_summaries(db.conn)
+    edition_cards = tuple(
+        summary
+        for summary in album_summaries
+        if summary.key.canonical_album_id is not None
+        and summary.edition_count >= 2
+        and summary.track_count >= 2
+    )
+    soundtracks = tuple(
+        summary
+        for summary in album_summaries
+        if summary.key.canonical_album_id is not None
+        and summary.album_kind == "soundtrack"
+    )
+    scores = tuple(
+        summary
+        for summary in album_summaries
+        if summary.key.canonical_album_id is not None
+        and summary.album_kind == "score"
+    )
+    soundtrack_ids = {
+        int(summary.key.canonical_album_id)
+        for summary in (*soundtracks, *scores)
+        if summary.key.canonical_album_id is not None
+    }
+    canonical_album_grouping = bool(
+        edition_cards
+        and len(query_album_tracks(db.conn, edition_cards[0].key))
+        == edition_cards[0].track_count
+    )
+
+    target_row = db.conn.execute(
+        "SELECT id FROM artists WHERE discogs_artist_id='91001'"
+    ).fetchone()
+    group_row = db.conn.execute(
+        "SELECT id FROM artists WHERE discogs_artist_id='91002'"
+    ).fetchone()
+    if target_row is None or group_row is None:
+        raise ReviewPlanError("Batch 10.3 synthetic artist identities are unavailable.")
+    target_artist_id = int(target_row[0])
+    group_artist_id = int(group_row[0])
+    artist_summaries = query_artist_summaries(db.conn)
+    target_summary = next(
+        (
+            summary
+            for summary in artist_summaries
+            if isinstance(summary, ArtistSummary)
+            and summary.key.artist_id == target_artist_id
+        ),
+        None,
+    )
+    group_summary = next(
+        (
+            summary
+            for summary in artist_summaries
+            if isinstance(summary, ArtistSummary)
+            and summary.key.artist_id == group_artist_id
+        ),
+        None,
+    )
+    if target_summary is None or group_summary is None:
+        raise ReviewPlanError("Batch 10.3 canonical artist cards are unavailable.")
+    target_sections = query_artist_track_sections(db.conn, target_summary.key)
+    group_sections = query_artist_track_sections(db.conn, group_summary.key)
+    section_ids = {
+        "tracks": {int(row["id"]) for row in target_sections.tracks},
+        "featured_on": {int(row["id"]) for row in target_sections.featured_on},
+        "collaborations": {
+            int(row["id"]) for row in target_sections.collaborations
+        },
+        "group_appearances": {
+            int(row["id"]) for row in target_sections.group_appearances
+        },
+    }
+    section_sets = tuple(section_ids.values())
+    artist_sections_complete = all(section_sets) and all(
+        section_sets[left].isdisjoint(section_sets[right])
+        for left in range(len(section_sets))
+        for right in range(left + 1, len(section_sets))
+    )
+
+    # Drive the real card handlers and the real artist section selector.  The
+    # browser may remain on any page afterward; playback context is separate.
+    window._browser_summary_maps["albums"] = {
+        summary.browser_key: summary for summary in album_summaries
+    }
+    window.open_album(edition_cards[0].browser_key if edition_cards else "")
+    album_handler_rows = int(window.library_table.rowCount())
+    window._browser_summary_maps["artists"] = {
+        summary.browser_key: summary for summary in artist_summaries
+    }
+    window.open_artist(target_summary.browser_key)
+    selector = window.artist_section_selector
+    expected_section_data = (
+        "tracks",
+        "featured_on",
+        "collaborations",
+        "group_appearances",
+    )
+    selector_has_all_sections = all(
+        selector.findData(section) >= 0 for section in expected_section_data
+    )
+    selector_row_counts: dict[str, int] = {}
+    for section in expected_section_data:
+        index = selector.findData(section)
+        if index < 0:
+            selector_row_counts[section] = 0
+            continue
+        selector.setCurrentIndex(index)
+        window.on_artist_section_changed(index)
+        selector_row_counts[section] = int(window.library_table.rowCount())
+    real_artist_handlers = bool(
+        album_handler_rows == edition_cards[0].track_count
+        if edition_cards
+        else False
+    ) and selector_has_all_sections and all(selector_row_counts.values())
+
+    corrected_alias_count = int(
+        db.conn.execute(
+            "SELECT COUNT(*) FROM artist_aliases "
+            "WHERE alias_kind='corrected_version_suffix'"
+        ).fetchone()[0]
+    )
+    malformed_entity_count = int(
+        db.conn.execute(
+            "SELECT COUNT(*) FROM artists "
+            "WHERE normalized_name='fixture soloist live at north hall'"
+        ).fetchone()[0]
+    )
+    repaired_credit_count = int(
+        db.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM track_artist_credits credit
+            JOIN artist_aliases alias ON alias.artist_id=credit.artist_id
+            JOIN track_metadata_fields version_type
+              ON version_type.track_id=credit.track_id
+             AND version_type.field_name='version_type'
+            JOIN track_metadata_fields version_label
+              ON version_label.track_id=credit.track_id
+             AND version_label.field_name='version_label'
+            WHERE credit.role='primary'
+              AND alias.alias_kind='corrected_version_suffix'
+              AND version_type.value='live'
+              AND NULLIF(TRIM(version_label.value), '') IS NOT NULL
+            """
+        ).fetchone()[0]
+    )
+    malformed_version_repaired = bool(
+        corrected_alias_count >= 1
+        and malformed_entity_count == 0
+        and repaired_credit_count >= 1
+        and not any(
+            "live at north hall" in summary.display_name.casefold()
+            for summary in artist_summaries
+        )
+    )
+
+    outcome_counts = {
+        str(row["state"]): int(row["count"])
+        for row in db.conn.execute(
+            "SELECT state,COUNT(*) AS count FROM metadata_intelligence_items "
+            "GROUP BY state"
+        ).fetchall()
+    }
+    dialog = MetadataIntelligenceDialog(
+        db,
+        getattr(window, "metadata_intelligence_service", None),
+        window,
+    )
+    try:
+        summary_text = dialog.summary.text()
+        review_filter_rows: dict[str, int] = {}
+        for state in ("needs_review", "applied_with_gaps", "source_fallback"):
+            index = dialog.filter_combo.findData(state)
+            if index < 0:
+                review_filter_rows[state] = 0
+                continue
+            dialog.filter_combo.setCurrentIndex(index)
+            dialog.refresh()
+            review_filter_rows[state] = int(dialog.table.rowCount())
+        review_widget_outcomes = bool(
+            all(review_filter_rows.values())
+            and "Needs Review:" in summary_text
+            and "Applied with Gaps:" in summary_text
+            and "Source Fallback:" in summary_text
+        )
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+
+    artist_image_service = getattr(window, "artist_image_service", None)
+    provider = getattr(artist_image_service, "provider", None)
+    runtime_policy = window._current_runtime_policy()
+    artist_provider_lazy_and_deferred = bool(
+        provider is None
+        and getattr(artist_image_service, "_provider_factory", None) is not None
+        and runtime_policy.startup_provider_work_deferred
+    )
+    provider_call_count = 0
+
+    event_filter = getattr(window, "global_play_pause_event_filter", None)
+    search = getattr(window, "search_box", None)
+    table = getattr(window, "library_table", None)
+    key_event = QKeyEvent(
+        QEvent.Type.KeyPress,
+        Qt.Key.Key_Space,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    text_guarded = False
+    normal_page_handled = False
+    if event_filter is not None and isinstance(search, QLineEdit):
+        _set_page(window, "library_page")
+        search.setFocus(Qt.FocusReason.OtherFocusReason)
+        QApplication.processEvents()
+        text_guarded = event_filter.eventFilter(search, key_event) is False
+    if event_filter is not None and table is not None:
+        table.setFocus(Qt.FocusReason.OtherFocusReason)
+        QApplication.processEvents()
+        normal_page_handled = event_filter.eventFilter(table, key_event) is True
+    control = getattr(window, "party_mode_btn", None)
+    global_space_guards = bool(
+        text_guarded
+        and normal_page_handled
+        and isinstance(control, QAbstractButton)
+        and not should_handle_global_play_pause(control)
+        and not should_handle_global_play_pause(
+            table,
+            active_modal_widget=window,
+        )
+        and not should_handle_global_play_pause(table, party_mode_active=True)
+    )
+
+    write_status = getattr(window, "write_app_status", None)
+    if not callable(write_status):
+        raise ReviewPlanError("Batch 10.3 App Status writer is unavailable.")
+    write_status()
+    try:
+        status = json.loads((data_root / "music_vault_status.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Batch 10.3 App Status is unavailable.") from exc
+    playback_status = status.get("playback") if isinstance(status, dict) else None
+    sync_status = status.get("sync") if isinstance(status, dict) else None
+    paths_status = status.get("paths") if isinstance(status, dict) else None
+    app_status_aggregate_only = bool(
+        isinstance(playback_status, dict)
+        and all(
+            playback_status.get(name) is None
+            for name in (
+                "currently_playing",
+                "current_title",
+                "current_artist",
+                "current_album",
+            )
+        )
+        and isinstance(sync_status, dict)
+        and all(
+            sync_status.get(name) is None
+            for name in (
+                "last_sync_playlist_title",
+                "last_sync_playlist_id",
+                "last_sync_error",
+            )
+        )
+        and isinstance(paths_status, dict)
+        and all(
+            paths_status.get(name) is None
+            for name in (
+                "project_root",
+                "data_dir",
+                "database",
+                "downloads",
+                "config",
+                "status_file",
+            )
+        )
+    )
+
+    media_players_after = tuple(window.findChildren(QMediaPlayer))
+    playback_preserved = _batch10_playback_unchanged(window, playback_before)
+    config = getattr(window, "config", {})
+    behaviors: dict[str, object] = {
+        "schema_version": schema_version,
+        "packaged_process": bool(getattr(sys, "frozen", False)),
+        "canonical_album_count": len(album_summaries),
+        "canonical_multi_edition_card_count": len(edition_cards),
+        "soundtrack_card_count": len(soundtracks),
+        "score_card_count": len(scores),
+        "artist_card_count": len(artist_summaries),
+        "artist_section_track_counts": {
+            name: len(values) for name, values in section_ids.items()
+        },
+        "review_outcome_counts": outcome_counts,
+        "corrected_version_alias_count": corrected_alias_count,
+        "synthetic_portrait_provider_call_count": provider_call_count,
+        "network_attempt_count": len(_REVIEW_NETWORK_EVENTS),
+        "canonical_album_grouping": canonical_album_grouping,
+        "soundtrack_and_score_distinct": bool(
+            soundtracks and scores and len(soundtrack_ids) == len(soundtracks) + len(scores)
+        ),
+        "canonical_artist_sections_complete": artist_sections_complete,
+        "group_tracks_present": bool(group_sections.tracks),
+        "verified_group_appearance_present": bool(target_sections.group_appearances),
+        "real_album_artist_handlers": real_artist_handlers,
+        "malformed_version_artist_repaired": malformed_version_repaired,
+        "review_outcomes_complete": all(
+            outcome_counts.get(state, 0) >= 1
+            for state in ("applied_with_gaps", "source_fallback", "review")
+        ),
+        "review_dialog_outcomes_visible": review_widget_outcomes,
+        "artist_provider_lazy_and_deferred": artist_provider_lazy_and_deferred,
+        "global_spacebar_guarded": global_space_guards,
+        "app_status_aggregate_only": app_status_aggregate_only,
+        "playback_preserved": playback_preserved,
+        "queue_preserved": playback_preserved,
+        "base_context_preserved": playback_preserved,
+        "same_media_player": bool(
+            media_players_before == media_players_after
+            and len(media_players_after) == 1
+            and media_players_after[0] is getattr(window, "player", None)
+        ),
+        "party_mode_surface_preserved": bool(
+            playback_preserved
+            and getattr(window, "party_mode_btn", None) is not None
+            and getattr(window, "party_mode_shortcut", None) is not None
+            and callable(getattr(window, "toggle_party_mode", None))
+        ),
+        "lyrics_surface_preserved": bool(
+            playback_preserved
+            and isinstance(config, dict)
+            and "party_mode_lyrics_enabled" in config
+            and "lyrics_online_lookup_enabled" in config
+            and getattr(window, "settings_lyrics_enabled", None) is not None
+            and getattr(window, "settings_lyrics_online", None) is not None
+        ),
+        "network_guard_active": _REVIEW_NETWORK_GUARD_INSTALLED,
+        "credential_files_absent": True,
+    }
+    non_boolean = {
+        "schema_version",
+        "packaged_process",
+        "canonical_album_count",
+        "canonical_multi_edition_card_count",
+        "soundtrack_card_count",
+        "score_card_count",
+        "artist_card_count",
+        "artist_section_track_counts",
+        "review_outcome_counts",
+        "corrected_version_alias_count",
+        "synthetic_portrait_provider_call_count",
+        "network_attempt_count",
+    }
+    failed = sorted(
+        name
+        for name, value in behaviors.items()
+        if name not in non_boolean and value is not True
+    )
+    if int(behaviors["network_attempt_count"]) != 0:
+        failed.append("network_attempt_count")
+    if failed:
+        raise ReviewPlanError(
+            "Batch 10.3 synthetic UI behavior failed: " + ", ".join(failed)
+        )
+    return behaviors
+
+
 def _prepare_sync_issue_scene(window: object) -> None:
     visual_helper = getattr(window, "set_sync_visual_state", None)
     if callable(visual_helper):
@@ -3814,6 +4256,13 @@ def prepare_review_scene(window: object, scene: str) -> None:
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+    elif scene in BATCH10_3_REVIEW_SCENES:
+        _set_page(window, "library_page")
+        _set_review_artist_fetch_state(window, False)
+        window.current_view_kind = "artists"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Artists"
+        window.show_artist_browser()
     elif scene in REMEDIATION_REVIEW_SCENES:
         _prepare_remediation_scene(window, scene)
     elif scene == "sync_managed_playlist":
@@ -3901,7 +4350,13 @@ def prepare_review_scene(window: object, scene: str) -> None:
 
 
 _BROWSER_REVIEW_SCENES = frozenset(
-    {"albums", "artists", "artists_fetch_disabled", "artists_fetch_enabled"}
+    {
+        "albums",
+        "artists",
+        "artists_fetch_disabled",
+        "artists_fetch_enabled",
+        *BATCH10_3_REVIEW_SCENES,
+    }
 )
 
 
@@ -3909,6 +4364,8 @@ def _review_browser_kind(scene: str) -> str | None:
     if scene == "albums":
         return "albums"
     if scene in {"artists", "artists_fetch_disabled", "artists_fetch_enabled"}:
+        return "artists"
+    if scene in BATCH10_3_REVIEW_SCENES:
         return "artists"
     return None
 
@@ -4498,6 +4955,7 @@ class UIReviewController(QObject):
                 scene in PARTY_REVIEW_SCENES
                 or scene in MULTI_SOURCE_REVIEW_SCENES
                 or scene in METADATA_INTELLIGENCE_REVIEW_SCENES
+                or scene in BATCH10_3_REVIEW_SCENES
                 for scene in self.plan.scenes
             ):
                 _install_review_network_guard()
@@ -4524,6 +4982,10 @@ class UIReviewController(QObject):
             if any(scene in MULTI_SOURCE_REVIEW_SCENES for scene in self.plan.scenes):
                 self.runtime_checks["multi_source_behaviors"] = (
                     validate_batch10_multi_source_behaviors(self.window, self.plan)
+                )
+            if any(scene in BATCH10_3_REVIEW_SCENES for scene in self.plan.scenes):
+                self.runtime_checks["batch10_3_behaviors"] = (
+                    validate_batch10_3_review_behaviors(self.window, self.plan)
                 )
             self.window.showNormal()
             self.window.raise_()
@@ -4742,6 +5204,7 @@ class UIReviewController(QObject):
             remediation_behaviors = self.runtime_checks.get("remediation_behaviors")
             party_mode_behaviors = self.runtime_checks.get("party_mode_behaviors")
             multi_source_behaviors = self.runtime_checks.get("multi_source_behaviors")
+            batch10_3_behaviors = self.runtime_checks.get("batch10_3_behaviors")
             self.runtime_checks = validate_review_runtime(self.plan)
             if metadata_behaviors is not None:
                 self.runtime_checks["metadata_behaviors"] = metadata_behaviors
@@ -4755,6 +5218,8 @@ class UIReviewController(QObject):
                 self.runtime_checks["party_mode_behaviors"] = party_mode_behaviors
             if multi_source_behaviors is not None:
                 self.runtime_checks["multi_source_behaviors"] = multi_source_behaviors
+            if batch10_3_behaviors is not None:
+                self.runtime_checks["batch10_3_behaviors"] = batch10_3_behaviors
             if len(self.captures) != self.plan.capture_count:
                 raise ReviewPlanError("The review capture matrix is incomplete.")
             self._write_manifest(self._manifest("complete"))

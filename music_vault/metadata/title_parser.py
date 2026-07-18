@@ -23,6 +23,14 @@ _FEATURED_RE = re.compile(
     r"\s+(?:feat\.?|ft\.?|featuring)\s+(?P<artist>.+?)(?=\s*[\[(]|$)",
     re.IGNORECASE,
 )
+_ARTIST_VERSION_SUFFIX_RE = re.compile(
+    r"^(?P<artist>.+?)\s+(?P<label>"
+    r"live\s+(?:at|from|in)\s+[^|:;]{2,100}"
+    r"|(?:radio|studio|acoustic)\s+session(?:\s+(?:at|from|in)\s+[^|:;]{2,100})?"
+    r"|tiny\s+desk(?:\s+concert)?"
+    r")$",
+    re.IGNORECASE,
+)
 _YEAR_SUFFIX_RE = re.compile(r"\s*[\[(](?P<year>(?:18|19|20)\d{2})[\])]\s*$")
 _BRACKET_SUFFIX_RE = re.compile(r"\s*(?P<open>[\[(])(?P<label>[^\[\]()]{1,120})[\])]\s*$")
 
@@ -66,7 +74,15 @@ _VERSION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slowed", re.compile(r"\bslowed(?:\s*(?:and|&)\s*reverb)?\b", re.IGNORECASE)),
     ("nightcore", re.compile(r"\bnightcore\b", re.IGNORECASE)),
     ("mashup", re.compile(r"\bmash[ -]?up\b", re.IGNORECASE)),
-    ("soundtrack", re.compile(r"\b(?:soundtrack|from\s+the\s+motion\s+picture)\b", re.IGNORECASE)),
+    (
+        "soundtrack",
+        re.compile(
+            r"\b(?:soundtrack|original\s+score|cast\s+(?:album|recording)"
+            r"|(?:broadway|west\s+end|film|movie)\s+cast"
+            r"|from\s+the\s+(?:motion\s+picture|film))\b",
+            re.IGNORECASE,
+        ),
+    ),
     ("edit", re.compile(r"\bedit\b", re.IGNORECASE)),
 )
 _REMASTER_RE = re.compile(r"\b(?:\d{4}\s+)?remaster(?:ed)?\b", re.IGNORECASE)
@@ -140,6 +156,42 @@ def _extract_featured(value: str) -> tuple[str, str | None]:
     return _clean(value[: match.start()] + value[match.end() :]), featured or None
 
 
+def split_artist_version_suffix(
+    value: object,
+) -> tuple[str, str, str] | None:
+    """Split only an anchored, explicit performance suffix from an artist.
+
+    This intentionally does not split punctuation, ampersands, collaborations,
+    or ordinary words such as ``Live`` used without a venue/session phrase.
+    """
+
+    text = _clean(value)
+    match = _ARTIST_VERSION_SUFFIX_RE.fullmatch(text)
+    if match is None:
+        return None
+    artist = _clean(match.group("artist"))
+    label = _clean(match.group("label"))
+    if not artist or not label:
+        return None
+    return artist, classify_artist_version_label(label), label
+
+
+def classify_artist_version_label(value: object) -> str:
+    """Classify the anchored performance labels shared by parser and repair."""
+
+    folded = _clean(value).casefold()
+    if folded.startswith("acoustic session"):
+        return "acoustic"
+    if folded.startswith(("radio session", "studio session")):
+        return "session"
+    return "live"
+
+
+STRONG_TITLE_PATTERNS = frozenset(
+    {"artist_dash_title", "title_by_artist", "artist_colon_title"}
+)
+
+
 @dataclass(frozen=True)
 class ParsedTitle:
     raw_title: str
@@ -155,7 +207,11 @@ class ParsedTitle:
 
     @property
     def strong_pattern(self) -> bool:
-        return bool(self.artist_hint and self.title_hint and self.pattern)
+        return bool(
+            self.artist_hint
+            and self.title_hint
+            and self.pattern in STRONG_TITLE_PATTERNS
+        )
 
     # Small compatibility aliases for callers that prefer candidate names.
     @property
@@ -213,6 +269,12 @@ def parse_youtube_title(value: object) -> ParsedTitle:
     featured_from_artist: str | None = None
     if artist:
         artist, featured_from_artist = _extract_featured(artist)
+        artist_version = split_artist_version_suffix(artist)
+        if artist_version is not None:
+            artist, artist_version_type, artist_version_label = artist_version
+            if version_type == "unknown":
+                version_type = artist_version_type
+                version_label = artist_version_label
         artist = artist or None
     featured = featured_from_title or featured_from_artist
     title_hint = _without_version_suffix(title_without_feature, version_label)
@@ -236,8 +298,11 @@ parse_title_hint = parse_youtube_title
 
 
 __all__ = [
+    "classify_artist_version_label",
     "ParsedTitle",
+    "STRONG_TITLE_PATTERNS",
     "classify_version_hint",
     "parse_title_hint",
     "parse_youtube_title",
+    "split_artist_version_suffix",
 ]

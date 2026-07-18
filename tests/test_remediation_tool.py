@@ -63,7 +63,7 @@ def test_default_status_does_not_create_a_missing_database_or_data_directory(
     assert result == 0
     assert payload == {
         "action": "status",
-        "current_schema_version": 6,
+        "current_schema_version": 7,
         "database_exists": False,
         "job": None,
         "migration_required": False,
@@ -94,7 +94,7 @@ def test_status_reports_schema_three_without_migration_backup_or_write(
 
     assert result == 0
     assert payload["schema_version"] == 3
-    assert payload["current_schema_version"] == 6
+    assert payload["current_schema_version"] == 7
     assert payload["migration_required"] is True
     assert payload["job"] is None
     assert (
@@ -127,7 +127,7 @@ def test_analyze_uses_production_service_and_status_reopens_read_only(
     database_path = runtime_root / "data" / "music_vault.sqlite3"
     assert database_path.is_file()
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert connection.execute(
             f"SELECT COUNT(*) FROM {REMEDIATION_JOBS_TABLE}"
         ).fetchone()[0] == 1
@@ -463,3 +463,23 @@ def test_tool_imports_no_gui_sync_or_api_key_modules_and_wrapper_restores_locati
     assert "Pop-Location" in wrapper
     assert ".venv\\Scripts\\python.exe" in wrapper
     assert "@args" in wrapper
+
+
+def test_tool_import_does_not_leak_no_secret_policy_into_importing_process():
+    project_root = Path(__file__).resolve().parents[1]
+    code = (
+        "import os; "
+        "name='MUSIC_VAULT_ACCEPTANCE_NO_SECRETS'; "
+        "os.environ.pop(name, None); "
+        "import tools.dev.remediate_library_metadata; "
+        "print(os.environ.get(name, 'absent'))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == "absent"

@@ -16,6 +16,7 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtGui import QImage, QImageReader, QImageWriter
 
 from music_vault.core.paths import cover_art_archive_dir, manual_covers_dir
+from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.version import user_agent
 
 
@@ -365,9 +366,18 @@ class CoverArtArchiveProvider:
         session: requests.Session | None = None,
         resolver: Callable[..., Sequence[Any]] = socket.getaddrinfo,
     ) -> None:
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.session = session
+        if self.session is not None:
+            self.session.trust_env = False
         self.resolver = resolver
+
+    def _network_session(self) -> requests.Session:
+        if not runtime_policy_for().allows_provider_construction(token_backed=False):
+            raise ArtworkError("provider_work_deferred")
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        return self.session
 
     @staticmethod
     def _release_id(value: object) -> str:
@@ -395,11 +405,13 @@ class CoverArtArchiveProvider:
 
     def fetch(self, release_id: str) -> PreparedArtwork | None:
         release_id = self._release_id(release_id)
+        # Block optional provider work before URL validation reaches DNS.
+        session = self._network_session()
         current_url = f"https://coverartarchive.org/release/{release_id}/front-500"
         for redirect_count in range(MAX_REDIRECTS + 1):
             current_url = validate_cover_art_url(current_url, resolver=self.resolver)
             try:
-                response = self.session.get(
+                response = session.get(
                     current_url,
                     headers={"User-Agent": MUSIC_VAULT_USER_AGENT, "Accept": "image/*"},
                     timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),

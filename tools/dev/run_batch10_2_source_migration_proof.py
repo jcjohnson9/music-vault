@@ -31,14 +31,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from music_vault.core import paths as runtime_paths  # noqa: E402
 from music_vault.core.app_status import write_app_status  # noqa: E402
-from music_vault.core.db import MusicVaultDB  # noqa: E402
+from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB  # noqa: E402
 from music_vault.metadata.artist_credits import normalize_artist_name  # noqa: E402
 from tools.dev import verify_batch10_1_live_migration as live_gate  # noqa: E402
 
 
 TEMP_PREFIX = "MusicVault_Batch10_2_SourceMigrationProof_"
 PRE_SCHEMA_VERSION = 5
-POST_SCHEMA_VERSION = 6
 EXTENSION_FIELDS = {
     "original_release_date": "original_release_date",
     "version_type": "version_type",
@@ -70,7 +69,8 @@ PROVIDER_STATE_TABLES = (
     "track_release_context",
 )
 AUTOMATIC_BACKUP_PATTERN = re.compile(
-    r"music_vault_pre_schema_v6_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
+    rf"music_vault_pre_schema_v{CURRENT_SCHEMA_VERSION}_"
+    r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
     r"(?:_\d+)?\.sqlite3"
 )
 
@@ -651,7 +651,7 @@ def _independent_database_checks(
         **identity_checks,
         **field_checks,
         **artist_checks,
-        "schema_is_6": schema == POST_SCHEMA_VERSION,
+        "schema_is_current": schema == CURRENT_SCHEMA_VERSION,
         "integrity_ok": integrity.casefold() == "ok",
         "foreign_keys_enabled": foreign_keys_enabled,
         "foreign_key_check_clean": foreign_key_issues == 0,
@@ -839,11 +839,13 @@ def run_source_migration_proof(
                 "automatic_schema5_backup_created_and_verified": (
                     len(automatic_candidates) == 1 and automatic_verified
                 ),
-                "schema6_reopen_created_no_backup": reopened_backup_absent,
-                "schema6_reopen_created_no_extra_backup": (
+                "current_schema_reopen_created_no_backup": reopened_backup_absent,
+                "current_schema_reopen_created_no_extra_backup": (
                     backup_names_first == backup_names_second
                 ),
-                "schema6_reopen_logically_idempotent": logical_first == logical_second,
+                "current_schema_reopen_logically_idempotent": (
+                    logical_first == logical_second
+                ),
                 "credentials_not_copied": credentials_absent,
                 "network_and_provider_calls_blocked_and_absent": network["count"] == 0,
                 "source_backup_unchanged": (
