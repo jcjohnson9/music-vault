@@ -8,12 +8,14 @@ YouTube-exclusive policy) before applying the hints.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 _SPACE_RE = re.compile(r"\s+")
-_ARTIST_TITLE_RE = re.compile(
-    r"^(?P<artist>.+?)\s+(?:-|\u2013|\u2014)\s+(?P<title>.+)$"
+_DASH_SEPARATOR_RE = re.compile(r"\s+(?:-|\u2013|\u2014)\s+")
+_DATE_LIKE_RE = re.compile(
+    r"[+-]?\d{1,4}(?:[-/.]\d{1,2}){0,2}",
+    re.IGNORECASE,
 )
 _ARTIST_COLON_TITLE_RE = re.compile(r"^(?P<artist>[^:]{1,160}):\s+(?P<title>.+)$")
 _TITLE_BY_ARTIST_RE = re.compile(
@@ -33,6 +35,9 @@ _ARTIST_VERSION_SUFFIX_RE = re.compile(
 )
 _YEAR_SUFFIX_RE = re.compile(r"\s*[\[(](?P<year>(?:18|19|20)\d{2})[\])]\s*$")
 _BRACKET_SUFFIX_RE = re.compile(r"\s*(?P<open>[\[(])(?P<label>[^\[\]()]{1,120})[\])]\s*$")
+_DELIMITED_SUFFIX_RE = re.compile(
+    r"\s+(?:-|\||:|\u2013|\u2014)\s*(?P<label>[^|:]{2,120})\s*$"
+)
 
 _PRESENTATION_NORMALIZED = frozenset(
     {
@@ -145,6 +150,18 @@ def _without_version_suffix(value: str, version_label: str | None) -> str:
     bracket = _BRACKET_SUFFIX_RE.search(value)
     if bracket and _clean(bracket.group("label")).casefold() == _clean(version_label).casefold():
         return _clean(value[: bracket.start()])
+    delimited = _DELIMITED_SUFFIX_RE.search(value)
+    if delimited:
+        candidate_label = _clean(delimited.group("label"))
+        candidate_type, _ = classify_version_hint(candidate_label)
+        recognized = candidate_type != "unknown" or bool(
+            _REMASTER_RE.fullmatch(candidate_label)
+        )
+        if (
+            recognized
+            and candidate_label.casefold() == _clean(version_label).casefold()
+        ):
+            return _clean(value[: delimited.start()])
     return value
 
 
@@ -154,6 +171,54 @@ def _extract_featured(value: str) -> tuple[str, str | None]:
         return value, None
     featured = _clean(match.group("artist"))
     return _clean(value[: match.start()] + value[match.end() :]), featured or None
+
+
+def _meaningful_dash_side(value: object) -> bool:
+    text = _clean(value)
+    return bool(text and any(character.isalnum() for character in text))
+
+
+def _recognized_version_tail(value: object) -> bool:
+    """Return whether a final dash segment is a performance/version suffix."""
+
+    text = _clean(value)
+    if not text:
+        return False
+    version_type, version_label = classify_version_hint(text)
+    return bool(
+        version_type != "unknown"
+        or (version_label and _REMASTER_RE.search(text) is not None)
+    )
+
+
+def _dash_title_parts(value: object) -> tuple[str, str] | None:
+    """Return one safe structural dash split, never an unbounded split set.
+
+    Ordinary hyphens, numeric/date ranges, and ambiguous multi-dash strings
+    are deliberately left untouched.  One extra trailing separator is allowed
+    only when its final segment is an established version qualifier, preserving
+    inputs such as ``Title - Artist - Live`` from the earlier parser contract.
+    """
+
+    text = _clean(value)
+    separators = tuple(_DASH_SEPARATOR_RE.finditer(text))
+    if not separators:
+        return None
+    if len(separators) > 2:
+        return None
+    if len(separators) == 2:
+        tail = text[separators[1].end() :]
+        if not _recognized_version_tail(tail):
+            return None
+
+    separator = separators[0]
+    left = _clean(text[: separator.start()])
+    right = _clean(text[separator.end() :])
+    if not (_meaningful_dash_side(left) and _meaningful_dash_side(right)):
+        return None
+    if _DATE_LIKE_RE.fullmatch(left) and _DATE_LIKE_RE.fullmatch(right):
+        return None
+    return left, right
 
 
 def split_artist_version_suffix(
@@ -193,6 +258,26 @@ STRONG_TITLE_PATTERNS = frozenset(
 
 
 @dataclass(frozen=True)
+class TitleOrientationHypothesis:
+    """One non-authoritative interpretation of a source title.
+
+    Dash-delimited source titles are intentionally represented both ways.
+    Provider or embedded evidence, rather than the parser, selects the final
+    orientation.
+    """
+
+    artist: str
+    title: str
+    orientation: str
+    year_hint: int | None = None
+    version_type: str = "unknown"
+    version_label: str | None = None
+    featured_artist: str | None = None
+    source_pattern: str | None = None
+    confidence_reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ParsedTitle:
     raw_title: str
     search_title: str
@@ -204,6 +289,7 @@ class ParsedTitle:
     featured_artist_hint: str | None
     presentation_suffixes: tuple[str, ...]
     pattern: str | None
+    orientation_hypotheses: tuple[TitleOrientationHypothesis, ...] = ()
 
     @property
     def strong_pattern(self) -> bool:
@@ -230,6 +316,32 @@ class ParsedTitle:
     def year(self) -> int | None:
         return self.year_hint
 
+    def for_orientation(
+        self, hypothesis: TitleOrientationHypothesis
+    ) -> "ParsedTitle":
+        """Return provider-search hints for one hypothesis without losing provenance."""
+
+        version_type = hypothesis.version_type
+        if version_type == "unknown" and self.version_type != "unknown":
+            version_type = self.version_type
+        return replace(
+            self,
+            search_title=hypothesis.title,
+            artist_hint=hypothesis.artist,
+            title_hint=hypothesis.title,
+            year_hint=(
+                hypothesis.year_hint
+                if hypothesis.year_hint is not None
+                else self.year_hint
+            ),
+            version_type=version_type,
+            version_label=hypothesis.version_label or self.version_label,
+            featured_artist_hint=(
+                hypothesis.featured_artist or self.featured_artist_hint
+            ),
+            pattern=hypothesis.source_pattern or self.pattern,
+        )
+
 
 def parse_youtube_title(value: object) -> ParsedTitle:
     """Extract non-authoritative hints while preserving the exact raw value."""
@@ -245,10 +357,11 @@ def parse_youtube_title(value: object) -> ParsedTitle:
     artist: str | None = None
     title_part = working
     pattern: str | None = None
-    match = _ARTIST_TITLE_RE.match(working)
-    if match:
-        artist = _clean(match.group("artist")) or None
-        title_part = _clean(match.group("title"))
+    orientation_hypotheses: tuple[TitleOrientationHypothesis, ...] = ()
+    dash_parts = _dash_title_parts(working)
+    if dash_parts:
+        artist = dash_parts[0] or None
+        title_part = dash_parts[1]
         pattern = "artist_dash_title"
     else:
         match = _TITLE_BY_ARTIST_RE.match(working)
@@ -279,6 +392,34 @@ def parse_youtube_title(value: object) -> ParsedTitle:
     featured = featured_from_title or featured_from_artist
     title_hint = _without_version_suffix(title_without_feature, version_label)
     title_hint = _clean(title_hint) or None
+    if pattern == "artist_dash_title" and artist and title_hint:
+        # Provider queries must use the same cleaned artist/title identities as
+        # the main parse. Otherwise a featured or live/version suffix on the
+        # right-hand side poisons the reverse-orientation artist lookup.
+        orientation_hypotheses = (
+            TitleOrientationHypothesis(
+                artist,
+                title_hint,
+                "left_is_artist",
+                year,
+                version_type,
+                version_label,
+                featured,
+                pattern,
+                ("conventional_dash_orientation",),
+            ),
+            TitleOrientationHypothesis(
+                title_hint,
+                artist,
+                "right_is_artist",
+                year,
+                version_type,
+                version_label,
+                featured,
+                pattern,
+                ("alternate_dash_orientation",),
+            ),
+        )
 
     return ParsedTitle(
         raw_title=raw,
@@ -291,7 +432,35 @@ def parse_youtube_title(value: object) -> ParsedTitle:
         featured_artist_hint=featured,
         presentation_suffixes=presentation,
         pattern=pattern,
+        orientation_hypotheses=orientation_hypotheses,
     )
+
+
+def title_orientation_hypotheses(value: object) -> tuple[TitleOrientationHypothesis, ...]:
+    """Return both bounded dash orientations, or the one explicit parse.
+
+    This helper performs no provider lookup and always keeps the raw source
+    observation untouched.
+    """
+
+    parsed = value if isinstance(value, ParsedTitle) else parse_youtube_title(value)
+    if parsed.orientation_hypotheses:
+        return parsed.orientation_hypotheses
+    if parsed.artist_hint and parsed.title_hint:
+        return (
+            TitleOrientationHypothesis(
+                parsed.artist_hint,
+                parsed.title_hint,
+                parsed.pattern or "explicit",
+                parsed.year_hint,
+                parsed.version_type,
+                parsed.version_label,
+                parsed.featured_artist_hint,
+                parsed.pattern,
+                ("explicit_source_orientation",),
+            ),
+        )
+    return ()
 
 
 parse_title_hint = parse_youtube_title
@@ -300,9 +469,11 @@ parse_title_hint = parse_youtube_title
 __all__ = [
     "classify_artist_version_label",
     "ParsedTitle",
+    "TitleOrientationHypothesis",
     "STRONG_TITLE_PATTERNS",
     "classify_version_hint",
     "parse_title_hint",
     "parse_youtube_title",
     "split_artist_version_suffix",
+    "title_orientation_hypotheses",
 ]

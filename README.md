@@ -30,6 +30,20 @@ external work for the rest of that process; the next ordinary non-migration
 launch can resume the user's enabled provider behavior without rewriting
 settings.
 
+Batch 10.5 completes the retained development batch with canonical
+cross-provider artist clusters, cache-preserving portrait priority, provider-
+adjudicated title orientation, best-available automatic metadata outcomes, and
+one virtual **Singles & Uncatalogued** album collection. User-confirmed locks
+remain authoritative, medium-confidence values stay database-only, and
+automatic media-tag writeback remains limited to high-confidence fields.
+
+Batch 10.6 makes dash-title adjudication deterministic: Music Vault evaluates
+both `Artist - Title` orientations when necessary, stops after a conclusive
+first Discogs result, permits at most two Discogs searches and one secondary
+MusicBrainz search, and stores the selected orientation and safe decision
+reasons without provider responses or credentials. Unresolved offline items
+remain honest source fallbacks and eligible for a later bounded lookup.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
@@ -69,8 +83,9 @@ downloaded automatically.
   unchanged-audio checks, and conflict-aware rollback
 - Optional Discogs-first automatic intelligence for title, artist credits,
   release/version context, and true artwork gaps; MusicBrainz remains a
-  secondary authority, uncertain fields stay review-only, and uploader/channel
-  names remain source provenance rather than assumed musical artists
+  secondary authority, best-available outcomes retain field confidence and
+  history, and uploader/channel names remain source provenance rather than
+  assumed musical artists
 - Fast SQL-backed canonical album/artist grids, edition-aware album cards,
   role-aware **Tracks**, **Featured On**, **Collaborations**, and **Group
   Appearances** sections, optional privacy-aware artist photos, and the premium
@@ -78,8 +93,8 @@ downloaded automatically.
 - Neutral, versioned local App Status JSON for optional local consumers
 
 Music Vault does not silently inspect browser cookies, start synchronization or
-metadata remediation on launch, auto-apply uncertain metadata matches, or scan
-the entire computer.
+metadata remediation on launch, write medium/low-confidence metadata into media
+tags, or scan the entire computer.
 
 ## v1.1.0 development preview
 
@@ -116,8 +131,9 @@ Discogs-first Metadata Intelligence is disabled until the user stores a
 personal token, accepts the provider/privacy notice, and enables it in
 Settings. It can enrich new imports in the background and offers a resumable
 existing-library scan. Only strong, unambiguous, unlocked fields may apply
-automatically; meaningful provider disagreement, date/release ambiguity, and
-version conflicts go to review. Structured credits distinguish primary,
+to media-file tags automatically. Best-available database values are selected
+with confidence and history instead of waiting in an ordinary review queue;
+rare mistakes remain manually correctable. Structured credits distinguish primary,
 featured, collaborator, remixer, and performer roles. Studio, live, remix,
 edit, acoustic, cover, slowed, sped-up, YouTube-exclusive, and other versions
 remain separate tracks. See [Discogs Metadata](docs/DISCOGS_METADATA.md).
@@ -129,8 +145,8 @@ recordings, compilations, EPs, singles, and remix albums remain distinct.
 Canonical artist aliases and verified relationships unify safe display
 variants while preserving conflicting same-name identities. Secondary gaps can
 finish as **Applied with Gaps** or **Accepted Source Fallback**; manual review is
-reserved for real identity, structured-credit, version, duration, or provider
-conflicts. See [Canonical Media Browser](docs/CANONICAL_MEDIA_BROWSER.md).
+available as an optional audit/correction surface rather than an automatic-work
+queue. See [Canonical Media Browser](docs/CANONICAL_MEDIA_BROWSER.md).
 
 Space toggles the existing player's Play/Pause state from ordinary application
 pages. Text fields, metadata/lyrics editors, dialogs, buttons, checkboxes,
@@ -171,7 +187,8 @@ YouTube upload dates and uploader/channel names remain source provenance rather
 than canonical release dates or default musical artists. Manual metadata work
 is local. Music Vault can contact Discogs only after explicit setup and consent;
 MusicBrainz remains an explicit candidate source and secondary corroboration or
-fallback. Uncertain items remain unchanged or enter review. See the
+fallback. Unsupported fields remain blank or are recorded as explicit gaps;
+accepted values remain reversible through metadata history. See the
 [Metadata Model](docs/METADATA_MODEL.md), [Metadata Remediation](docs/METADATA_REMEDIATION.md),
 and [Discogs Metadata](docs/DISCOGS_METADATA.md).
 
@@ -248,9 +265,10 @@ a possible external future option. Android, Best Original quality, an
 installer/updater, an editable queue panel, and personal radio are not V1
 requirements. Batch 9 Party Mode, Batch 9.1 motion/lyrics refinement, Batch 10
 Multiple Source Playlists, Batch 10.1 Discogs-first metadata intelligence,
-Batch 10.2 timestamp preservation, Batch 10.3 canonical media browsing/review
-tuning, and Batch 10.4 migration-startup quiescence are complete on the v1.1.0
-development line; Batch 11
+Batch 10.2 timestamp preservation, Batch 10.3 canonical media browsing, Batch
+10.4 migration-startup quiescence, and Batch 10.5 metadata acceptance and
+artist-identity correction, plus Batch 10.6 dual-orientation metadata
+acceptance, are complete on the v1.1.0 development line; Batch 11
 Highest-Practical-Quality / Best Original is next. See the
 [roadmap](docs/ROADMAP.md).
 

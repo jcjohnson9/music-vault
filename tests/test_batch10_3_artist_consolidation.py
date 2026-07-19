@@ -411,7 +411,7 @@ def test_identical_legacy_credit_collision_deduplicates_during_merge():
     conn.close()
 
 
-def test_exact_same_name_without_shared_provider_identity_remains_separate(
+def test_exact_same_name_with_provider_backed_and_legacy_rows_consolidates(
     tmp_path: Path,
 ):
     db = MusicVaultDB(tmp_path / "same-name.sqlite3")
@@ -426,10 +426,13 @@ def test_exact_same_name_without_shared_provider_identity_remains_separate(
 
     plan = ArtistConsolidationService(db).plan()
 
-    assert plan.merges == ()
-    assert len(plan.conflicts) == 1
-    assert plan.conflicts[0].reason == "ambiguous_exact_same_name"
-    assert db.conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0] == 2
+    assert len(plan.merges) == 1
+    assert plan.merges[0].canonical_artist_id == first
+    assert plan.merges[0].duplicate_artist_ids == (second,)
+    assert plan.conflicts == ()
+    report = ArtistConsolidationService(db).apply(plan)
+    assert report.merged_artist_count == 1
+    assert db.conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0] == 1
     db.close()
 
 
@@ -975,4 +978,58 @@ def test_version_repair_keeps_still_referenced_identity_and_blocks_entity_type_c
     assert db.conn.execute(
         "SELECT entity_type FROM artists WHERE id=?", (typed_canonical,)
     ).fetchone()[0] == "person"
+    db.close()
+
+
+def test_internal_member_of_relationship_blocks_merge_without_changing_evidence(
+    tmp_path: Path,
+):
+    db = MusicVaultDB(tmp_path / "internal-relationship.sqlite3")
+    first_track = _track(db, tmp_path, "internal-first", "Shared Relation")
+    second_track = _track(db, tmp_path, "internal-second", "shared relation")
+    _empty_generated_graph(db)
+    first = _artist(db, "Shared Relation")
+    second = _artist(db, "shared relation")
+    _credit(db, first_track, first)
+    _credit(db, second_track, second)
+    db.conn.execute(
+        """
+        INSERT INTO artist_relationships (
+            subject_artist_id,related_artist_id,relationship_kind,
+            provenance,provider_reference,confidence,created_at,updated_at
+        ) VALUES (?,?,'member_of','manual','manual:internal',100,?,?)
+        """,
+        (first, second, STAMP, STAMP),
+    )
+    db.conn.commit()
+    before = tuple(
+        db.conn.execute(
+            """
+            SELECT subject_artist_id,related_artist_id,relationship_kind,
+                   provenance,provider_reference,confidence,created_at,updated_at
+            FROM artist_relationships
+            """
+        ).fetchone()
+    )
+
+    service = ArtistConsolidationService(db)
+    plan = service.plan()
+    report = service.apply(plan)
+
+    assert plan.merges == ()
+    assert {conflict.reason for conflict in plan.conflicts} == {
+        "relationship_evidence_conflict"
+    }
+    assert report.merged_artist_count == 0
+    assert db.conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0] == 2
+    after = tuple(
+        db.conn.execute(
+            """
+            SELECT subject_artist_id,related_artist_id,relationship_kind,
+                   provenance,provider_reference,confidence,created_at,updated_at
+            FROM artist_relationships
+            """
+        ).fetchone()
+    )
+    assert after == before
     db.close()

@@ -150,6 +150,13 @@ def seed_existing_artist_credits(
     ).fetchall()
     for row in rows:
         display = _display_name(row["artist"])
+        from .soundtrack import is_various_artists
+
+        if is_various_artists(display):
+            # Various Artists is release context, not a performer identity.
+            # Preserve the flat legacy display while avoiding a fabricated
+            # primary artist entity during future schema migrations.
+            continue
         normalized = normalize_artist_name(display)
         timestamp = str(row["field_updated_at"] or row["updated_at"] or "1970-01-01T00:00:00Z")
         artist_row, alias_ambiguous = _repair_alias_candidate(conn, normalized)
@@ -427,6 +434,7 @@ class ArtistCreditService:
         is_locked: bool = False,
         actor: str = "metadata_intelligence",
         reason: str = "artist_credit_update",
+        update_display: bool = True,
         commit: bool = True,
     ) -> tuple[TrackArtistCredit, ...]:
         if self.conn.execute("SELECT 1 FROM tracks WHERE id=?", (int(track_id),)).fetchone() is None:
@@ -458,11 +466,30 @@ class ArtistCreditService:
 
         # Structured automatic credits must never bypass the effective artist lock.
         field = self.conn.execute(
-            "SELECT is_locked FROM track_metadata_fields WHERE track_id=? AND field_name='artist'",
+            "SELECT is_manual,is_locked FROM track_metadata_fields "
+            "WHERE track_id=? AND field_name='artist'",
             (int(track_id),),
         ).fetchone()
-        if not is_manual and field is not None and bool(field["is_locked"]):
+        if (
+            not is_manual
+            and field is not None
+            and (bool(field["is_manual"]) or bool(field["is_locked"]))
+        ):
             return self.track_credits(track_id)
+        existing_credits = self.track_credits(track_id)
+        if not is_manual and any(
+            credit.is_manual or credit.is_locked for credit in existing_credits
+        ):
+            return existing_credits
+        if (
+            not is_manual
+            and str(provenance or "").strip().casefold()
+            in {"youtube_title_parsed", "adjudicated_source_title"}
+            and any(credit.role != "primary" for credit in existing_credits)
+        ):
+            # A parsed source-title credit may refine a lone legacy primary,
+            # but it must not erase richer structured provider/manual roles.
+            return existing_credits
 
         reference = (
             str(provider_reference).strip()
@@ -512,30 +539,31 @@ class ArtistCreditService:
                     ),
                 )
             stored = self.track_credits(track_id)
-            display = self.formatted_credit(stored)
-            from .service import MetadataAction, MetadataService
+            if update_display:
+                display = self.formatted_credit(stored)
+                from .service import MetadataAction, MetadataService
 
-            metadata = MetadataService(self.conn)
-            if is_manual:
-                metadata.apply_actions(
-                    track_id,
-                    {"artist": MetadataAction.set(display)},
-                    actor=actor,
-                    reason=reason,
-                    commit=False,
-                )
-            else:
-                metadata.record_source_observations(
-                    track_id,
-                    provider=str(provenance or "unknown"),
-                    values={"artist": display},
-                    provider_reference=reference,
-                    confidence=score,
-                    apply_effective=True,
-                    actor=actor,
-                    reason=reason,
-                    commit=False,
-                )
+                metadata = MetadataService(self.conn)
+                if is_manual:
+                    metadata.apply_actions(
+                        track_id,
+                        {"artist": MetadataAction.set(display)},
+                        actor=actor,
+                        reason=reason,
+                        commit=False,
+                    )
+                else:
+                    metadata.record_source_observations(
+                        track_id,
+                        provider=str(provenance or "unknown"),
+                        values={"artist": display},
+                        provider_reference=reference,
+                        confidence=score,
+                        apply_effective=True,
+                        actor=actor,
+                        reason=reason,
+                        commit=False,
+                    )
         return self.track_credits(track_id)
 
     def track_credits(self, track_id: int) -> tuple[TrackArtistCredit, ...]:

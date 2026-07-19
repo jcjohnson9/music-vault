@@ -38,6 +38,11 @@ _VERSION_SUFFIX_RE = re.compile(
     r")$",
     re.IGNORECASE,
 )
+_EXPLICIT_CREDIT_PHRASE_RE = re.compile(
+    r"^(?P<primary>.+?)\s+(?P<join>feat\.?|ft\.?|featuring|with|x|vs\.?)\s+"
+    r"(?P<related>.+)$",
+    re.IGNORECASE,
+)
 _GROUP_TYPES = frozenset({"group", "band", "duo", "orchestra", "collective"})
 _PERSON_TYPES = frozenset({"person"})
 _MUSICBRAINZ_ARTIST_ID_RE = re.compile(
@@ -277,7 +282,18 @@ class ArtistConsolidationService:
                     and _provider_id(left["musicbrainz_artist_id"])
                     == _provider_id(right["musicbrainz_artist_id"])
                 )
-                if not (same_discogs or same_musicbrainz):
+                provider_backed_pair = bool(
+                    _provider_id(left["discogs_artist_id"])
+                    or _provider_id(left["musicbrainz_artist_id"])
+                    or _provider_id(right["discogs_artist_id"])
+                    or _provider_id(right["musicbrainz_artist_id"])
+                )
+                # A provider-backed replacement may safely absorb an otherwise
+                # unqualified legacy row, and complementary Discogs/MB rows are
+                # intentional Batch 10.5 evidence. Two unqualified rows with an
+                # identical stored display remain ambiguous: the browser can
+                # cluster them without deleting either stored identity.
+                if not (same_discogs or same_musicbrainz or provider_backed_pair):
                     return True
         return False
 
@@ -287,11 +303,11 @@ class ArtistConsolidationService:
         discogs = bool(_provider_id(row["discogs_artist_id"]))
         musicbrainz = bool(_provider_id(row["musicbrainz_artist_id"]))
         return (
+            -int(self.portrait_available(str(row["display_name"]))),
             -(int(discogs) + int(musicbrainz)),
             -int(discogs and musicbrainz),
             -int(discogs),
             -int(musicbrainz),
-            -int(self.portrait_available(str(row["display_name"]))),
             -int(row["primary_usage"] or 0),
             int(row["id"]),
         )
@@ -469,6 +485,17 @@ class ArtistConsolidationService:
             """,
             (*identifiers, *identifiers),
         ).fetchall()
+        # A relationship whose endpoints would collapse into one artist is
+        # identity evidence, not disposable duplication.  In particular,
+        # member/group and collaboration-project links must never be turned
+        # into a self-edge and silently deleted by consolidation.  Fail closed
+        # for every internal relationship so its provenance remains intact.
+        for row in rows:
+            if (
+                int(row["subject_artist_id"]) in identifiers
+                and int(row["related_artist_id"]) in identifiers
+            ):
+                return True
         groups: dict[tuple[int, int, str], list[sqlite3.Row]] = {}
         for row in rows:
             subject = 0 if int(row["subject_artist_id"]) in identifiers else int(
@@ -509,7 +536,9 @@ class ArtistConsolidationService:
         rows = self._artist_rows()
         row_by_id = {int(row["id"]): row for row in rows}
         parent = {artist_id: artist_id for artist_id in row_by_id}
-        evidence: dict[tuple[int, int], set[str]] = {}
+        members = {artist_id: {artist_id} for artist_id in row_by_id}
+        component_evidence = {artist_id: set() for artist_id in row_by_id}
+        edges: dict[tuple[int, int], set[str]] = {}
 
         def find(value: int) -> int:
             while parent[value] != value:
@@ -517,11 +546,19 @@ class ArtistConsolidationService:
                 value = parent[value]
             return value
 
-        def union(left: int, right: int, reason: str) -> None:
-            first, second = find(left), find(right)
-            if first != second:
-                parent[max(first, second)] = min(first, second)
-            evidence.setdefault(tuple(sorted((left, right))), set()).add(reason)
+        def add_edge(left: int, right: int, reason: str) -> None:
+            if left == right:
+                return
+            edges.setdefault(tuple(sorted((left, right))), set()).add(reason)
+
+        conflicts_by_key: dict[
+            tuple[tuple[int, ...], str], ArtistIdentityConflict
+        ] = {}
+
+        def reject(artist_ids: Sequence[int], reason: str) -> None:
+            identifiers = tuple(sorted(set(int(value) for value in artist_ids)))
+            key = (identifiers, reason)
+            conflicts_by_key[key] = ArtistIdentityConflict(identifiers, reason)
 
         indexes: tuple[tuple[str, Callable[[sqlite3.Row], str]], ...] = (
             (
@@ -548,73 +585,108 @@ class ArtistConsolidationService:
             for ids in groups.values():
                 if len(ids) < 2:
                     continue
-                anchor = ids[0]
-                for candidate in ids[1:]:
-                    union(anchor, candidate, reason)
+                group_rows = [row_by_id[value] for value in ids]
+                if reason == "same_presentation_identity":
+                    if self._provider_conflict(group_rows, "discogs_artist_id"):
+                        reject(ids, "discogs_id_conflict")
+                        continue
+                    if self._provider_conflict(
+                        group_rows, "musicbrainz_artist_id"
+                    ):
+                        reject(ids, "musicbrainz_id_conflict")
+                        continue
+                    if self._ambiguous_exact_name(group_rows):
+                        reject(ids, "ambiguous_exact_same_name")
+                        continue
+                for index, left in enumerate(ids):
+                    for right in ids[index + 1 :]:
+                        add_edge(left, right, reason)
 
-        components: dict[int, list[int]] = {}
-        for artist_id in parent:
-            components.setdefault(find(artist_id), []).append(artist_id)
+        if _table_exists(self.conn, "artist_aliases"):
+            ids_by_name: dict[str, list[int]] = {}
+            for row in rows:
+                ids_by_name.setdefault(str(row["normalized_name"]), []).append(
+                    int(row["id"])
+                )
+            alias_owners: dict[str, set[int]] = {}
+            for alias in self.conn.execute(
+                "SELECT artist_id,normalized_alias FROM artist_aliases ORDER BY id"
+            ).fetchall():
+                owner = int(alias["artist_id"])
+                normalized_alias = str(alias["normalized_alias"])
+                if owner in row_by_id and normalized_alias:
+                    alias_owners.setdefault(normalized_alias, set()).add(owner)
+            for normalized_alias, owners in alias_owners.items():
+                candidates = ids_by_name.get(normalized_alias, ())
+                if len(owners) > 1:
+                    reject(
+                        tuple(sorted(owners | set(candidates))),
+                        "ambiguous_preserved_alias",
+                    )
+                    continue
+                owner = next(iter(owners))
+                for candidate in candidates:
+                    add_edge(owner, candidate, "preserved_alias_identity")
 
-        merges: list[ArtistMerge] = []
-        conflicts: list[ArtistIdentityConflict] = []
-        for artist_ids in components.values():
-            if len(artist_ids) < 2:
+        priority = {
+            "same_discogs_artist_id": 0,
+            "same_musicbrainz_artist_id": 0,
+            "preserved_alias_identity": 1,
+            "same_presentation_identity": 2,
+        }
+        ordered_edges = sorted(
+            edges.items(),
+            key=lambda item: (
+                min(priority.get(reason, 9) for reason in item[1]),
+                item[0],
+            ),
+        )
+        for (left, right), reasons in ordered_edges:
+            first, second = find(left), find(right)
+            if first == second:
+                component_evidence[first].update(reasons)
                 continue
+            artist_ids = sorted(members[first] | members[second])
             component_rows = [row_by_id[value] for value in artist_ids]
             if self._provider_conflict(component_rows, "discogs_artist_id"):
-                conflicts.append(
-                    ArtistIdentityConflict(tuple(sorted(artist_ids)), "discogs_id_conflict")
-                )
+                reject(artist_ids, "discogs_id_conflict")
                 continue
             if self._provider_conflict(component_rows, "musicbrainz_artist_id"):
-                conflicts.append(
-                    ArtistIdentityConflict(
-                        tuple(sorted(artist_ids)), "musicbrainz_id_conflict"
-                    )
-                )
+                reject(artist_ids, "musicbrainz_id_conflict")
                 continue
             provider_context_conflict = self._accepted_provider_context_conflict(
                 component_rows
             )
             if provider_context_conflict is not None:
-                conflicts.append(
-                    ArtistIdentityConflict(
-                        tuple(sorted(artist_ids)), provider_context_conflict
-                    )
-                )
+                reject(artist_ids, provider_context_conflict)
                 continue
             if self._types_conflict(component_rows):
-                conflicts.append(
-                    ArtistIdentityConflict(tuple(sorted(artist_ids)), "person_group_conflict")
-                )
+                reject(artist_ids, "person_group_conflict")
                 continue
             if self._ambiguous_exact_name(component_rows):
-                conflicts.append(
-                    ArtistIdentityConflict(
-                        tuple(sorted(artist_ids)), "ambiguous_exact_same_name"
-                    )
-                )
+                reject(artist_ids, "ambiguous_exact_same_name")
                 continue
             if self._relationship_evidence_collision(artist_ids):
-                conflicts.append(
-                    ArtistIdentityConflict(
-                        tuple(sorted(artist_ids)),
-                        "relationship_evidence_conflict",
-                    )
-                )
+                reject(artist_ids, "relationship_evidence_conflict")
                 continue
             if self._credit_collision(artist_ids):
-                conflicts.append(
-                    ArtistIdentityConflict(tuple(sorted(artist_ids)), "credit_collision")
-                )
+                reject(artist_ids, "credit_collision")
                 continue
+
+            target, source = (first, second) if first < second else (second, first)
+            parent[source] = target
+            members[target].update(members.pop(source))
+            component_evidence[target].update(component_evidence.pop(source))
+            component_evidence[target].update(reasons)
+
+        merges: list[ArtistMerge] = []
+        for artist_ids in members.values():
+            if len(artist_ids) < 2:
+                continue
+            component_rows = [row_by_id[value] for value in artist_ids]
             canonical = min(component_rows, key=self._canonical_sort_key)
             canonical_id = int(canonical["id"])
-            reasons: set[str] = set()
-            for pair, pair_reasons in evidence.items():
-                if pair[0] in artist_ids and pair[1] in artist_ids:
-                    reasons.update(pair_reasons)
+            reasons = component_evidence[find(canonical_id)]
             merges.append(
                 ArtistMerge(
                     canonical_id,
@@ -622,7 +694,15 @@ class ArtistConsolidationService:
                     tuple(sorted(reasons)),
                 )
             )
-        return tuple(merges), tuple(conflicts)
+        return (
+            tuple(sorted(merges, key=lambda item: item.canonical_artist_id)),
+            tuple(
+                sorted(
+                    conflicts_by_key.values(),
+                    key=lambda item: (item.artist_ids, item.reason),
+                )
+            ),
+        )
 
     def _version_repairs(self) -> tuple[VersionArtistRepair, ...]:
         if not _table_exists(self.conn, "track_metadata_fields"):
@@ -631,6 +711,7 @@ class ArtistConsolidationService:
             """
             SELECT c.track_id, c.artist_id, a.display_name, a.entity_type,
                    a.discogs_artist_id, a.musicbrainz_artist_id,
+                   c.provenance AS credit_provenance,
                    vt.value AS version_type, vl.value AS version_label,
                    COALESCE(ar.is_locked, 0) AS artist_locked,
                    COALESCE(vt.is_locked, 0) AS type_locked,
@@ -671,13 +752,17 @@ class ArtistConsolidationService:
             label = _clean_display(match.group("label"))
             stored_label = _clean_display(row["version_label"])
             stored_type = str(row["version_type"] or "").strip().casefold()
-            if not stored_label or not stored_type:
-                continue
-            if normalize_artist_name(label) != normalize_artist_name(stored_label):
-                continue
             version_type = classify_artist_version_label(label)
-            if stored_type not in {version_type, "live" if version_type == "session" else version_type}:
-                continue
+            stored_version_support = bool(
+                stored_label
+                and stored_type
+                and normalize_artist_name(label) == normalize_artist_name(stored_label)
+                and stored_type
+                in {
+                    version_type,
+                    "live" if version_type == "session" else version_type,
+                }
+            )
             candidates = self.conn.execute(
                 """
                 SELECT id, display_name, entity_type,
@@ -703,6 +788,21 @@ class ArtistConsolidationService:
                 != _provider_id(canonical["musicbrainz_artist_id"])
             ):
                 continue
+            shared_provider_support = bool(
+                _provider_id(row["discogs_artist_id"])
+                and _provider_id(row["discogs_artist_id"])
+                == _provider_id(canonical["discogs_artist_id"])
+            ) or bool(
+                _provider_id(row["musicbrainz_artist_id"])
+                and _provider_id(row["musicbrainz_artist_id"])
+                == _provider_id(canonical["musicbrainz_artist_id"])
+            )
+            parsed_title_support = (
+                "title" in str(row["credit_provenance"] or "").casefold()
+                and "pars" in str(row["credit_provenance"] or "").casefold()
+            )
+            if not (stored_version_support or shared_provider_support or parsed_title_support):
+                continue
             repairs.append(
                 VersionArtistRepair(
                     int(row["track_id"]),
@@ -711,7 +811,15 @@ class ArtistConsolidationService:
                     str(canonical["display_name"]),
                     version_type,
                     label,
-                    "stored_version_fields",
+                    (
+                        "stored_version_fields"
+                        if stored_version_support
+                        else (
+                            "shared_provider_identity"
+                            if shared_provider_support
+                            else "explicit_source_title_phrase"
+                        )
+                    ),
                 )
             )
         return tuple(repairs)
@@ -743,10 +851,9 @@ class ArtistConsolidationService:
         return tuple(credits)
 
     def _full_credit_repairs(self) -> tuple[FullCreditRepair, ...]:
-        if not _table_exists(self.conn, "metadata_intelligence_items"):
-            return ()
-        rows = self.conn.execute(
-            """
+        rows = (
+            self.conn.execute(
+                """
             SELECT item.track_id, item.field_proposal, item.field_confidence,
                    c.artist_id, a.display_name, a.discogs_artist_id,
                    a.musicbrainz_artist_id,
@@ -768,8 +875,11 @@ class ArtistConsolidationService:
                   WHERE other.track_id=item.track_id AND other.id<>c.id
               )
             ORDER BY item.track_id, item.id DESC
-            """
-        ).fetchall()
+                """
+            ).fetchall()
+            if _table_exists(self.conn, "metadata_intelligence_items")
+            else ()
+        )
         repairs: dict[int, FullCreditRepair] = {}
         for row in rows:
             track_id = int(row["track_id"])
@@ -809,6 +919,77 @@ class ArtistConsolidationService:
                 credits,
                 "discogs_high_confidence",
                 _provider_id(provider.get("provider_reference")),
+                confidence,
+            )
+
+        # Explicit title-parser role phrases are the second deterministic
+        # source after provider-structured credits.  Punctuation and ordinary
+        # conjunctions are intentionally absent from this pattern: ``A & B``,
+        # ``A, B``, ``A/B`` and ``A and B`` remain one unsplit display identity.
+        if not _table_exists(self.conn, "track_metadata_fields"):
+            return tuple(repairs.values())
+        explicit_rows = self.conn.execute(
+            """
+            SELECT credit.track_id,credit.artist_id,credit.provenance,
+                   credit.provider_reference,credit.confidence,
+                   credit.is_manual,credit.is_locked,
+                   artist.display_name,artist.discogs_artist_id,
+                   artist.musicbrainz_artist_id,
+                   COALESCE(field.is_locked,0) AS artist_locked
+            FROM track_artist_credits AS credit
+            JOIN artists AS artist ON artist.id=credit.artist_id
+            LEFT JOIN track_metadata_fields AS field
+              ON field.track_id=credit.track_id AND field.field_name='artist'
+            WHERE credit.role='primary'
+              AND NOT EXISTS (
+                  SELECT 1 FROM track_artist_credits AS other
+                  WHERE other.track_id=credit.track_id AND other.id<>credit.id
+              )
+            ORDER BY credit.track_id,credit.id
+            """
+        ).fetchall()
+        for row in explicit_rows:
+            track_id = int(row["track_id"])
+            if track_id in repairs or bool(
+                row["artist_locked"] or row["is_manual"] or row["is_locked"]
+            ):
+                continue
+            provenance = str(row["provenance"] or "").casefold()
+            if "title" not in provenance or "pars" not in provenance:
+                continue
+            if _provider_id(row["discogs_artist_id"]) or _provider_id(
+                row["musicbrainz_artist_id"]
+            ):
+                continue
+            display = _clean_display(row["display_name"])
+            match = _EXPLICIT_CREDIT_PHRASE_RE.fullmatch(display)
+            if match is None:
+                continue
+            primary = _clean_display(match.group("primary"))
+            related = _clean_display(match.group("related"))
+            phrase = _clean_display(match.group("join"))
+            if not primary or not related:
+                continue
+            role = (
+                "featured"
+                if phrase.casefold().rstrip(".") in {"feat", "ft", "featuring"}
+                else "collaborator"
+            )
+            try:
+                confidence = float(row["confidence"] or 86.0)
+            except (TypeError, ValueError, OverflowError):
+                confidence = 86.0
+            if confidence < 80:
+                continue
+            repairs[track_id] = FullCreditRepair(
+                track_id,
+                int(row["artist_id"]),
+                (
+                    StructuredCredit(primary, "primary"),
+                    StructuredCredit(related, role, f" {phrase} "),
+                ),
+                "explicit_source_title_phrase",
+                _provider_id(row["provider_reference"]),
                 confidence,
             )
         return tuple(repairs.values())
@@ -1326,6 +1507,7 @@ class ArtistConsolidationService:
             confidence=repair.confidence,
             actor="artist_consolidation",
             reason="structured_full_credit_repair",
+            update_display=False,
             commit=False,
         )
         primary = self.conn.execute(

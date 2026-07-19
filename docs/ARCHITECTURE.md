@@ -60,6 +60,8 @@ provides the user interface, Qt Multimedia provides playback through
 | `music_vault/metadata/review_reclassification.py` | Bounded, resumable reclassification of saved review evidence without constructing provider clients. |
 | `music_vault/metadata/soundtrack.py` | Conservative soundtrack/score/cast context classification and distinct-work safeguards. |
 | `music_vault/metadata/intelligence.py` | Consent-gated Discogs-first, MusicBrainz-secondary field ensemble, automatic import queue, and resumable library analysis. |
+| `music_vault/metadata/title_orientation.py` | Pure, bounded dual-orientation scoring and persistence-safe decision evidence for ambiguous dash titles. |
+| `music_vault/metadata/orientation_repair.py` | Exact-one-target, transaction-aware Batch 10.6 orientation repair boundary used only by explicit acceptance tooling. |
 | `music_vault/metadata/artist_credits.py` | Conservative legacy seeding plus provider/manual structured-credit persistence and display materialization. |
 | `music_vault/metadata/title_parser.py` | Comparison-only extraction of YouTube title, credit, and version hints without rewriting stored metadata. |
 | `music_vault/metadata/uploader_classifier.py` | Conservative uploader/channel classification so labels and distribution channels remain provenance. |
@@ -263,10 +265,16 @@ once and can resume an explicitly started existing-library job. Provider work
 runs outside import and GUI transactions. Discogs is preferred only when its
 match is strong and version-consistent; MusicBrainz corroborates or fills a
 credible fallback, while YouTube titles and uploader classes provide hints and
-provenance. Only unambiguous field-level confidence at the automatic threshold
-may update an unlocked field. Disagreement, release/date ambiguity, version
-conflict, and uncertain artist identity remain review-only. A recording-group
+provenance. Best-available unlocked database values retain field confidence
+and reasons. Disagreement, release/date ambiguity, version conflict, and
+uncertain artist identity remain explicit audit diagnostics. A recording-group
 key never merges media or changes source membership.
+
+Dash-title provider work is adaptive rather than an eager query expansion.
+The first Discogs orientation short-circuits only when conclusive; otherwise
+one reverse Discogs request is allowed. One MusicBrainz request may corroborate
+or provide a secondary fallback. Soundtrack work/release context is carried on
+those same queries, so it does not expand the two-orientation request budget.
 
 The remediation coordinator keeps analysis separate from apply. Analysis
 snapshots state, uses cached/rate-limited provider candidates, and writes only
@@ -274,7 +282,8 @@ private job/cache/report records. Apply rechecks the aggregate library revision,
 per-item metadata/locks, candidate age, file state, and disk estimate. It routes
 eligible database changes through `MetadataService`; manual and confirmed locks
 remain authoritative. Distinct recording identity is evaluated separately from
-album/release/artwork certainty, so ambiguous release fields stay review-only.
+album/release/artwork certainty, so ambiguous secondary fields become recorded
+gaps instead of blocking non-conflicting values.
 
 Supported MP3 writeback creates and verifies a complete original backup, edits
 a temporary copy, validates tag readback and unchanged audio-payload hash/codec/

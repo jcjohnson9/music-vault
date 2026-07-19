@@ -172,6 +172,13 @@ def test_strong_source_title_without_provider_is_accepted_fallback():
             "artist": "Synthetic Ensemble",
             "pattern": "artist_dash_title",
             "version_type": "unknown",
+            "orientation": {
+                "evaluated_count": 2,
+                "selected": "left_is_artist",
+                "provider_confirmed": False,
+                "requires_provider_adjudication": True,
+                "reasons": ["provisional_conventional_orientation"],
+            },
         },
     )
 
@@ -373,6 +380,13 @@ def test_reclassification_is_resumable_network_free_and_reconciles_counts(tmp_pa
             "title": "Source Title",
             "artist": "Source Artist",
             "pattern": "artist_dash_title",
+            "orientation": {
+                "evaluated_count": 2,
+                "selected": "left_is_artist",
+                "provider_confirmed": False,
+                "requires_provider_adjudication": True,
+                "reasons": ["provisional_conventional_orientation"],
+            },
         },
     )
     conflict = _evidence(reason="version_conflict")
@@ -394,10 +408,10 @@ def test_reclassification_is_resumable_network_free_and_reconciles_counts(tmp_pa
 
     applied = reclassifier.reclassify(job_id=job_id, limit=20, apply=True)
     assert applied.scanned == 3
-    assert applied.applied_with_gaps == 1
+    assert applied.applied_with_gaps == 2
     assert applied.source_fallback == 1
-    assert applied.needs_review == 1
-    assert applied.safe_fields_applied == 1
+    assert applied.needs_review == 0
+    assert applied.safe_fields_applied == 2
     states = {
         int(row["id"]): str(row["state"])
         for row in db.conn.execute(
@@ -406,37 +420,31 @@ def test_reclassification_is_resumable_network_free_and_reconciles_counts(tmp_pa
     }
     assert states[item_ids[0]] == "applied_with_gaps"
     assert states[item_ids[1]] == "source_fallback"
-    assert states[item_ids[2]] == "review"
+    assert states[item_ids[2]] == "applied_with_gaps"
     summary = store.job_summary(job_id)
-    assert summary.review_items == 1
-    assert summary.applied_with_gaps_items == 1
+    assert summary.review_items == 0
+    assert summary.applied_with_gaps_items == 2
     assert summary.source_fallback_items == 1
-    assert db.get_track(track_ids[0])["title"] == "Recovered Synthetic Title"
+    assert db.get_track(track_ids[0])["title"] == "Synthetic Theme"
 
     history = db.conn.execute(
         "SELECT COUNT(*) FROM track_metadata_history WHERE track_id=? AND field_name='title'",
         (track_ids[0],),
     ).fetchone()[0]
     assert history == 1
-    before_item = db.conn.execute(
-        "SELECT updated_at FROM metadata_intelligence_items WHERE id=?", (item_ids[2],)
-    ).fetchone()[0]
     before_job = db.conn.execute(
         "SELECT updated_at FROM metadata_intelligence_jobs WHERE id=?", (job_id,)
     ).fetchone()[0]
     rerun = reclassifier.reclassify(job_id=job_id, apply=True)
-    assert rerun.scanned == 1
+    assert rerun.scanned == 0
     assert rerun.changed == 0
-    assert db.conn.execute(
-        "SELECT updated_at FROM metadata_intelligence_items WHERE id=?", (item_ids[2],)
-    ).fetchone()[0] == before_item
     assert db.conn.execute(
         "SELECT updated_at FROM metadata_intelligence_jobs WHERE id=?", (job_id,)
     ).fetchone()[0] == before_job
     db.close()
 
 
-def test_review_dashboard_defaults_to_critical_review_and_can_show_gaps(
+def test_outcome_dashboard_defaults_to_all_and_keeps_legacy_pending_auditable(
     tmp_path, qapp
 ):
     db = MusicVaultDB(tmp_path / "ui.sqlite3", backup_dir=tmp_path / "backups")
@@ -459,25 +467,33 @@ def test_review_dashboard_defaults_to_critical_review_and_can_show_gaps(
                 "title": "Fallback",
                 "artist": "Synthetic Ensemble",
                 "pattern": "artist_dash_title",
+                "orientation": {
+                    "evaluated_count": 2,
+                    "selected": "left_is_artist",
+                    "provider_confirmed": False,
+                    "requires_provider_adjudication": True,
+                    "reasons": ["provisional_conventional_orientation"],
+                },
             },
         ),
     )
     store.mark_item(claimed[2].id, "review", **_evidence(reason="version_conflict"))
 
     dialog = MetadataIntelligenceDialog(db)
-    assert dialog.filter_combo.currentData() == "needs_review"
-    assert dialog.table.rowCount() == 1
-    assert dialog.table.item(0, 0).text() == "Needs Review"
-    assert "Needs Review: 1" in dialog.summary.text()
+    assert dialog.filter_combo.currentData() is None
+    assert dialog.filter_combo.findData("needs_review") == -1
+    assert dialog.table.rowCount() == 3
+    assert {dialog.table.item(row, 0).text() for row in range(3)} == {
+        "Legacy Pending",
+        "Applied with Gaps",
+        "Accepted Source Fallback",
+    }
+    assert "Pending: 1" in dialog.summary.text()
     assert "Applied with Gaps: 1" in dialog.summary.text()
     assert "Source Fallback: 1" in dialog.summary.text()
 
     dialog.show_incomplete_checkbox.setChecked(True)
-    assert dialog.table.rowCount() == 2
-    assert {dialog.table.item(row, 0).text() for row in range(2)} == {
-        "Needs Review",
-        "Applied with Gaps",
-    }
+    assert dialog.table.rowCount() == 3
     dialog.filter_combo.setCurrentIndex(dialog.filter_combo.findData("source_fallback"))
     assert dialog.table.rowCount() == 1
     assert dialog.table.item(0, 0).text() == "Accepted Source Fallback"

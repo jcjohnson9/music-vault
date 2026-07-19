@@ -63,6 +63,10 @@ RENDER_WIDTH = 1100
 RENDER_HEIGHT = 720
 ARTWORK_COUNT = 24
 RECLASSIFICATION_BATCH_SIZE = 250
+ALBUM_SUMMARY_SQL_STATEMENT_LIMIT = 4
+ARTIST_SUMMARY_SQL_STATEMENT_LIMIT = 9
+ALBUM_TRACK_SQL_STATEMENT_LIMIT = 2
+ARTIST_SECTION_SQL_STATEMENT_LIMIT = 7
 T = TypeVar("T")
 
 
@@ -175,9 +179,11 @@ def _generate_artwork(path: Path, index: int) -> None:
         raise RuntimeError("Synthetic artwork generation failed.")
 
 
-def _review_evidence(index: int) -> tuple[str, str, str, str, str]:
+def _review_evidence(
+    index: int, artist_index: int
+) -> tuple[str, str, str, str, str]:
     title = f"Synthetic Track {index:05d}"
-    artist = f"Synthetic Artist {index:04d}"
+    artist = f"Synthetic Artist {artist_index:04d}"
     common_current = {
         "title": title,
         "artist": artist,
@@ -406,7 +412,9 @@ def _seed_database(root: Path, track_count: int) -> tuple[Path, dict[str, object
         )
         item_rows = []
         for index, track_id in enumerate(track_ids):
-            hints, proposal, confidence, agreement, reason = _review_evidence(index)
+            hints, proposal, confidence, agreement, reason = _review_evidence(
+                index, index % artist_count
+            )
             item_rows.append(
                 (
                     job_id,
@@ -672,11 +680,20 @@ def _profile_dataset(app: QApplication, track_count: int) -> dict[str, object]:
             or counts["canonical_artists"] != requested_artists
         ):
             raise RuntimeError("Synthetic canonical browser seed did not reconcile.")
-        # Schema capability probes plus one aggregate summary query (and one
-        # representative-cover query for albums) stay constant as card counts
-        # grow.  A per-card query would make these totals scale with results.
-        if album_query_statements > 4 or artist_query_statements > 3:
+        # Schema capability probes and the bounded canonical identity, alias,
+        # relationship, and aggregate summary queries stay constant as card
+        # counts grow. A per-card query would make these totals scale with
+        # results.
+        if (
+            album_query_statements > ALBUM_SUMMARY_SQL_STATEMENT_LIMIT
+            or artist_query_statements > ARTIST_SUMMARY_SQL_STATEMENT_LIMIT
+        ):
             raise RuntimeError("Synthetic browser summaries used per-card SQL queries.")
+        if (
+            album_track_query_statements > ALBUM_TRACK_SQL_STATEMENT_LIMIT
+            or artist_section_query_statements > ARTIST_SECTION_SQL_STATEMENT_LIMIT
+        ):
+            raise RuntimeError("Synthetic browser details used per-track SQL queries.")
         if "idx_track_album_memberships_album" not in album_membership_plan:
             raise RuntimeError("Canonical album lookup did not use its membership index.")
 

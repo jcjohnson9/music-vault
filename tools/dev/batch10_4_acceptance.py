@@ -64,6 +64,8 @@ EXPECTED_CACHE_RECORD_FIELDS = frozenset(
         "requested_display_name",
         "normalized_key",
         "identity_key",
+        "canonical_artist_id",
+        "historical_aliases",
         "matched_artist_name",
         "musicbrainz_artist_id",
         "discogs_artist_id",
@@ -74,6 +76,10 @@ EXPECTED_CACHE_RECORD_FIELDS = frozenset(
         "image_url",
         "cache_file",
         "content_type",
+        "width",
+        "height",
+        "portrait_kind",
+        "pinned",
         "fetched_at",
         "retry_after",
         "error_code",
@@ -323,6 +329,7 @@ def audit_artist_cache(
             "tree_file_count": 0,
             "tree_total_bytes": 0,
             "index_entry_count": 0,
+            "index_alias_count": 0,
             "resolved_entry_count": 0,
             "referenced_image_count": 0,
             "physical_image_count": 0,
@@ -372,15 +379,35 @@ def audit_artist_cache(
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != ARTIST_IMAGE_CACHE_SCHEMA_VERSION
-        or set(payload) != {"schema_version", "entries"}
+        or not {"schema_version", "entries"} <= set(payload)
+        or not set(payload) <= {"schema_version", "entries", "aliases"}
         or not isinstance(payload.get("entries"), dict)
+        or not isinstance(payload.get("aliases", {}), dict)
     ):
         issues["index_invalid"] += 1
         result["checks"] = {"cache_root_valid": True, "index_parses": False}
         return result
 
     entries: Mapping[str, Any] = payload["entries"]
+    aliases: Mapping[str, Any] = payload.get("aliases", {})
     result["counts"]["index_entry_count"] = len(entries)
+    result["counts"]["index_alias_count"] = len(aliases)
+    for alias_key, targets in aliases.items():
+        if not ENTRY_KEY_RE.fullmatch(str(alias_key)):
+            issues["unexpected_entry"] += 1
+            continue
+        values = [targets] if isinstance(targets, str) else targets
+        if (
+            not isinstance(values, list)
+            or not values
+            or len(values) > 256
+            or len(set(str(value) for value in values)) != len(values)
+            or any(
+                not ENTRY_KEY_RE.fullmatch(str(value)) or str(value) not in entries
+                for value in values
+            )
+        ):
+            issues["unexpected_entry"] += 1
     files_dir = (root / "files").resolve(strict=False)
     referenced: dict[Path, str] = {}
     validated_physical: set[Path] = set()

@@ -91,7 +91,7 @@ def test_offscreen_review_renders_production_window_and_dialog_then_cleans_temp(
 
     completed = subprocess.run(
         [
-            str(PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"),
+            sys.executable,
             "-B",
             str(PROJECT_ROOT / "tools" / "dev" / "run_batch10_3_review.py"),
             "--offscreen",

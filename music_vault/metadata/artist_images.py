@@ -41,6 +41,11 @@ ARTIST_IMAGE_USER_AGENT = user_agent()
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_PIXELS = 25_000_000
+MIN_NEW_PORTRAIT_DIMENSION = 320
+MIN_PORTRAIT_ASPECT_RATIO = 0.45
+MAX_PORTRAIT_ASPECT_RATIO = 2.2
+MAX_CACHE_REPAIR_GROUPS = 10_000
+MAX_CACHE_IDENTITIES_PER_GROUP = 256
 CONNECT_TIMEOUT_SECONDS = 5.0
 READ_TIMEOUT_SECONDS = 15.0
 MAX_REDIRECTS = 3
@@ -96,6 +101,10 @@ class ArtistIdentity:
     normalized_key: str
     discogs_artist_id: str | None = None
     musicbrainz_artist_id: str | None = None
+    canonical_artist_id: int | None = None
+    historical_aliases: tuple[str, ...] = ()
+    allow_normalized_name_cache: bool = False
+    allow_historical_alias_cache: bool = False
 
     @classmethod
     def from_display_name(
@@ -104,6 +113,10 @@ class ArtistIdentity:
         *,
         discogs_artist_id: object = None,
         musicbrainz_artist_id: object = None,
+        canonical_artist_id: object = None,
+        historical_aliases: Sequence[object] = (),
+        allow_normalized_name_cache: bool = False,
+        allow_historical_alias_cache: bool = False,
     ) -> "ArtistIdentity":
         display_name = _display_artist_name(value)
         discogs_id = str(discogs_artist_id or "").strip() or None
@@ -112,20 +125,75 @@ class ArtistIdentity:
         musicbrainz_id = str(musicbrainz_artist_id or "").strip() or None
         if musicbrainz_id is not None and not _MUSICBRAINZ_ID_RE.fullmatch(musicbrainz_id):
             musicbrainz_id = None
+        try:
+            canonical_id = int(canonical_artist_id) if canonical_artist_id is not None else None
+        except (TypeError, ValueError, OverflowError):
+            canonical_id = None
+        if canonical_id is not None and canonical_id <= 0:
+            canonical_id = None
+        aliases = tuple(
+            dict.fromkeys(
+                normalized
+                for normalized in (
+                    normalize_artist_identity(alias) for alias in historical_aliases
+                )
+                if normalized and normalized != normalize_artist_identity(display_name)
+            )
+        )
         return cls(
             display_name,
             normalize_artist_identity(display_name),
             discogs_id,
             musicbrainz_id,
+            canonical_id,
+            aliases,
+            bool(allow_normalized_name_cache),
+            bool(allow_historical_alias_cache),
         )
 
     @property
     def cache_identity(self) -> str:
+        if self.canonical_artist_id is not None:
+            return f"artist:{self.canonical_artist_id}"
         if self.discogs_artist_id:
             return f"discogs:{self.discogs_artist_id}"
         if self.musicbrainz_artist_id:
             return f"musicbrainz:{self.musicbrainz_artist_id.casefold()}"
         return f"name:{self.normalized_key}"
+
+    @property
+    def cache_identities(self) -> tuple[str, ...]:
+        """Return every bounded cache identity known for this canonical artist.
+
+        Provider-backed same-name entities remain isolated unless the caller
+        has proved that the normalized presentation is unambiguous in current
+        database context. Canonical/provider IDs alone cannot safely claim a
+        legacy name-only portrait because distinct artists can share a name.
+        """
+
+        values: list[str] = []
+        if self.canonical_artist_id is not None:
+            values.append(f"artist:{self.canonical_artist_id}")
+        if self.musicbrainz_artist_id:
+            values.append(f"musicbrainz:{self.musicbrainz_artist_id.casefold()}")
+        if self.discogs_artist_id:
+            values.append(f"discogs:{self.discogs_artist_id}")
+        if (
+            (
+                not self.musicbrainz_artist_id
+                and not self.discogs_artist_id
+                or self.allow_normalized_name_cache
+            )
+            and self.normalized_key
+        ):
+            values.append(f"name:{self.normalized_key}")
+        if (
+            not self.musicbrainz_artist_id
+            and not self.discogs_artist_id
+            or self.allow_historical_alias_cache
+        ):
+            values.extend(f"name:{alias}" for alias in self.historical_aliases)
+        return tuple(dict.fromkeys(values))
 
 
 @dataclass(frozen=True)
@@ -147,6 +215,10 @@ class ArtistImageResult:
     content_type: str | None = None
     image_bytes: bytes | None = field(default=None, repr=False, compare=False)
     from_cache: bool = False
+    width: int | None = None
+    height: int | None = None
+    portrait_kind: str | None = None
+    pinned: bool = False
 
     @property
     def resolved(self) -> bool:
@@ -397,6 +469,20 @@ def validate_image_payload(
     return ValidatedImage(payload, mime, extension, image.width(), image.height())
 
 
+def validate_new_portrait_quality(image: ValidatedImage) -> ValidatedImage:
+    """Reject newly fetched thumbnail-scale or unusably shaped portraits."""
+
+    if (
+        image.width < MIN_NEW_PORTRAIT_DIMENSION
+        or image.height < MIN_NEW_PORTRAIT_DIMENSION
+    ):
+        raise ArtistImageContentError("portrait_dimensions_too_small")
+    aspect_ratio = image.width / image.height
+    if not MIN_PORTRAIT_ASPECT_RATIO <= aspect_ratio <= MAX_PORTRAIT_ASPECT_RATIO:
+        raise ArtistImageContentError("portrait_aspect_ratio_rejected")
+    return image
+
+
 class SafeArtistImageTransport:
     """Small requests transport with strict public-destination and body limits."""
 
@@ -544,9 +630,15 @@ class _RateLimiter:
 class MusicBrainzWikimediaProvider:
     """No-key provider using MusicBrainz identity and Wikimedia APIs."""
 
-    def __init__(self, transport: SafeArtistImageTransport | None = None) -> None:
+    def __init__(
+        self,
+        transport: SafeArtistImageTransport | None = None,
+        *,
+        allow_direct_fallback: bool = True,
+    ) -> None:
         self.transport = transport or SafeArtistImageTransport()
         self._musicbrainz_rate = _RateLimiter(1.05)
+        self.allow_direct_fallback = bool(allow_direct_fallback)
 
     @staticmethod
     def _cancelled(cancel_event: threading.Event | None) -> None:
@@ -684,7 +776,7 @@ class MusicBrainzWikimediaProvider:
         image_url = str(info.get("thumburl") or info.get("url") or "")
         if not image_url:
             return None
-        validated = self.transport.get_image(image_url)
+        validated = validate_new_portrait_quality(self.transport.get_image(image_url))
         source = str(info.get("descriptionurl") or "")
         if not is_safe_artist_source_url(source):
             source = "https://commons.wikimedia.org/wiki/File:" + quote(filename, safe="_()-.~")
@@ -786,7 +878,7 @@ class MusicBrainzWikimediaProvider:
         )
         if not image_url:
             return None
-        validated = self.transport.get_image(image_url)
+        validated = validate_new_portrait_quality(self.transport.get_image(image_url))
         source = str(page.get("fullurl") or "")
         if not is_safe_artist_source_url(source):
             source = "https://en.wikipedia.org/wiki/" + quote(page_title, safe="_()-.~")
@@ -941,7 +1033,7 @@ class MusicBrainzWikimediaProvider:
                 resolved = self._wikidata_image(wikidata_id, cancel_event)
             if resolved is None and wikipedia_title:
                 resolved = self._wikipedia_image(wikipedia_title, cancel_event)
-            if resolved is None:
+            if resolved is None and self.allow_direct_fallback:
                 resolved = self._direct_wikimedia_image(
                     identity,
                     cancel_event,
@@ -967,6 +1059,9 @@ class MusicBrainzWikimediaProvider:
                 source_page_url=source_page,
                 image_url=image_url,
                 content_type=image.content_type,
+                width=image.width,
+                height=image.height,
+                portrait_kind="musicbrainz_wikimedia",
                 image_bytes=image.payload,
             )
         except CancelledError:
@@ -978,6 +1073,70 @@ class MusicBrainzWikimediaProvider:
                 error_code=_safe_error_code(exc),
             )
         except (ArtistImageUnavailableError, ArtistImageContentError, UnsafeArtistImageUrlError) as exc:
+            return ArtistImageResult(
+                ArtistImageStatus.UNAVAILABLE,
+                identity,
+                error_code=_safe_error_code(exc),
+            )
+        except Exception:
+            return ArtistImageResult(
+                ArtistImageStatus.TEMPORARY_ERROR,
+                identity,
+                error_code="provider_error",
+            )
+
+
+class StrictDirectWikimediaProvider(MusicBrainzWikimediaProvider):
+    """Exact-name Wikimedia fallback that performs no MusicBrainz search."""
+
+    def __init__(self, transport: SafeArtistImageTransport | None = None) -> None:
+        super().__init__(transport, allow_direct_fallback=True)
+
+    def resolve(
+        self,
+        identity: ArtistIdentity,
+        cancel_event: threading.Event | None = None,
+    ) -> ArtistImageResult:
+        if not identity.normalized_key:
+            return ArtistImageResult(ArtistImageStatus.NO_MATCH, identity)
+        try:
+            resolved = self._direct_wikimedia_image(
+                identity,
+                cancel_event,
+                musicbrainz_artist_id=identity.musicbrainz_artist_id,
+            )
+            if resolved is None:
+                return ArtistImageResult(ArtistImageStatus.NO_MATCH, identity)
+            image, source_page, image_url = resolved
+            return ArtistImageResult(
+                ArtistImageStatus.RESOLVED,
+                identity,
+                matched_artist_name=identity.display_name,
+                musicbrainz_artist_id=identity.musicbrainz_artist_id,
+                discogs_artist_id=identity.discogs_artist_id,
+                match_score=100,
+                image_provider="Wikimedia Commons",
+                source_page_url=source_page,
+                image_url=image_url,
+                content_type=image.content_type,
+                width=image.width,
+                height=image.height,
+                portrait_kind="direct_wikimedia",
+                image_bytes=image.payload,
+            )
+        except CancelledError:
+            raise
+        except ArtistImageTemporaryError as exc:
+            return ArtistImageResult(
+                ArtistImageStatus.TEMPORARY_ERROR,
+                identity,
+                error_code=_safe_error_code(exc),
+            )
+        except (
+            ArtistImageUnavailableError,
+            ArtistImageContentError,
+            UnsafeArtistImageUrlError,
+        ) as exc:
             return ArtistImageResult(
                 ArtistImageStatus.UNAVAILABLE,
                 identity,
@@ -1051,25 +1210,35 @@ class DiscogsArtistImageProvider:
         return next(iter(candidates)) if len(candidates) == 1 else None
 
     @staticmethod
-    def _artist_image(payload: Mapping[str, Any]) -> str | None:
+    def _looks_like_placeholder(url: str) -> bool:
+        lowered = url.casefold()
+        return any(
+            marker in lowered
+            for marker in (
+                "placeholder",
+                "noimage",
+                "no-image",
+                "default-avatar",
+                "spacer.gif",
+                "discogs-logo",
+            )
+        )
+
+    @classmethod
+    def _artist_image_candidates(cls, payload: Mapping[str, Any]) -> tuple[str, ...]:
         values = payload.get("images") or ()
         if not isinstance(values, Sequence) or isinstance(
             values, (str, bytes, bytearray)
         ):
-            return None
-        ranked: list[tuple[int, int, str]] = []
+            return ()
+        ranked: list[tuple[int, int, int, int, int, str]] = []
+        seen: set[str] = set()
         for order, value in enumerate(values):
             if not isinstance(value, Mapping):
                 continue
             image_type = str(value.get("type") or "").strip().casefold()
             if image_type not in {"primary", "secondary"}:
                 continue
-            image_url = str(
-                value.get("uri150")
-                or value.get("uri")
-                or value.get("resource_url")
-                or ""
-            ).strip()
             try:
                 width = int(value.get("width") or 0)
                 height = int(value.get("height") or 0)
@@ -1079,9 +1248,47 @@ class DiscogsArtistImageProvider:
                 width and height and width * height > MAX_IMAGE_PIXELS
             ):
                 continue
-            if image_url:
-                ranked.append((0 if image_type == "primary" else 1, order, image_url))
-        return min(ranked)[2] if ranked else None
+            if width and height:
+                aspect_ratio = width / height
+                if (
+                    width < MIN_NEW_PORTRAIT_DIMENSION
+                    or height < MIN_NEW_PORTRAIT_DIMENSION
+                    or not MIN_PORTRAIT_ASPECT_RATIO
+                    <= aspect_ratio
+                    <= MAX_PORTRAIT_ASPECT_RATIO
+                ):
+                    # In particular, never promote a declared 150-pixel
+                    # thumbnail to a resolved portrait.
+                    continue
+            for source_rank, field_name in enumerate(
+                ("uri", "resource_url", "original", "image_url", "url")
+            ):
+                image_url = str(value.get(field_name) or "").strip()
+                if (
+                    not image_url
+                    or image_url in seen
+                    or cls._looks_like_placeholder(image_url)
+                ):
+                    continue
+                seen.add(image_url)
+                ranked.append(
+                    (
+                        0 if image_type == "primary" else 1,
+                        source_rank,
+                        -min(width, height),
+                        -(width * height),
+                        order,
+                        image_url,
+                    )
+                )
+            # ``uri150`` is intentionally diagnostic-only and is never
+            # returned as an automatically accepted candidate.
+        return tuple(candidate[-1] for candidate in sorted(ranked))
+
+    @classmethod
+    def _artist_image(cls, payload: Mapping[str, Any]) -> str | None:
+        candidates = cls._artist_image_candidates(payload)
+        return candidates[0] if candidates else None
 
     def resolve(
         self,
@@ -1104,8 +1311,8 @@ class DiscogsArtistImageProvider:
             matched_name = self._clean_discogs_name(payload.get("name"))
             if normalize_artist_identity(matched_name) != identity.normalized_key:
                 return ArtistImageResult(ArtistImageStatus.AMBIGUOUS, identity)
-            image_url = self._artist_image(payload)
-            if not image_url:
+            image_candidates = self._artist_image_candidates(payload)
+            if not image_candidates:
                 return ArtistImageResult(
                     ArtistImageStatus.NO_MATCH,
                     identity,
@@ -1113,7 +1320,31 @@ class DiscogsArtistImageProvider:
                     discogs_artist_id=artist_id,
                     match_score=100,
                 )
-            validated = self.transport.get_image(image_url)
+            validated: ValidatedImage | None = None
+            image_url: str | None = None
+            for candidate_url in image_candidates:
+                try:
+                    candidate = validate_new_portrait_quality(
+                        self.transport.get_image(candidate_url)
+                    )
+                except (
+                    ArtistImageContentError,
+                    ArtistImageUnavailableError,
+                    UnsafeArtistImageUrlError,
+                ):
+                    continue
+                validated = candidate
+                image_url = candidate_url
+                break
+            if validated is None or image_url is None:
+                return ArtistImageResult(
+                    ArtistImageStatus.NO_MATCH,
+                    identity,
+                    matched_artist_name=matched_name,
+                    discogs_artist_id=artist_id,
+                    match_score=100,
+                    error_code="discogs_portrait_quality_rejected",
+                )
             source_page = f"https://www.discogs.com/artist/{artist_id}"
             return ArtistImageResult(
                 ArtistImageStatus.RESOLVED,
@@ -1126,6 +1357,9 @@ class DiscogsArtistImageProvider:
                 source_page_url=source_page,
                 image_url=image_url,
                 content_type=validated.content_type,
+                width=validated.width,
+                height=validated.height,
+                portrait_kind="discogs",
                 image_bytes=validated.payload,
             )
         except CancelledError:
@@ -1279,14 +1513,23 @@ def create_artist_image_provider(
         return SyntheticArtistImageProvider()
     if requested not in {"", "production", "public"}:
         raise RuntimeError("Unknown artist-image provider mode.")
-    public_provider = MusicBrainzWikimediaProvider()
+    public_transport = SafeArtistImageTransport()
+    linked_wikimedia = MusicBrainzWikimediaProvider(
+        public_transport,
+        allow_direct_fallback=False,
+    )
+    direct_wikimedia = StrictDirectWikimediaProvider(public_transport)
     from .intelligence_settings import DiscogsTokenStore
 
     token = DiscogsTokenStore().read()
     if not token:
-        return public_provider
+        return ChainedArtistImageProvider((linked_wikimedia, direct_wikimedia))
     return ChainedArtistImageProvider(
-        (DiscogsArtistImageProvider(token=token), public_provider)
+        (
+            linked_wikimedia,
+            DiscogsArtistImageProvider(token=token),
+            direct_wikimedia,
+        )
     )
 
 
@@ -1341,11 +1584,19 @@ class ArtistImageCache:
         return hashlib.sha256(identity.cache_identity.encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _identity_key(value: str) -> str:
+        return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _legacy_entry_key(identity: ArtistIdentity) -> str:
         return hashlib.sha256(identity.normalized_key.encode("utf-8")).hexdigest()
 
     def _empty_manifest(self) -> dict[str, Any]:
-        return {"schema_version": ARTIST_IMAGE_CACHE_SCHEMA_VERSION, "entries": {}}
+        return {
+            "schema_version": ARTIST_IMAGE_CACHE_SCHEMA_VERSION,
+            "entries": {},
+            "aliases": {},
+        }
 
     def _load(self) -> dict[str, Any]:
         if self._manifest is not None:
@@ -1358,6 +1609,8 @@ class ArtistImageCache:
                 or not isinstance(loaded.get("entries"), dict)
             ):
                 raise ValueError("unsupported cache manifest")
+            if not isinstance(loaded.get("aliases"), dict):
+                loaded["aliases"] = {}
             self._manifest = loaded
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             self._manifest = self._empty_manifest()
@@ -1391,9 +1644,102 @@ class ArtistImageCache:
     def _drop_broken_entry(self, entry_key: str, file_path: Path | None = None) -> None:
         entries = self._load()["entries"]
         entries.pop(entry_key, None)
+        aliases = self._load().get("aliases") or {}
+        for alias_key, targets in tuple(aliases.items()):
+            values = [targets] if isinstance(targets, str) else list(targets or ())
+            remaining = [value for value in values if value != entry_key]
+            if remaining:
+                aliases[alias_key] = remaining
+            else:
+                aliases.pop(alias_key, None)
         if file_path is not None and file_path.parent == self.files_dir:
-            file_path.unlink(missing_ok=True)
+            referenced_elsewhere = any(
+                isinstance(record, Mapping)
+                and self._safe_cached_path(record.get("cache_file")) == file_path
+                for record in entries.values()
+            )
+            if not referenced_elsewhere:
+                file_path.unlink(missing_ok=True)
         self._write_manifest()
+
+    @staticmethod
+    def _record_priority(record: Mapping[str, Any]) -> int:
+        if any(
+            record.get(key) is True
+            for key in ("pinned", "manual", "is_pinned", "is_manual")
+        ) or str(record.get("portrait_kind") or "").casefold() in {
+            "manual",
+            "pinned",
+            "manual_pinned",
+        }:
+            return 0
+        kind = str(record.get("portrait_kind") or "").strip().casefold()
+        explicit = {
+            "musicbrainz_wikimedia": 1,
+            "discogs": 2,
+            "direct_wikimedia": 3,
+        }
+        if kind in explicit:
+            return explicit[kind]
+        provider = str(record.get("image_provider") or "").strip().casefold()
+        musicbrainz_id = str(record.get("musicbrainz_artist_id") or "").strip()
+        if "wikimedia" in provider and bool(musicbrainz_id):
+            return 1
+        if "discogs" in provider:
+            return 2
+        if any(
+            marker in provider for marker in ("wikimedia", "wikidata", "wikipedia")
+        ):
+            return 3
+        return 4
+
+    @classmethod
+    def _selection_key(
+        cls,
+        record: Mapping[str, Any],
+        image: ValidatedImage,
+    ) -> tuple[int, int, int, int, float]:
+        fetched = _parse_iso(record.get("fetched_at"))
+        fetched_timestamp = fetched.timestamp() if fetched is not None else 0.0
+        return (
+            cls._record_priority(record),
+            -min(image.width, image.height),
+            -max(image.width, image.height),
+            -(image.width * image.height),
+            -fetched_timestamp,
+        )
+
+    def _candidate_entry_keys(
+        self,
+        identities: Sequence[ArtistIdentity],
+    ) -> tuple[str, ...]:
+        manifest = self._load()
+        aliases = manifest.get("aliases") or {}
+        candidates: list[str] = []
+        for identity in identities:
+            cache_identities = identity.cache_identities
+            for cache_identity in cache_identities:
+                alias_key = self._identity_key(cache_identity)
+                candidates.append(alias_key)
+                targets = aliases.get(alias_key)
+                if isinstance(targets, str):
+                    candidates.append(targets)
+                elif isinstance(targets, Sequence):
+                    candidates.extend(str(target) for target in targets)
+            if (
+                identity.normalized_key
+                and any(value.startswith("name:") for value in cache_identities)
+            ):
+                candidates.append(self._legacy_entry_key(identity))
+                for cache_identity in cache_identities:
+                    if not cache_identity.startswith("name:"):
+                        continue
+                    alias = cache_identity.removeprefix("name:")
+                    if alias and alias != identity.normalized_key:
+                        candidates.append(
+                            hashlib.sha256(alias.encode("utf-8")).hexdigest()
+                        )
+        return tuple(dict.fromkeys(candidates))
 
     def lookup(
         self,
@@ -1408,54 +1754,78 @@ class ArtistImageCache:
         when a malformed entry is encountered.
         """
         with self._lock:
-            entry_key = self._entry_key(identity)
-            record = self._load()["entries"].get(entry_key)
-            if (
-                not isinstance(record, dict)
-                and identity.discogs_artist_id is None
-                and identity.musicbrainz_artist_id is None
-            ):
-                # Schema-1 name-only cache entries remain useful and are never
-                # shared across newly distinguished provider-backed entities.
-                legacy_key = self._legacy_entry_key(identity)
-                legacy_record = self._load()["entries"].get(legacy_key)
-                if isinstance(legacy_record, dict):
-                    entry_key, record = legacy_key, legacy_record
-            if not isinstance(record, dict):
-                return None
-            if record.get("normalized_key") != identity.normalized_key:
-                if repair:
-                    self._drop_broken_entry(entry_key)
-                return None
-            try:
-                status = ArtistImageStatus(str(record.get("status")))
-            except ValueError:
-                if repair:
-                    self._drop_broken_entry(entry_key)
-                return None
-
-            if status is ArtistImageStatus.RESOLVED:
+            entries = self._load()["entries"]
+            allowed_names = {
+                identity.normalized_key,
+                *identity.historical_aliases,
+            }
+            resolved: list[
+                tuple[
+                    tuple[int, int, int, int, float],
+                    str,
+                    Mapping[str, Any],
+                    Path,
+                    ValidatedImage,
+                ]
+            ] = []
+            negative: list[tuple[str, Mapping[str, Any], ArtistImageStatus]] = []
+            broken: list[tuple[str, Path | None]] = []
+            for entry_key in self._candidate_entry_keys((identity,)):
+                record = entries.get(entry_key)
+                if not isinstance(record, Mapping):
+                    continue
+                if str(record.get("normalized_key") or "") not in allowed_names:
+                    continue
+                try:
+                    status = ArtistImageStatus(str(record.get("status")))
+                except ValueError:
+                    broken.append((entry_key, None))
+                    continue
+                if status is not ArtistImageStatus.RESOLVED:
+                    retry_at = _parse_iso(record.get("retry_after"))
+                    if (
+                        retry_at is not None
+                        and self.clock().astimezone(timezone.utc) < retry_at
+                    ):
+                        negative.append((entry_key, record, status))
+                    continue
                 cache_file = self._safe_cached_path(record.get("cache_file"))
                 if cache_file is None or not cache_file.is_file():
-                    if repair:
-                        self._drop_broken_entry(entry_key, cache_file)
-                    return None
+                    broken.append((entry_key, cache_file))
+                    continue
                 try:
                     if cache_file.stat().st_size > MAX_IMAGE_BYTES:
                         raise ArtistImageContentError("image_size_rejected")
-                    validate_image_payload(
+                    image = validate_image_payload(
                         cache_file.read_bytes(),
                         str(record.get("content_type") or ""),
                     )
                 except (OSError, ArtistImageContentError):
-                    if repair:
-                        self._drop_broken_entry(entry_key, cache_file)
-                    return None
-            else:
+                    broken.append((entry_key, cache_file))
+                    continue
+                resolved.append(
+                    (
+                        self._selection_key(record, image),
+                        entry_key,
+                        record,
+                        cache_file,
+                        image,
+                    )
+                )
+
+            if repair:
+                for broken_key, broken_path in broken:
+                    self._drop_broken_entry(broken_key, broken_path)
+
+            if resolved:
+                _, _, record, cache_file, image = min(resolved, key=lambda item: item[0])
+                status = ArtistImageStatus.RESOLVED
+            elif negative:
+                _, record, status = negative[0]
                 cache_file = None
-                retry_at = _parse_iso(record.get("retry_after"))
-                if retry_at is None or self.clock().astimezone(timezone.utc) >= retry_at:
-                    return None
+                image = None
+            else:
+                return None
 
             return ArtistImageResult(
                 status=status,
@@ -1477,21 +1847,39 @@ class ArtistImageCache:
                 retry_after=record.get("retry_after"),
                 error_code=record.get("error_code"),
                 content_type=record.get("content_type"),
+                width=image.width if image is not None else record.get("width"),
+                height=image.height if image is not None else record.get("height"),
+                portrait_kind=record.get("portrait_kind"),
+                pinned=bool(record.get("pinned")),
                 from_cache=True,
             )
 
-    def store(self, result: ArtistImageResult) -> ArtistImageResult:
+    def store(
+        self,
+        result: ArtistImageResult,
+        *,
+        replace_existing: bool = False,
+    ) -> ArtistImageResult:
         if result.status is ArtistImageStatus.DISABLED:
             return result
         now = self.clock().astimezone(timezone.utc)
         with self._lock:
+            existing = self.lookup(result.identity, repair=False)
+            if existing is not None and existing.resolved and not replace_existing:
+                return existing
             cache_file: Path | None = None
             relative_file: str | None = None
             content_type = result.content_type
+            validated: ValidatedImage | None = None
             if result.status is ArtistImageStatus.RESOLVED:
                 if result.image_bytes is None:
                     raise ArtistImageContentError("resolved_image_missing")
-                validated = validate_image_payload(result.image_bytes, result.content_type or "")
+                validated = validate_new_portrait_quality(
+                    validate_image_payload(
+                        result.image_bytes,
+                        result.content_type or "",
+                    )
+                )
                 digest = hashlib.sha256(validated.payload).hexdigest()
                 self.files_dir.mkdir(parents=True, exist_ok=True)
                 cache_file = self.files_dir / f"{digest}.{validated.extension}"
@@ -1530,6 +1918,8 @@ class ArtistImageCache:
                 "requested_display_name": result.identity.display_name,
                 "normalized_key": result.identity.normalized_key,
                 "identity_key": result.identity.cache_identity,
+                "canonical_artist_id": result.identity.canonical_artist_id,
+                "historical_aliases": list(result.identity.historical_aliases),
                 "matched_artist_name": result.matched_artist_name,
                 "musicbrainz_artist_id": musicbrainz_id,
                 "discogs_artist_id": (
@@ -1548,11 +1938,25 @@ class ArtistImageCache:
                 "image_url": image_url,
                 "cache_file": relative_file,
                 "content_type": content_type,
+                "width": validated.width if validated is not None else result.width,
+                "height": validated.height if validated is not None else result.height,
+                "portrait_kind": result.portrait_kind,
+                "pinned": bool(result.pinned),
                 "fetched_at": _iso(now),
                 "retry_after": retry_after,
                 "error_code": _safe_error_code(result.error_code) if result.error_code else None,
             }
-            self._load()["entries"][self._entry_key(result.identity)] = record
+            manifest = self._load()
+            entry_key = self._entry_key(result.identity)
+            manifest["entries"][entry_key] = record
+            aliases = manifest.setdefault("aliases", {})
+            for cache_identity in result.identity.cache_identities:
+                alias_key = self._identity_key(cache_identity)
+                current = aliases.get(alias_key)
+                targets = [current] if isinstance(current, str) else list(current or ())
+                if entry_key not in targets:
+                    targets.append(entry_key)
+                aliases[alias_key] = targets
             self._write_manifest()
             return replace(
                 result,
@@ -1565,6 +1969,10 @@ class ArtistImageCache:
                 retry_after=retry_after,
                 error_code=record["error_code"],
                 content_type=content_type,
+                width=record["width"],
+                height=record["height"],
+                portrait_kind=record["portrait_kind"],
+                pinned=record["pinned"],
             )
 
     def clear(self, identity: ArtistIdentity | None = None) -> None:
@@ -1581,13 +1989,19 @@ class ArtistImageCache:
                 self._manifest = self._empty_manifest()
                 return
 
+            entry_keys = set(self._candidate_entry_keys((identity,)))
             records = [
                 self._load()["entries"].pop(entry_key, None)
-                for entry_key in {
-                    self._entry_key(identity),
-                    self._legacy_entry_key(identity),
-                }
+                for entry_key in entry_keys
             ]
+            aliases = self._load().get("aliases") or {}
+            for alias_key, targets in tuple(aliases.items()):
+                values = [targets] if isinstance(targets, str) else list(targets or ())
+                remaining_targets = [value for value in values if value not in entry_keys]
+                if remaining_targets:
+                    aliases[alias_key] = remaining_targets
+                else:
+                    aliases.pop(alias_key, None)
             remaining = {
                 candidate.get("cache_file")
                 for candidate in self._load()["entries"].values()
@@ -1603,7 +2017,13 @@ class ArtistImageCache:
             self._write_manifest()
 
     def rekey(self, old_identity: ArtistIdentity, new_identity: ArtistIdentity) -> bool:
-        """Preserve valid portraits and discard stale failures after a safe merge."""
+        """Expose an old cache entry through a canonical identity without loss.
+
+        Resolved source entries remain in the manifest so a later rekey cannot
+        discard a higher-priority portrait that is already cached under another
+        provider identity. Canonical aliases point at every valid candidate and
+        normal lookup applies the deterministic portrait-selection policy.
+        """
 
         with self._lock:
             entries = self._load()["entries"]
@@ -1616,22 +2036,215 @@ class ArtistImageCache:
             )
             if source_key is None:
                 return False
-            record = dict(entries.pop(source_key))
+            record = dict(entries[source_key])
             target_key = self._entry_key(new_identity)
             if record.get("status") == ArtistImageStatus.RESOLVED.value:
-                record["requested_display_name"] = new_identity.display_name
-                record["normalized_key"] = new_identity.normalized_key
-                record["identity_key"] = new_identity.cache_identity
                 target = entries.get(target_key)
-                if (
+                if source_key == target_key:
+                    historical_aliases = list(record.get("historical_aliases") or ())
+                    old_normalized = str(record.get("normalized_key") or "")
+                    if old_normalized and old_normalized != new_identity.normalized_key:
+                        historical_aliases.append(old_normalized)
+                    record["requested_display_name"] = new_identity.display_name
+                    record["normalized_key"] = new_identity.normalized_key
+                    record["identity_key"] = new_identity.cache_identity
+                    record["canonical_artist_id"] = new_identity.canonical_artist_id
+                    record["historical_aliases"] = list(
+                        dict.fromkeys(
+                            (*historical_aliases, *new_identity.historical_aliases)
+                        )
+                    )
+                    entries[target_key] = record
+                elif (
                     not isinstance(target, dict)
                     or target.get("status") != ArtistImageStatus.RESOLVED.value
                 ):
-                    entries[target_key] = record
-            # Negative malformed-name cache entries intentionally disappear so
-            # an explicitly enabled refresh may retry the canonical identity.
+                    canonical_record = dict(record)
+                    canonical_record["requested_display_name"] = new_identity.display_name
+                    canonical_record["normalized_key"] = new_identity.normalized_key
+                    canonical_record["identity_key"] = new_identity.cache_identity
+                    canonical_record["canonical_artist_id"] = (
+                        new_identity.canonical_artist_id
+                    )
+                    canonical_record["historical_aliases"] = list(
+                        new_identity.historical_aliases
+                    )
+                    entries[target_key] = canonical_record
+                aliases = self._load().setdefault("aliases", {})
+                for cache_identity in new_identity.cache_identities:
+                    alias_key = self._identity_key(cache_identity)
+                    values = aliases.get(alias_key)
+                    targets = [values] if isinstance(values, str) else list(values or ())
+                    for candidate_key in (source_key, target_key):
+                        if candidate_key not in targets:
+                            targets.append(candidate_key)
+                    aliases[alias_key] = targets
+            else:
+                # Negative malformed-name cache entries intentionally disappear
+                # so an explicitly enabled refresh may retry the canonical
+                # identity. They never represent portrait content to preserve.
+                entries.pop(source_key, None)
+                aliases = self._load().get("aliases") or {}
+                for alias_key, targets in tuple(aliases.items()):
+                    values = [targets] if isinstance(targets, str) else list(targets or ())
+                    remaining = [value for value in values if value != source_key]
+                    if remaining:
+                        aliases[alias_key] = remaining
+                    else:
+                        aliases.pop(alias_key, None)
             self._write_manifest()
             return True
+
+    def repair_index(
+        self,
+        groups: Mapping[ArtistIdentity, Sequence[ArtistIdentity]]
+        | Sequence[ArtistIdentity],
+        *,
+        backup_path: str | Path | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Repoint bounded canonical aliases to the best valid cached portrait.
+
+        The operation is strictly offline: it inspects only the existing
+        manifest and files, never invokes a provider, never creates a negative
+        cache entry, and never removes an image. When changes are applied, an
+        exact ``index.json`` backup is created before the atomic replacement.
+        """
+
+        if isinstance(groups, Mapping):
+            normalized_groups = tuple(
+                (canonical, tuple(related))
+                for canonical, related in groups.items()
+            )
+        else:
+            normalized_groups = tuple((identity, ()) for identity in groups)
+        if len(normalized_groups) > MAX_CACHE_REPAIR_GROUPS:
+            raise ValueError("Artist-image cache repair group limit exceeded.")
+        if any(
+            not isinstance(canonical, ArtistIdentity)
+            or len(related) > MAX_CACHE_IDENTITIES_PER_GROUP
+            or any(not isinstance(identity, ArtistIdentity) for identity in related)
+            for canonical, related in normalized_groups
+        ):
+            raise ValueError("Artist-image cache repair identities are invalid or unbounded.")
+
+        with self._lock:
+            manifest = self._load()
+            entries = manifest["entries"]
+            aliases = manifest.setdefault("aliases", {})
+            proposed: dict[str, list[str]] = {}
+            selected_count = 0
+            valid_candidate_count = 0
+            keys_consolidated_count = 0
+            preferred_change_count = 0
+            conflict_aliases: set[str] = set()
+
+            for canonical, related in normalized_groups:
+                identities = (canonical, *related)
+                allowed_names = {
+                    name
+                    for identity in identities
+                    for name in (identity.normalized_key, *identity.historical_aliases)
+                    if name
+                }
+                candidates: list[
+                    tuple[
+                        tuple[int, int, int, int, float],
+                        str,
+                    ]
+                ] = []
+                for entry_key in self._candidate_entry_keys(identities):
+                    record = entries.get(entry_key)
+                    if (
+                        not isinstance(record, Mapping)
+                        or record.get("status") != ArtistImageStatus.RESOLVED.value
+                        or str(record.get("normalized_key") or "") not in allowed_names
+                    ):
+                        continue
+                    file_path = self._safe_cached_path(record.get("cache_file"))
+                    if file_path is None or not file_path.is_file():
+                        continue
+                    try:
+                        if file_path.stat().st_size > MAX_IMAGE_BYTES:
+                            continue
+                        image = validate_image_payload(
+                            file_path.read_bytes(),
+                            str(record.get("content_type") or ""),
+                        )
+                    except (OSError, ArtistImageContentError):
+                        continue
+                    valid_candidate_count += 1
+                    candidates.append((self._selection_key(record, image), entry_key))
+                if not candidates:
+                    continue
+                selected_key = min(candidates, key=lambda item: item[0])[1]
+                selected_count += 1
+                distinct_candidate_keys = {entry_key for _, entry_key in candidates}
+                keys_consolidated_count += max(0, len(distinct_candidate_keys) - 1)
+                canonical_alias_key = self._identity_key(canonical.cache_identity)
+                current_preferred = aliases.get(canonical_alias_key)
+                current_targets = (
+                    [current_preferred]
+                    if isinstance(current_preferred, str)
+                    else list(current_preferred or ())
+                )
+                if current_targets and current_targets != [selected_key]:
+                    preferred_change_count += 1
+                cache_identities = tuple(
+                    dict.fromkeys(
+                        cache_identity
+                        for identity in identities
+                        for cache_identity in identity.cache_identities
+                    )
+                )
+                for cache_identity in cache_identities:
+                    alias_key = self._identity_key(cache_identity)
+                    previous = proposed.get(alias_key)
+                    if previous is not None and previous != [selected_key]:
+                        conflict_aliases.add(alias_key)
+                        proposed.pop(alias_key, None)
+                    elif alias_key not in conflict_aliases:
+                        proposed[alias_key] = [selected_key]
+
+            changed_aliases = sum(
+                1
+                for alias_key, targets in proposed.items()
+                if aliases.get(alias_key) != targets
+            )
+            report: dict[str, Any] = {
+                "group_count": len(normalized_groups),
+                "selected_group_count": selected_count,
+                "valid_candidate_count": valid_candidate_count,
+                "changed_alias_count": changed_aliases,
+                "keys_consolidated_count": keys_consolidated_count,
+                "preferred_change_count": preferred_change_count,
+                "conflict_count": len(conflict_aliases),
+                "dry_run": bool(dry_run),
+                "backup_path": None,
+                "backup_sha256": None,
+            }
+            if dry_run or not changed_aliases:
+                return report
+
+            if self.index_path.is_file():
+                source_hash = hashlib.sha256(self.index_path.read_bytes()).hexdigest()
+                if backup_path is None:
+                    timestamp = self.clock().astimezone(timezone.utc).strftime(
+                        "%Y%m%d_%H%M%S_%f"
+                    )
+                    resolved_backup = self.root / f"index.batch10_5_{timestamp}.json.bak"
+                else:
+                    resolved_backup = Path(backup_path).expanduser().resolve()
+                resolved_backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self.index_path, resolved_backup)
+                if hashlib.sha256(resolved_backup.read_bytes()).hexdigest() != source_hash:
+                    raise OSError("Artist-image cache index backup verification failed.")
+                report["backup_path"] = str(resolved_backup)
+                report["backup_sha256"] = source_hash
+
+            aliases.update(proposed)
+            self._write_manifest()
+            return report
 
     def statistics(self) -> dict[str, int]:
         with self._lock:
@@ -1729,7 +2342,7 @@ class ArtistImageService(QObject):
             if cancel_event.is_set() or generation != self._generation or self._closed:
                 raise CancelledError()
             try:
-                return self.cache.store(result)
+                return self.cache.store(result, replace_existing=force)
             except ArtistImageContentError as exc:
                 return self.cache.store(
                     ArtistImageResult(

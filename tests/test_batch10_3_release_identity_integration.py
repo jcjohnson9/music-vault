@@ -155,6 +155,93 @@ def test_accepted_provider_family_is_persisted_and_drives_real_upsert_and_backfi
     db.close()
 
 
+def test_accepted_edition_and_original_dates_reach_context_and_membership(
+    tmp_path: Path,
+):
+    db = MusicVaultDB(tmp_path / "edition-dates.sqlite3")
+    track_id = _queued_track(db, tmp_path, "edition-dates")
+    score = 98.0
+    candidate = ProviderReleaseCandidate(
+        provider="discogs",
+        title="Accepted Song",
+        artist="Synthetic Artist",
+        artist_credits=(ProviderArtistCredit("Synthetic Artist"),),
+        album="Accepted Album (2022 Reissue)",
+        album_artist="Synthetic Artist",
+        release_date="2022-04-01",
+        original_release_date="1984",
+        version_type="studio",
+        duration_seconds=180.0,
+        provider_score=score,
+        release_id="synthetic-release-2022",
+        master_id="synthetic-master-1984",
+        track_position="A1",
+        provider_reference="https://www.discogs.com/release/2022",
+        field_scores={
+            name: score
+            for name in (
+                "title",
+                "artist",
+                "artist_credits",
+                "album",
+                "album_artist",
+                "release_date",
+                "original_release_date",
+                "version_type",
+                "discogs_release_id",
+                "discogs_master_id",
+                "discogs_track_position",
+            )
+        },
+    )
+    service = MetadataIntelligenceService(
+        db,
+        _settings(musicbrainz=False),
+        token_store=_TokenStore(),
+        discogs_provider_factory=lambda _token: _StaticDiscogs(candidate),
+    )
+
+    assert service.process_automatic_queue().applied == 1
+
+    track = db.get_track(track_id)
+    assert track["release_date"] == "2022-04-01"
+    assert track["original_release_date"] == "1984"
+    context = db.conn.execute(
+        """
+        SELECT release_date,original_release_date,discogs_release_id,
+               discogs_master_id
+        FROM track_release_context WHERE track_id=?
+        """,
+        (track_id,),
+    ).fetchone()
+    assert tuple(context) == (
+        "2022-04-01",
+        "1984",
+        "synthetic-release-2022",
+        "synthetic-master-1984",
+    )
+    album = db.conn.execute(
+        """
+        SELECT album.title,album.original_release_date,
+               membership.edition_label,membership.edition_release_date,
+               membership.discogs_release_id
+        FROM canonical_albums AS album
+        JOIN track_album_memberships AS membership
+          ON membership.canonical_album_id=album.id
+        WHERE membership.track_id=?
+        """,
+        (track_id,),
+    ).fetchone()
+    assert tuple(album) == (
+        "Accepted Album",
+        "1984",
+        "2022 Reissue",
+        "2022-04-01",
+        "synthetic-release-2022",
+    )
+    db.close()
+
+
 def test_accepted_structured_credits_drive_fallback_album_after_credit_replacement(
     tmp_path: Path,
 ):

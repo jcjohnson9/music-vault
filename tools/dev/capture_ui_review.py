@@ -716,14 +716,15 @@ def validate_output(
         runtime_checks = payload.get("runtime_checks") or {}
         behaviors = runtime_checks.get("metadata_intelligence_behaviors") or {}
         required_behaviors = {
-            "schema_6",
+            "schema_current",
             "exact_random_uploader_corrected",
             "label_excluded_from_artist_credits",
             "group_and_featured_credits_structured",
             "studio_live_tracks_remain_separate",
-            "unofficial_live_year_blank_original_date_separate",
-            "provider_conflict_requires_review",
-            "youtube_exclusive_fallback_reviewed",
+            "unofficial_live_dates_withheld",
+            "provider_conflict_terminal_best_available",
+            "ordinary_review_count_zero",
+            "youtube_exclusive_source_fallback",
             "source_memberships_preserved",
             "network_guard_active",
             "no_secret_files",

@@ -391,6 +391,11 @@ class MusicVaultDB:
             if self._has_user_data():
                 self._create_pre_migration_backup(CURRENT_SCHEMA_VERSION)
 
+            # Own one explicit transaction from the first schema mutation
+            # through the Batch 10.5 repair marker and final integrity gate.
+            # This prevents an empty/near-empty legacy database from letting
+            # a nested repair context commit before migration verification.
+            self.conn.execute("BEGIN IMMEDIATE")
             with self.conn:
                 self._create_base_tables()
                 self._add_track_source_columns()
@@ -410,32 +415,16 @@ class MusicVaultDB:
                 seed_existing_metadata_field_extensions(self.conn)
                 seed_existing_artist_credits(self.conn)
                 create_canonical_media_schema(self.conn)
-                # Schema-v7 consolidation is a one-time, stored-evidence-only
-                # migration step.  These focused services construct no
-                # provider clients and never inspect or write media files.
-                from music_vault.metadata.artist_consolidation import (
-                    consolidate_existing_artists,
-                )
-                from music_vault.metadata.review_reclassification import (
-                    reclassify_stored_review_items,
-                )
-                from music_vault.metadata.artist_relationships import (
-                    import_accepted_saved_artist_relationships,
+                # Future pre-v7 databases receive the corrected Batch 10.5
+                # stored-evidence pass in this migration transaction.  The
+                # orchestrator constructs no provider client and never reads
+                # or writes media, tags, secrets, or portrait files.  Current
+                # schema-7 startup deliberately does not invoke this repair.
+                from music_vault.metadata.acceptance_repair import (
+                    apply_metadata_acceptance_repair,
                 )
 
-                consolidation = consolidate_existing_artists(self.conn, dry_run=False)
-                # Canonical album fallback identity must see the consolidated
-                # primary artist credit rather than a legacy presentation
-                # duplicate, so album membership backfill follows artist
-                # consolidation inside the same transaction.
-                seed_existing_canonical_albums(self.conn)
-                reclassify_stored_review_items(self, apply=True)
-                # Reclassification may accept legacy review rows as
-                # applied-with-gaps. Import saved, provider-ID-backed member
-                # evidence only after that state transition and artist
-                # consolidation, so the one-time migration sees every newly
-                # accepted item and resolves canonical endpoints.
-                import_accepted_saved_artist_relationships(self.conn)
+                consolidation = apply_metadata_acceptance_repair(self)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
                 allowed_artist_reductions = max(
                     0, int(consolidation.deleted_artist_count)

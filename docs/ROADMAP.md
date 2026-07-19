@@ -271,7 +271,45 @@ controlled quiescent live startup with a verified schema-v7 rollback backup.
 acceptance, cache deletion, sync, remediation, playback change, media/tag write,
 new tag, or public release.
 
-**Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0;
+**Status:** Complete on the v1.1.0 development line. Stable remains v1.0.0.
+
+## Batch 10.5 — Metadata Acceptance and Artist Identity Correction
+
+**Objective:** Finish the retained canonical-media batch by accepting the best
+honest stored metadata automatically and repairing artist/portrait identity
+without touching personal media.
+
+**Scope:** Active-interpreter CI portability; cache-preserving
+MusicBrainz/Wikimedia-first portrait selection; full-size Discogs fallback;
+canonical cross-provider artist clusters and role-aware detail unions;
+provider-adjudicated dash-title orientation; best-available field outcomes;
+soundtrack/album application; one virtual **Singles & Uncatalogued**
+collection; and one idempotent, offline schema-v7 live repair.
+
+**Non-goals:** No AI provider, schema 8, provider request during repair, media
+or tag rewrite, source/playlist change, sync change, public tag, or Release.
+
+**Status:** Complete on the v1.1.0 development line after offline repair,
+preservation, packaged/UI/performance, regression, build, and delivery gates.
+Stable remains v1.0.0; Batch 11 remains next.
+
+## Batch 10.6 — Dual-Orientation Title Resolution and Final Metadata Acceptance
+
+**Objective:** Resolve ambiguous dash-separated source titles deterministically
+and close the final metadata-acceptance blocker without broad library work.
+
+**Scope:** Immutable left/right title-orientation hypotheses; safe top-level
+dash parsing; adaptive maximum-two Discogs adjudication; one secondary
+MusicBrainz lookup; normalized orientation evidence; strict offline canonical-
+artist selection; accepted source-fallback eligibility; and one explicit,
+backup-protected, exact-target schema-v7 repair with no media/tag/artwork write.
+
+**Non-goals:** No AI provider, schema change, full-library scan, YouTube sync,
+media/tag write, artwork/portrait refresh, playlist/source/playback change,
+public tag, or Release.
+
+**Status:** Complete on the v1.1.0 development line after targeted/private,
+packaged, regression, build, CI, and delivery gates. Stable remains v1.0.0;
 Batch 11 remains next.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original

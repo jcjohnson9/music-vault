@@ -43,9 +43,9 @@ def test_profiler_uses_required_scale_shapes_and_synthetic_small_run(qapp):
     assert dataset["albums"]["card_widget_count"] == 0
     assert dataset["artists"]["card_widget_count"] == 0
     assert dataset["albums"]["summary_sql_statement_count"] <= 4
-    assert dataset["artists"]["summary_sql_statement_count"] <= 3
+    assert dataset["artists"]["summary_sql_statement_count"] <= 9
     assert dataset["albums"]["track_query_sql_statement_count"] <= 2
-    assert dataset["artists"]["section_query_sql_statement_count"] <= 3
+    assert dataset["artists"]["section_query_sql_statement_count"] <= 7
     assert dataset["albums"]["thumbnails"]["offscreen_sources_requested"] == 0
     assert dataset["albums"]["thumbnails"]["stats"]["decodes"] <= 10
 

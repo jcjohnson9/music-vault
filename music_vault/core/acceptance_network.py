@@ -26,6 +26,8 @@ NETWORK_REPORT_SCHEMA_VERSION = 2
 _ACCEPTANCE_PREFIXES = (
     "MusicVault_Batch10_3_",
     "MusicVault_Batch10_4_",
+    "MusicVault_Batch10_5_",
+    "MusicVault_Batch10_6_",
 )
 _ACTIVE_GUARD_LOCK = threading.Lock()
 _ACTIVE_GUARD: "AcceptanceNetworkGuard | None" = None

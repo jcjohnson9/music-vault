@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -287,7 +288,7 @@ def test_startup_rekeys_unambiguous_consolidation_alias_portrait(tmp_path: Path)
     assert cache.lookup(new_identity).status is ArtistImageStatus.RESOLVED
     assert cache.lookup(
         ArtistIdentity.from_display_name("Canonical Unit Live at Synthetic Hall")
-    ) is None
+    ).status is ArtistImageStatus.RESOLVED
     db.close()
 
 
@@ -303,9 +304,16 @@ def test_provider_rekey_uses_exact_entry_and_leaves_same_name_legacy_cache(
         "Canonical Rekey Name", discogs_artist_id="8001"
     )
     cache.store(ArtistImageResult(ArtistImageStatus.NO_MATCH, legacy_identity))
-    cache.store(SyntheticArtistImageProvider().resolve(provider_identity))
+    provider = cache.store(SyntheticArtistImageProvider().resolve(provider_identity))
 
     assert cache.rekey(provider_identity, canonical_identity)
     assert cache.lookup(canonical_identity).status is ArtistImageStatus.RESOLVED
     assert cache.lookup(legacy_identity).status is ArtistImageStatus.NO_MATCH
-    assert cache.lookup(provider_identity) is None
+    manifest = json.loads(cache.index_path.read_text(encoding="utf-8"))
+    assert {
+        record["cache_file"]
+        for record in manifest["entries"].values()
+        if record["status"] == ArtistImageStatus.RESOLVED.value
+    } == {
+        provider.cache_file.relative_to(cache.root).as_posix()
+    }

@@ -150,9 +150,53 @@ def classify_soundtrack(
     )
 
 
+def soundtrack_search_variants(
+    *,
+    track_title: object,
+    artist: object = None,
+    work_title: object = None,
+    composer: object = None,
+    limit: int = 6,
+) -> tuple[tuple[str, str | None], ...]:
+    """Return bounded, deduplicated catalogue queries for soundtrack work.
+
+    The result is data only; constructing it never contacts a provider.
+    """
+
+    title = _clean(track_title)
+    if not title or limit < 1:
+        return ()
+    artist_name = _clean(artist) or None
+    work = _clean(work_title)
+    composer_name = _clean(composer) or None
+    candidates: list[tuple[str, str | None]] = [(title, artist_name)]
+    if work:
+        candidates.extend(
+            (
+                (f"{title} {work}", artist_name),
+                (f"{title} Original Soundtrack", artist_name),
+                (f"{work} soundtrack", None),
+            )
+        )
+    if composer_name:
+        candidates.append((title, composer_name))
+    result: list[tuple[str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for query_title, query_artist in candidates:
+        key = (query_title.casefold(), (query_artist or "").casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((query_title, query_artist))
+        if len(result) >= min(6, int(limit)):
+            break
+    return tuple(result)
+
+
 __all__ = [
     "SoundtrackClassification",
     "SoundtrackKind",
     "classify_soundtrack",
     "is_various_artists",
+    "soundtrack_search_variants",
 ]

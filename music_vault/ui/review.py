@@ -75,6 +75,8 @@ METADATA_REVIEW_SCENES = (
 METADATA_INTELLIGENCE_REVIEW_SCENES = ("metadata_intelligence_smoke",)
 
 BATCH10_3_REVIEW_SCENES = ("batch10_3_smoke",)
+BATCH10_5_REVIEW_SCENES = ("batch10_5_smoke",)
+BATCH10_6_REVIEW_SCENES = ("batch10_6_smoke",)
 
 REMEDIATION_REVIEW_SCENES = (
     "remediation_empty",
@@ -141,6 +143,8 @@ SCENE_LABELS = {
     "metadata_currently_playing": "Metadata • Currently Playing",
     "metadata_intelligence_smoke": "Automatic Metadata Intelligence - Packaged Smoke",
     "batch10_3_smoke": "Canonical Media Browser - Packaged Synthetic Smoke",
+    "batch10_5_smoke": "Metadata Acceptance - Packaged Synthetic Smoke",
+    "batch10_6_smoke": "Dual-Orientation Metadata - Packaged Synthetic Smoke",
     "remediation_empty": "Remediation - Empty",
     "remediation_analyzing": "Remediation - Analyzing",
     "remediation_paused": "Remediation - Paused",
@@ -1259,8 +1263,6 @@ class _SyntheticIntelligenceDiscogs:
 
         title = str(getattr(query, "title", "")).strip()
         folded = title.casefold()
-        if folded == "neon notebook session":
-            return None
         mapping = {
             "amber circuit": ("Aster Vale", "person", None),
             "glass meridian": ("Lowland Unit", "group", None),
@@ -1270,9 +1272,9 @@ class _SyntheticIntelligenceDiscogs:
             "paper lantern": ("Copper Horizon", "group", None),
             "quiet prism": ("Juniper Arc", "duo", None),
         }
-        artist, entity_type, featured = mapping.get(
-            folded, (str(getattr(query, "artist", "") or "Synthetic Unit"), "group", None)
-        )
+        if folded not in mapping:
+            return None
+        artist, entity_type, featured = mapping[folded]
         version = str(getattr(query, "version_type", "") or "unknown").casefold()
         is_live = folded == "static bloom" and version == "live"
         identity = {
@@ -1320,7 +1322,7 @@ class _SyntheticIntelligenceDiscogs:
             artist_credits=tuple(credits),
             album="Synthetic Catalogue Release",
             album_artist=artist,
-            release_date="1987",
+            release_date=None if is_live else "1987",
             original_release_date="1984",
             version_type="live" if is_live else "studio",
             version_label="Live at Synthetic Hall" if is_live else None,
@@ -1366,15 +1368,15 @@ class _SyntheticIntelligenceMusicBrainz:
 
         self.calls.append((title, artist))
         folded = str(title).casefold()
-        if folded in {"neon notebook session", "static bloom"}:
-            return ()
         mapping = {
             "amber circuit": "Aster Vale",
             "glass meridian": "Lowland Unit",
             "cloud geometry": "Sable Current",
             "velvet transit": "Velvet Transit Unit Alternate",
         }
-        canonical_artist = mapping.get(folded, artist or "Synthetic Unit")
+        if folded not in mapping:
+            return ()
+        canonical_artist = mapping[folded]
         candidate_title = (
             "Velvet Transit Alternate" if folded == "velvet transit" else title
         )
@@ -1572,8 +1574,10 @@ def validate_metadata_intelligence_review_behaviors(
         rows["studio"]["id"] != rows["live"]["id"]
         and rows["studio"]["version_type"] == "studio"
         and rows["live"]["version_type"] == "live"
-        and rows["live"]["release_date"] in (None, "")
-        and rows["live"]["original_release_date"] == "1984"
+    )
+    unofficial_live_dates_withheld = (
+        rows["live"]["release_date"] in (None, "")
+        and rows["live"]["original_release_date"] in (None, "")
     )
     states = {
         str(row["reason"]): str(row["state"])
@@ -1593,6 +1597,15 @@ def validate_metadata_intelligence_review_behaviors(
         window.db.conn.execute(
             "SELECT state FROM metadata_intelligence_items WHERE job_id=? AND track_id=?",
             (job_id, track_ids["exclusive"]),
+        ).fetchone()[0]
+    )
+    ordinary_review_count = int(
+        window.db.conn.execute(
+            """
+            SELECT COUNT(*) FROM metadata_intelligence_items
+            WHERE job_id=? AND state IN ('review', 'ready', 'no_match')
+            """,
+            (job_id,),
         ).fetchone()[0]
     )
     memberships_after = int(
@@ -1671,8 +1684,11 @@ def validate_metadata_intelligence_review_behaviors(
         "label_excluded_from_artist_credits": label_credit_count == 0,
         "group_and_featured_credits_structured": group_and_featured,
         "studio_live_tracks_remain_separate": studio_live_preserved,
-        "unofficial_live_year_blank_original_date_separate": studio_live_preserved,
-        "provider_conflict_requires_review": conflict_state == "review",
+        "unofficial_live_dates_withheld": unofficial_live_dates_withheld,
+        "provider_conflict_terminal_best_available": (
+            conflict_state == "applied_with_gaps"
+        ),
+        "ordinary_review_count_zero": ordinary_review_count == 0,
         "youtube_exclusive_source_fallback": (
             exclusive_state == "source_fallback"
             and rows["exclusive"]["version_type"] == "youtube_exclusive"
@@ -1702,8 +1718,9 @@ def validate_metadata_intelligence_review_behaviors(
         "label_excluded_from_artist_credits",
         "group_and_featured_credits_structured",
         "studio_live_tracks_remain_separate",
-        "unofficial_live_year_blank_original_date_separate",
-        "provider_conflict_requires_review",
+        "unofficial_live_dates_withheld",
+        "provider_conflict_terminal_best_available",
+        "ordinary_review_count_zero",
         "youtube_exclusive_source_fallback",
         "source_memberships_preserved",
         "network_guard_active",
@@ -1719,8 +1736,12 @@ def validate_metadata_intelligence_review_behaviors(
         "artwork_attribution_persisted",
         "discogs_artwork_not_embedded",
     )
-    if any(evidence[name] is not True for name in required):
-        raise ReviewPlanError("Synthetic packaged metadata-intelligence behavior failed.")
+    failed_required = tuple(name for name in required if evidence[name] is not True)
+    if failed_required:
+        raise ReviewPlanError(
+            "Synthetic packaged metadata-intelligence behavior failed: "
+            + ", ".join(failed_required)
+        )
     if evidence["network_attempt_count"] != 0 or result.processed != len(specifications):
         raise ReviewPlanError("Synthetic metadata-intelligence work was incomplete or attempted network access.")
     setattr(window, "_review_metadata_intelligence_metrics", evidence)
@@ -3361,7 +3382,7 @@ def validate_batch10_3_review_behaviors(
     try:
         summary_text = dialog.summary.text()
         review_filter_rows: dict[str, int] = {}
-        for state in ("needs_review", "applied_with_gaps", "source_fallback"):
+        for state in ("applied_with_gaps", "source_fallback"):
             index = dialog.filter_combo.findData(state)
             if index < 0:
                 review_filter_rows[state] = 0
@@ -3371,7 +3392,7 @@ def validate_batch10_3_review_behaviors(
             review_filter_rows[state] = int(dialog.table.rowCount())
         review_widget_outcomes = bool(
             all(review_filter_rows.values())
-            and "Needs Review:" in summary_text
+            and "Pending: 0" in summary_text
             and "Applied with Gaps:" in summary_text
             and "Source Fallback:" in summary_text
         )
@@ -3495,8 +3516,9 @@ def validate_batch10_3_review_behaviors(
         "malformed_version_artist_repaired": malformed_version_repaired,
         "review_outcomes_complete": all(
             outcome_counts.get(state, 0) >= 1
-            for state in ("applied_with_gaps", "source_fallback", "review")
-        ),
+            for state in ("applied_with_gaps", "source_fallback")
+        )
+        and sum(outcome_counts.get(state, 0) for state in ("review", "ready")) == 0,
         "review_dialog_outcomes_visible": review_widget_outcomes,
         "artist_provider_lazy_and_deferred": artist_provider_lazy_and_deferred,
         "global_spacebar_guarded": global_space_guards,
@@ -3550,6 +3572,592 @@ def validate_batch10_3_review_behaviors(
     if failed:
         raise ReviewPlanError(
             "Batch 10.3 synthetic UI behavior failed: " + ", ".join(failed)
+        )
+    return behaviors
+
+
+def validate_batch10_5_review_behaviors(
+    window: object,
+    plan: ReviewPlan,
+) -> dict[str, object]:
+    """Validate the explicit Batch 10.5 packaged fixture without provider work.
+
+    This hook is inert unless ``batch10_5_smoke`` is present in an explicitly
+    validated synthetic review plan.  It reads only the disposable database
+    and portrait cache beneath that plan's runtime root.
+    """
+
+    if "batch10_5_smoke" not in plan.scenes:
+        raise ReviewPlanError("Batch 10.5 validation requires its explicit scene.")
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() != "1":
+        raise ReviewPlanError("Batch 10.5 smoke requires no-secret mode.")
+    if not _review_no_network_enabled() or not _REVIEW_NETWORK_GUARD_INSTALLED:
+        raise ReviewPlanError("Batch 10.5 smoke requires the no-network guard.")
+    data_root = plan.runtime_root / "data"
+    for name in ("youtube_api_key.txt", "discogs_token.txt"):
+        if (data_root / name).exists():
+            raise ReviewPlanError("Batch 10.5 smoke found a credential file.")
+
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtMultimedia import QMediaPlayer
+    from PySide6.QtWidgets import QApplication, QAbstractButton, QLineEdit
+
+    from music_vault.app import should_handle_global_play_pause
+    from music_vault.core.db import CURRENT_SCHEMA_VERSION
+    from music_vault.core.library_browser import (
+        query_album_summaries,
+        query_artist_summaries,
+        query_artist_track_sections,
+    )
+    from music_vault.ui.metadata_intelligence import MetadataIntelligenceDialog
+
+    db = window.db
+    schema_version = int(db.conn.execute("PRAGMA user_version").fetchone()[0])
+    if schema_version != CURRENT_SCHEMA_VERSION:
+        raise ReviewPlanError("Batch 10.5 smoke requires the current schema.")
+    playback_before = _batch10_playback_snapshot(window)
+    media_players_before = tuple(window.findChildren(QMediaPlayer))
+
+    artist_summaries = query_artist_summaries(db.conn)
+    target_summaries = tuple(
+        summary
+        for summary in artist_summaries
+        if summary.key.normalized_name == "glass horizon"
+    )
+    if len(target_summaries) != 1:
+        raise ReviewPlanError("Batch 10.5 canonical cluster is unavailable.")
+    target = target_summaries[0]
+    target_sections = query_artist_track_sections(db.conn, target.key)
+    section_ids = {
+        "tracks": {int(row["id"]) for row in target_sections.tracks},
+        "featured_on": {int(row["id"]) for row in target_sections.featured_on},
+        "collaborations": {
+            int(row["id"]) for row in target_sections.collaborations
+        },
+        "group_appearances": {
+            int(row["id"]) for row in target_sections.group_appearances
+        },
+    }
+    section_sets = tuple(section_ids.values())
+    canonical_sections_complete = all(section_sets) and all(
+        section_sets[left].isdisjoint(section_sets[right])
+        for left in range(len(section_sets))
+        for right in range(left + 1, len(section_sets))
+    )
+
+    window._browser_summary_maps["artists"] = {
+        summary.browser_key: summary for summary in artist_summaries
+    }
+    window.open_artist(target.browser_key)
+    selector = window.artist_section_selector
+    section_handler_rows: dict[str, int] = {}
+    for section in section_ids:
+        index = selector.findData(section)
+        if index < 0:
+            section_handler_rows[section] = 0
+            continue
+        selector.setCurrentIndex(index)
+        window.on_artist_section_changed(index)
+        section_handler_rows[section] = int(window.library_table.rowCount())
+
+    identity = window.artist_image_identity(target)
+    cached = window.artist_image_cache.lookup(identity, repair=False)
+    portrait_preferred = bool(
+        cached is not None
+        and cached.resolved
+        and cached.portrait_kind == "musicbrainz_wikimedia"
+        and min(int(cached.width or 0), int(cached.height or 0)) >= 320
+    )
+    artist_image_service = getattr(window, "artist_image_service", None)
+    provider_deferred = bool(
+        artist_image_service is not None
+        and getattr(artist_image_service, "provider", None) is None
+        and getattr(artist_image_service, "_provider_factory", None) is not None
+    )
+
+    outcome_counts = {
+        str(row["state"]): int(row["count"])
+        for row in db.conn.execute(
+            "SELECT state,COUNT(*) AS count FROM metadata_intelligence_items GROUP BY state"
+        ).fetchall()
+    }
+    review_count = sum(outcome_counts.get(state, 0) for state in ("review", "ready"))
+    dialog = MetadataIntelligenceDialog(
+        db,
+        getattr(window, "metadata_intelligence_service", None),
+        window,
+    )
+    try:
+        summary_text = dialog.summary.text().casefold()
+        metadata_dashboard_zero_review = bool(
+            review_count == 0
+            and "pending: 0" in summary_text
+            and outcome_counts.get("applied", 0) >= 1
+            and outcome_counts.get("applied_with_gaps", 0) >= 1
+            and outcome_counts.get("source_fallback", 0) >= 1
+        )
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+
+    backwards = db.conn.execute(
+        "SELECT title,artist,album FROM tracks "
+        "WHERE source_video_id='batch10_5_backwards'"
+    ).fetchone()
+    backwards_orientation_repaired = bool(
+        backwards is not None
+        and tuple(backwards) == ("Song Name", "Band Name", "Catalogue Record")
+    )
+    album_summaries = query_album_summaries(db.conn)
+    virtual_albums = tuple(
+        summary
+        for summary in album_summaries
+        if summary.key.virtual_kind == "singles_uncatalogued"
+    )
+    soundtrack_album_applied = bool(
+        any(
+            summary.album_kind == "soundtrack"
+            and "skyline quest" in summary.album_title.casefold()
+            for summary in album_summaries
+        )
+    )
+    virtual_uncatalogued_singleton = bool(
+        len(virtual_albums) == 1
+        and virtual_albums[0].track_count >= 2
+        and int(
+            db.conn.execute(
+                "SELECT COUNT(*) FROM tracks WHERE album='Singles & Uncatalogued'"
+            ).fetchone()[0]
+        )
+        == 0
+    )
+    no_unknown_album_cards = not any(
+        summary.album_title.casefold() == "unknown album"
+        for summary in album_summaries
+    )
+    no_version_suffix_cards = not any(
+        "live at north hall" in summary.display_name.casefold()
+        for summary in artist_summaries
+    )
+    no_duplicate_normalized_cards = len(
+        {summary.key.normalized_name for summary in artist_summaries}
+    ) == len(artist_summaries)
+
+    event_filter = getattr(window, "global_play_pause_event_filter", None)
+    search = getattr(window, "search_box", None)
+    table = getattr(window, "library_table", None)
+    key_event = QKeyEvent(
+        QEvent.Type.KeyPress,
+        Qt.Key.Key_Space,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    text_guarded = False
+    normal_page_handled = False
+    if event_filter is not None and isinstance(search, QLineEdit):
+        _set_page(window, "library_page")
+        search.setFocus(Qt.FocusReason.OtherFocusReason)
+        QApplication.processEvents()
+        text_guarded = event_filter.eventFilter(search, key_event) is False
+    if event_filter is not None and table is not None:
+        table.setFocus(Qt.FocusReason.OtherFocusReason)
+        QApplication.processEvents()
+        normal_page_handled = event_filter.eventFilter(table, key_event) is True
+    control = getattr(window, "party_mode_btn", None)
+    global_spacebar_guarded = bool(
+        text_guarded
+        and normal_page_handled
+        and isinstance(control, QAbstractButton)
+        and not should_handle_global_play_pause(control)
+    )
+
+    media_players_after = tuple(window.findChildren(QMediaPlayer))
+    playback_preserved = _batch10_playback_unchanged(window, playback_before)
+    behaviors: dict[str, object] = {
+        "schema_version": schema_version,
+        "packaged_process": bool(getattr(sys, "frozen", False)),
+        "artist_card_count": len(artist_summaries),
+        "canonical_cluster_artist_id_count": len(target.key.cluster_artist_ids),
+        "artist_section_track_counts": {
+            name: len(values) for name, values in section_ids.items()
+        },
+        "review_outcome_counts": outcome_counts,
+        "network_attempt_count": len(_REVIEW_NETWORK_EVENTS),
+        "one_canonical_artist_cluster": len(target.key.cluster_artist_ids) >= 2,
+        "no_duplicate_normalized_artist_cards": no_duplicate_normalized_cards,
+        "canonical_artist_sections_complete": canonical_sections_complete,
+        "real_artist_section_handlers": all(section_handler_rows.values()),
+        "preferred_cached_portrait": portrait_preferred,
+        "low_resolution_portrait_not_selected": bool(
+            cached is not None
+            and min(int(cached.width or 0), int(cached.height or 0)) > 150
+        ),
+        "portrait_provider_deferred": provider_deferred,
+        "metadata_dashboard_zero_review": metadata_dashboard_zero_review,
+        "ordinary_review_eliminated": review_count == 0,
+        "backwards_title_orientation_repaired": backwards_orientation_repaired,
+        "soundtrack_album_applied": soundtrack_album_applied,
+        "virtual_uncatalogued_singleton": virtual_uncatalogued_singleton,
+        "no_unknown_album_cards": no_unknown_album_cards,
+        "version_suffix_artist_repaired": no_version_suffix_cards,
+        "global_spacebar_guarded": global_spacebar_guarded,
+        "playback_preserved": playback_preserved,
+        "queue_preserved": playback_preserved,
+        "base_context_preserved": playback_preserved,
+        "same_media_player": bool(
+            media_players_before == media_players_after
+            and len(media_players_after) == 1
+            and media_players_after[0] is getattr(window, "player", None)
+        ),
+        "network_guard_active": _REVIEW_NETWORK_GUARD_INSTALLED,
+        "credential_files_absent": True,
+        "dist_runtime_data_absent": not (
+            plan.runtime_root / "dist" / "MusicVault" / "data"
+        ).exists(),
+    }
+    non_boolean = {
+        "schema_version",
+        "packaged_process",
+        "artist_card_count",
+        "canonical_cluster_artist_id_count",
+        "artist_section_track_counts",
+        "review_outcome_counts",
+        "network_attempt_count",
+    }
+    failed = sorted(
+        name
+        for name, value in behaviors.items()
+        if name not in non_boolean and value is not True
+    )
+    if int(behaviors["network_attempt_count"]) != 0:
+        failed.append("network_attempt_count")
+    if failed:
+        raise ReviewPlanError(
+            "Batch 10.5 synthetic UI behavior failed: " + ", ".join(failed)
+        )
+    return behaviors
+
+
+def _batch10_6_tree_snapshot(root: Path) -> dict[str, tuple[int, int, str]]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def validate_batch10_6_review_behaviors(
+    window: object,
+    plan: ReviewPlan,
+) -> dict[str, object]:
+    """Run one bounded dual-orientation item with injected offline providers."""
+
+    if "batch10_6_smoke" not in plan.scenes:
+        raise ReviewPlanError("Batch 10.6 validation requires its explicit scene.")
+    if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() != "1":
+        raise ReviewPlanError("Batch 10.6 smoke requires no-secret mode.")
+    if not _review_no_network_enabled() or not _REVIEW_NETWORK_GUARD_INSTALLED:
+        raise ReviewPlanError("Batch 10.6 smoke requires the no-network guard.")
+    data_root = plan.runtime_root / "data"
+    for name in ("youtube_api_key.txt", "discogs_token.txt"):
+        if (data_root / name).exists():
+            raise ReviewPlanError("Batch 10.6 smoke found a credential file.")
+
+    from PySide6.QtMultimedia import QMediaPlayer
+
+    from music_vault.core.runtime_policy import RuntimePolicy
+    from music_vault.metadata.intelligence import (
+        AUTOMATIC_IMPORT_JOB_ID,
+        MetadataIntelligenceService,
+    )
+    from music_vault.metadata.musicbrainz_enricher import MetadataCandidate
+    from music_vault.metadata.providers import ProviderArtistCredit, ProviderReleaseCandidate
+
+    db = window.db
+    targets = db.conn.execute(
+        "SELECT * FROM tracks WHERE source_video_id='b106smoke01'"
+    ).fetchall()
+    if len(targets) != 1:
+        raise ReviewPlanError("Batch 10.6 smoke requires exactly one fictional target.")
+    target = targets[0]
+    track_id = int(target["id"])
+    item = db.conn.execute(
+        "SELECT * FROM metadata_intelligence_items WHERE job_id=? AND track_id=?",
+        (AUTOMATIC_IMPORT_JOB_ID, track_id),
+    ).fetchone()
+    if item is None or str(item["state"]) != "queued":
+        raise ReviewPlanError("Batch 10.6 synthetic target is not exclusively queued.")
+
+    playback_before = _batch10_playback_snapshot(window)
+    media_players_before = tuple(window.findChildren(QMediaPlayer))
+    memberships_before = int(
+        db.conn.execute("SELECT COUNT(*) FROM playlist_track_origins").fetchone()[0]
+    )
+    playlists_before = int(db.conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0])
+    sources_before = int(db.conn.execute("SELECT COUNT(*) FROM sync_sources").fetchone()[0])
+    history_before = int(
+        db.conn.execute(
+            "SELECT COUNT(*) FROM track_metadata_history WHERE track_id=?", (track_id,)
+        ).fetchone()[0]
+    )
+    media_before = _batch10_6_tree_snapshot(data_root / "youtube_downloads")
+    covers_before = _batch10_6_tree_snapshot(data_root / "covers")
+    portraits_before = _batch10_6_tree_snapshot(data_root / "artist_images")
+
+    class _TokenStore:
+        @staticmethod
+        def read() -> str:
+            return "isolated-review-placeholder"
+
+    class _Discogs:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def search(self, query: object, *, cancel_event=None):
+            self.calls.append(query)
+            first = len(self.calls) == 1
+            title = str(getattr(query, "title", ""))
+            artist = str(getattr(query, "artist", ""))
+            if not first:
+                title = "Anthem of the Republic"
+                artist = "The Cosmic Assembly"
+            score = 70.0 if first else 97.0
+            return (
+                ProviderReleaseCandidate(
+                    provider="discogs",
+                    title=title,
+                    artist=artist,
+                    artist_credits=(
+                        ProviderArtistCredit(
+                            artist,
+                            role="primary",
+                            artist_id="10601" if not first else "10600",
+                            entity_type="group",
+                        ),
+                    ),
+                    album="Republic Signals",
+                    album_artist=artist,
+                    release_date="1978",
+                    original_release_date="1978",
+                    version_type="live",
+                    version_label="Live",
+                    duration_seconds=222.0,
+                    provider_score=score,
+                    release_id="10601" if not first else "10600",
+                    master_id="20601" if not first else "20600",
+                    track_position="A1",
+                    provider_reference="synthetic:batch10-6-discogs",
+                    reasons=("exact_tracklist_title", "exact_artist_credit"),
+                    field_scores={
+                        name: score
+                        for name in (
+                            "title",
+                            "artist",
+                            "artist_credits",
+                            "album",
+                            "album_artist",
+                            "release_date",
+                            "original_release_date",
+                            "version_type",
+                            "version_label",
+                            "discogs_release_id",
+                            "discogs_master_id",
+                        )
+                    },
+                ),
+            )
+
+    class _MusicBrainz:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def search(self, title: str, artist: str | None = None, *, cancel_event=None):
+            self.calls.append((title, artist))
+            return (
+                MetadataCandidate(
+                    title="Anthem of the Republic",
+                    artist="The Cosmic Assembly",
+                    album="Republic Signals",
+                    release_date="1978",
+                    recording_id="b106-recording",
+                    release_id="b106-release",
+                    score=96,
+                    duration_seconds=222.0,
+                    album_artist="The Cosmic Assembly",
+                ),
+            )
+
+    class _ForbiddenTagWriter:
+        calls = 0
+
+        def __getattr__(self, _name: str):
+            def blocked(*_args, **_kwargs):
+                self.calls += 1
+                raise ReviewPlanError("Batch 10.6 smoke attempted media writeback.")
+
+            return blocked
+
+    discogs = _Discogs()
+    musicbrainz = _MusicBrainz()
+    tag_writer = _ForbiddenTagWriter()
+    artwork_calls: list[object] = []
+
+    def forbidden_artwork_store(_token: str):
+        artwork_calls.append(object())
+        raise ReviewPlanError("Batch 10.6 smoke attempted artwork retrieval.")
+
+    service = MetadataIntelligenceService(
+        db,
+        {
+            "metadata_intelligence_enabled": True,
+            "metadata_discogs_enabled": True,
+            "metadata_musicbrainz_secondary_enabled": True,
+            "metadata_writeback_enabled": False,
+            "metadata_fill_missing_artwork_enabled": False,
+            "metadata_scan_existing_after_setup": False,
+            "metadata_intelligence_consent_version": 1,
+            "metadata_discogs_consent_version": 1,
+        },
+        token_store=_TokenStore(),
+        discogs_provider_factory=lambda _token: discogs,
+        musicbrainz_provider_factory=lambda: musicbrainz,
+        tag_writer=tag_writer,
+        artwork_store_factory=forbidden_artwork_store,
+        runtime_policy=RuntimePolicy(),
+    )
+    result = service.process_automatic_queue()
+    corrected = db.get_track(track_id)
+    completed = db.conn.execute(
+        "SELECT * FROM metadata_intelligence_items WHERE job_id=? AND track_id=?",
+        (AUTOMATIC_IMPORT_JOB_ID, track_id),
+    ).fetchone()
+    try:
+        proposal = json.loads(str(completed["field_proposal"] or "{}"))
+        orientation = proposal.get("_orientation", {})
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReviewPlanError("Batch 10.6 orientation evidence is malformed.") from exc
+    raw_observation = db.conn.execute(
+        "SELECT value FROM track_metadata_observations "
+        "WHERE track_id=? AND provider='youtube' AND field_name='title' "
+        "ORDER BY observed_at DESC,id DESC LIMIT 1",
+        (track_id,),
+    ).fetchone()
+    credits = db.conn.execute(
+        "SELECT a.display_name,c.role FROM track_artist_credits c "
+        "JOIN artists a ON a.id=c.artist_id WHERE c.track_id=? ORDER BY c.credit_order",
+        (track_id,),
+    ).fetchall()
+    album_membership = int(
+        db.conn.execute(
+            "SELECT COUNT(*) FROM track_album_memberships WHERE track_id=?", (track_id,)
+        ).fetchone()[0]
+    )
+    review_count = int(
+        db.conn.execute(
+            "SELECT COUNT(*) FROM metadata_intelligence_items WHERE state IN ('review','ready')"
+        ).fetchone()[0]
+    )
+    media_players_after = tuple(window.findChildren(QMediaPlayer))
+    behaviors: dict[str, object] = {
+        "schema_version": int(db.conn.execute("PRAGMA user_version").fetchone()[0]),
+        "packaged_process": bool(getattr(sys, "frozen", False)),
+        "processed_count": int(result.processed),
+        "discogs_query_count": len(discogs.calls),
+        "musicbrainz_query_count": len(musicbrainz.calls),
+        "network_attempt_count": len(_REVIEW_NETWORK_EVENTS),
+        "exactly_one_target_processed": result.processed == 1,
+        "weak_first_triggered_reverse": len(discogs.calls) == 2,
+        "musicbrainz_bounded": len(musicbrainz.calls) <= 1,
+        "reverse_orientation_selected": orientation.get("selected") == "right_is_artist",
+        "orientation_evidence_complete": bool(
+            int(orientation.get("evaluated_count", 0)) == 2
+            and orientation.get("provider_confirmed") is True
+            and orientation.get("requires_provider_adjudication") is False
+        ),
+        "raw_source_preserved": bool(
+            raw_observation is not None
+            and str(raw_observation[0])
+            == "Anthem of the Republic - The Cosmic Assembly - Live (1978)"
+        ),
+        "year_and_version_preserved": bool(
+            corrected["original_release_date"] == "1978"
+            and corrected["version_type"] == "live"
+        ),
+        "title_artist_corrected": bool(
+            corrected["title"] == "Anthem of the Republic"
+            and corrected["artist"] == "The Cosmic Assembly"
+        ),
+        "album_metadata_applied": corrected["album"] == "Republic Signals",
+        "structured_primary_credit_correct": bool(
+            len(credits) == 1
+            and tuple(credits[0]) == ("The Cosmic Assembly", "primary")
+        ),
+        "canonical_album_membership_rebuilt": album_membership == 1,
+        "metadata_history_written": int(
+            db.conn.execute(
+                "SELECT COUNT(*) FROM track_metadata_history WHERE track_id=?", (track_id,)
+            ).fetchone()[0]
+        )
+        > history_before,
+        "ordinary_review_zero": review_count == 0,
+        "terminal_non_review_outcome": str(completed["state"])
+        in {"applied", "applied_with_gaps"},
+        "no_media_tag_write": tag_writer.calls == 0,
+        "no_artwork_request": not artwork_calls,
+        "media_unchanged": _batch10_6_tree_snapshot(data_root / "youtube_downloads")
+        == media_before,
+        "covers_unchanged": _batch10_6_tree_snapshot(data_root / "covers")
+        == covers_before,
+        "portrait_cache_unchanged": _batch10_6_tree_snapshot(data_root / "artist_images")
+        == portraits_before,
+        "source_memberships_preserved": int(
+            db.conn.execute("SELECT COUNT(*) FROM playlist_track_origins").fetchone()[0]
+        )
+        == memberships_before,
+        "playlists_preserved": int(db.conn.execute("SELECT COUNT(*) FROM playlists").fetchone()[0])
+        == playlists_before,
+        "sync_sources_preserved": int(db.conn.execute("SELECT COUNT(*) FROM sync_sources").fetchone()[0])
+        == sources_before,
+        "playback_preserved": _batch10_playback_unchanged(window, playback_before),
+        "queue_preserved": _batch10_playback_unchanged(window, playback_before),
+        "same_media_player": bool(
+            media_players_before == media_players_after
+            and len(media_players_after) == 1
+            and media_players_after[0] is getattr(window, "player", None)
+        ),
+        "network_guard_active": _REVIEW_NETWORK_GUARD_INSTALLED,
+        "credential_files_absent": True,
+        "dist_runtime_data_absent": not (
+            plan.runtime_root / "dist" / "MusicVault" / "data"
+        ).exists(),
+    }
+    non_boolean = {
+        "schema_version",
+        "packaged_process",
+        "processed_count",
+        "discogs_query_count",
+        "musicbrainz_query_count",
+        "network_attempt_count",
+    }
+    failed = sorted(
+        name
+        for name, value in behaviors.items()
+        if name not in non_boolean and value is not True
+    )
+    if int(behaviors["discogs_query_count"]) != 2:
+        failed.append("discogs_query_count")
+    if int(behaviors["musicbrainz_query_count"]) > 1:
+        failed.append("musicbrainz_query_count")
+    if int(behaviors["network_attempt_count"]) != 0:
+        failed.append("network_attempt_count")
+    if failed:
+        raise ReviewPlanError(
+            "Batch 10.6 synthetic UI behavior failed: " + ", ".join(sorted(set(failed)))
         )
     return behaviors
 
@@ -4244,7 +4852,7 @@ def prepare_review_scene(window: object, scene: str) -> None:
     _close_review_sync_dialog(window)
     if scene in METADATA_REVIEW_SCENES:
         _prepare_metadata_scene(window, scene)
-    elif scene in METADATA_INTELLIGENCE_REVIEW_SCENES:
+    elif scene in (*METADATA_INTELLIGENCE_REVIEW_SCENES, *BATCH10_6_REVIEW_SCENES):
         from music_vault.ui.metadata_intelligence import MetadataIntelligenceDialog
 
         dialog = MetadataIntelligenceDialog(
@@ -4263,6 +4871,16 @@ def prepare_review_scene(window: object, scene: str) -> None:
         window.current_playlist_id = None
         window.current_playlist_name = "Artists"
         window.show_artist_browser()
+    elif scene in BATCH10_5_REVIEW_SCENES:
+        _set_page(window, "library_page")
+        _set_review_artist_fetch_state(window, False)
+        window.current_view_kind = "artists"
+        window.current_playlist_id = None
+        window.current_playlist_name = "Artists"
+        window.show_artist_browser()
+        search = getattr(window, "search_box", None)
+        if search is not None:
+            search.setText("Glass Horizon")
     elif scene in REMEDIATION_REVIEW_SCENES:
         _prepare_remediation_scene(window, scene)
     elif scene == "sync_managed_playlist":
@@ -4356,6 +4974,7 @@ _BROWSER_REVIEW_SCENES = frozenset(
         "artists_fetch_disabled",
         "artists_fetch_enabled",
         *BATCH10_3_REVIEW_SCENES,
+        *BATCH10_5_REVIEW_SCENES,
     }
 )
 
@@ -4365,7 +4984,7 @@ def _review_browser_kind(scene: str) -> str | None:
         return "albums"
     if scene in {"artists", "artists_fetch_disabled", "artists_fetch_enabled"}:
         return "artists"
-    if scene in BATCH10_3_REVIEW_SCENES:
+    if scene in (*BATCH10_3_REVIEW_SCENES, *BATCH10_5_REVIEW_SCENES):
         return "artists"
     return None
 
@@ -4376,7 +4995,7 @@ def review_scene_ready(window: object, scene: str) -> bool:
     if scene in PARTY_REVIEW_SCENES:
         return True
 
-    if scene in METADATA_INTELLIGENCE_REVIEW_SCENES:
+    if scene in (*METADATA_INTELLIGENCE_REVIEW_SCENES, *BATCH10_6_REVIEW_SCENES):
         dialog = getattr(window, "_review_metadata_intelligence_dialog", None)
         return bool(dialog is not None and dialog.isVisible())
 
@@ -4956,6 +5575,8 @@ class UIReviewController(QObject):
                 or scene in MULTI_SOURCE_REVIEW_SCENES
                 or scene in METADATA_INTELLIGENCE_REVIEW_SCENES
                 or scene in BATCH10_3_REVIEW_SCENES
+                or scene in BATCH10_5_REVIEW_SCENES
+                or scene in BATCH10_6_REVIEW_SCENES
                 for scene in self.plan.scenes
             ):
                 _install_review_network_guard()
@@ -4986,6 +5607,14 @@ class UIReviewController(QObject):
             if any(scene in BATCH10_3_REVIEW_SCENES for scene in self.plan.scenes):
                 self.runtime_checks["batch10_3_behaviors"] = (
                     validate_batch10_3_review_behaviors(self.window, self.plan)
+                )
+            if any(scene in BATCH10_5_REVIEW_SCENES for scene in self.plan.scenes):
+                self.runtime_checks["batch10_5_behaviors"] = (
+                    validate_batch10_5_review_behaviors(self.window, self.plan)
+                )
+            if any(scene in BATCH10_6_REVIEW_SCENES for scene in self.plan.scenes):
+                self.runtime_checks["batch10_6_behaviors"] = (
+                    validate_batch10_6_review_behaviors(self.window, self.plan)
                 )
             self.window.showNormal()
             self.window.raise_()
@@ -5205,6 +5834,8 @@ class UIReviewController(QObject):
             party_mode_behaviors = self.runtime_checks.get("party_mode_behaviors")
             multi_source_behaviors = self.runtime_checks.get("multi_source_behaviors")
             batch10_3_behaviors = self.runtime_checks.get("batch10_3_behaviors")
+            batch10_5_behaviors = self.runtime_checks.get("batch10_5_behaviors")
+            batch10_6_behaviors = self.runtime_checks.get("batch10_6_behaviors")
             self.runtime_checks = validate_review_runtime(self.plan)
             if metadata_behaviors is not None:
                 self.runtime_checks["metadata_behaviors"] = metadata_behaviors
@@ -5220,6 +5851,10 @@ class UIReviewController(QObject):
                 self.runtime_checks["multi_source_behaviors"] = multi_source_behaviors
             if batch10_3_behaviors is not None:
                 self.runtime_checks["batch10_3_behaviors"] = batch10_3_behaviors
+            if batch10_5_behaviors is not None:
+                self.runtime_checks["batch10_5_behaviors"] = batch10_5_behaviors
+            if batch10_6_behaviors is not None:
+                self.runtime_checks["batch10_6_behaviors"] = batch10_6_behaviors
             if len(self.captures) != self.plan.capture_count:
                 raise ReviewPlanError("The review capture matrix is incomplete.")
             self._write_manifest(self._manifest("complete"))

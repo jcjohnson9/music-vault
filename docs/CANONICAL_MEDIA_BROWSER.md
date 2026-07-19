@@ -4,7 +4,8 @@ Music Vault 1.1 groups the Albums and Artists browsers by durable media
 identity while preserving every track row, source membership, local file, and
 user-visible metadata value.
 
-This document describes Batch 10.3 on the v1.1.0 development line. The latest
+This document describes the Batch 10.3 browser foundation and Batch 10.5
+acceptance corrections on the v1.1.0 development line. The latest
 public stable release remains immutable v1.0.0. Batch 11 remains next; Batch
 10.3 does not create a tag or public Release.
 
@@ -58,7 +59,8 @@ is limited to non-conflicting case, spacing, or presentation punctuation. A
 deterministic canonical entity is selected using accepted provider identity,
 portrait availability, primary-credit usage, and stable ID. Conflicting
 provider identities, unrelated same-name artists, and person/group ambiguity
-remain separate and are reported for review.
+remain diagnostically distinct and use an explicit disambiguated browser
+presentation.
 
 Credits keep their role, order, join phrase, provenance, confidence, manual
 state, and lock state when reassigned. Alternate display forms become aliases.
@@ -91,11 +93,12 @@ stored provider credits. Explicit `feat.`, `featuring`, `with`, `x`, `vs.`, or
 provider-supported `presents` roles may be used; punctuation alone is never a
 split rule.
 
-## Review outcomes
+## Automatic outcomes
 
-`Needs Review` is reserved for meaningful uncertainty in song identity,
-primary artist or structured credits, version identity, severe duration
-conflict, or competing critical provider matches.
+The ordinary metadata Review queue is no longer part of automatic processing.
+Music Vault applies the best honest stored value to the database, keeps field-
+level confidence and reasons, and leaves rare corrections to the normal
+metadata editor and history/undo surfaces.
 
 `Applied with Gaps` means critical identity is accepted while secondary details
 such as album, year, exact edition, artwork, label, catalogue number, or country
@@ -107,15 +110,16 @@ match, but strong source-title evidence provides a usable title, artist, and
 version with no critical conflict. Unsupported album and year values remain
 blank, and the uploader remains separate provenance.
 
-Existing review items can be reclassified from stored proposals, confidence,
-agreement, parsed hints, and history. Reclassification does not require a new
-provider request when stored evidence is sufficient, and it never auto-accepts
-a critical conflict.
+Existing legacy review items can be reclassified from stored proposals,
+confidence, agreement, parsed hints, and history. Reclassification does not
+require a new provider request. Discogs is preferred for catalogue identity,
+MusicBrainz fills useful Discogs gaps, and a structured source-title fallback
+is accepted when neither catalogue has an honest value.
 
 Reclassification runs in bounded batches, updates aggregate job outcomes, and
-is idempotent for terminal items. It can fill only an empty, unlocked critical
-field supported by saved high-confidence evidence; it does not rewrite a
-populated field or media tag.
+is idempotent for terminal items. Manual/confirmed locks remain authoritative.
+Medium-confidence values may update the database with history, but only
+high-confidence fields remain eligible for automatic media-tag writeback.
 
 ## Soundtracks
 
@@ -129,9 +133,12 @@ release context rather than a performer identity.
 ## Artist portraits
 
 Valid manual and cached portraits are preserved. Missing portraits use the
-private fallback chain: high-confidence Discogs artist image, existing
-MusicBrainz/Wikidata/Wikimedia lookup, strict canonical Wikimedia fallback, and
-placeholder. Album covers are never used as portraits. Cached files and
+private fallback chain: MusicBrainz-linked Wikimedia, a validated full-size
+Discogs artist portrait, strict canonical Wikimedia fallback, and placeholder.
+New provider images must be at least 320 by 320 pixels; a `uri150` thumbnail never wins
+over a full-size Discogs URI. Canonical artist IDs, MusicBrainz IDs, Discogs
+IDs, normalized names, and historical aliases all resolve the same cache
+identity. Album covers are never used as portraits. Cached files and
 attribution remain private runtime data, and fetching requires the existing
 user opt-in.
 

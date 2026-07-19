@@ -35,6 +35,9 @@ from music_vault.core.db import MusicVaultDB  # noqa: E402
 from music_vault.metadata.artist_consolidation import (  # noqa: E402
     analyze_existing_artist_consolidation,
 )
+from music_vault.metadata.acceptance_repair import (  # noqa: E402
+    METADATA_ACCEPTANCE_REPAIR_MARKER,
+)
 from music_vault.metadata.canonical_albums import (  # noqa: E402
     analyze_canonical_album_backfill,
     create_canonical_media_schema,
@@ -51,6 +54,7 @@ AUTOMATIC_BACKUP_PATTERN = re.compile(
     r"music_vault_pre_schema_v7_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}"
     r"(?:_\d+)?\.sqlite3"
 )
+EXPECTED_SCHEMA7_REPAIR_MARKER_VALUE = "1"
 
 
 class GateFailure(acceptance.AcceptanceFailure):
@@ -488,9 +492,10 @@ def verify_migration(
     before_names = set(before_tables)
     after_names = set(after_tables)
 
-    exact_protected = all(
+    exact_protected_except_app_meta = all(
         after_db["protected_tables"].get(name) == guard
         for name, guard in before_db["protected_tables"].items()
+        if name != "app_meta"
     )
     preservation_counts = before_db["preservation_counts"]
     current_counts = after_db["preservation_counts"]
@@ -554,6 +559,33 @@ def verify_migration(
         acceptance.readonly(Path(database), immutable=False)
     ) as connection:
         actual_post_state = acceptance.capture_post_migration_semantics(connection)
+        app_meta_columns = acceptance.columns(connection, "app_meta")
+        app_meta_baseline_rows = connection.execute(
+            "SELECT "
+            + ",".join(acceptance.quote_identifier(name) for name in app_meta_columns)
+            + " FROM app_meta WHERE key<>?",
+            (METADATA_ACCEPTANCE_REPAIR_MARKER,),
+        ).fetchall()
+        app_meta_baseline_guard = {
+            "count": len(app_meta_baseline_rows),
+            "columns": app_meta_columns,
+            "digest": acceptance.aggregate_digest(
+                acceptance.row_digest(tuple(row)) for row in app_meta_baseline_rows
+            ),
+        }
+        app_meta_baseline_rows_exact = (
+            app_meta_baseline_guard
+            == before_db["protected_tables"].get("app_meta")
+        )
+        repair_marker_rows = connection.execute(
+            "SELECT value FROM app_meta WHERE key=?",
+            (METADATA_ACCEPTANCE_REPAIR_MARKER,),
+        ).fetchall()
+        repair_marker_exact = (
+            len(repair_marker_rows) == 1
+            and str(repair_marker_rows[0][0])
+            == EXPECTED_SCHEMA7_REPAIR_MARKER_VALUE
+        )
         canonical_count = int(connection.execute("SELECT COUNT(*) FROM canonical_albums").fetchone()[0])
         membership_count = int(
             connection.execute("SELECT COUNT(*) FROM track_album_memberships").fetchone()[0]
@@ -609,7 +641,13 @@ def verify_migration(
         "foreign_key_check_clean": after_db["health"]["foreign_key_issue_count"] == 0,
         "all_schema6_tables_remain": before_names <= after_names,
         "only_expected_v7_tables_added": after_names == before_names | set(acceptance.V7_TABLES),
-        "all_protected_tables_exact": exact_protected,
+        "app_meta_baseline_rows_exact": app_meta_baseline_rows_exact,
+        "batch10_5_repair_marker_exact": repair_marker_exact,
+        "all_protected_tables_exact": (
+            exact_protected_except_app_meta
+            and app_meta_baseline_rows_exact
+            and repair_marker_exact
+        ),
         "track_ids_exact": after_db["track_id_guard"] == before_db["track_id_guard"],
         "track_stable_values_exact": after_db["track_stable_guard"] == before_db["track_stable_guard"],
         "track_release_context_stable_values_exact": (

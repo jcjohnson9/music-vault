@@ -117,21 +117,22 @@ presented as a member's solo track. Punctuation does not prove a band split,
 and `Various Artists`, labels, distributors, or uploaders never become
 performer cards from release/source context alone.
 
-## Field-level review outcomes
+## Field-level automatic outcomes
 
-`Needs Review` is limited to critical song, primary-artist, structured-credit,
-version, severe-duration, or conflicting-provider uncertainty. Accepted
-identity with missing album, year, exact edition, artwork, label, catalogue
-number, or country becomes `Applied with Gaps`. Strong source-title identity
-with no critical conflict and no credible catalogue match becomes `Accepted
+Automatic work finishes as `Applied`, `Applied with Gaps`, `Accepted Source
+Fallback`, `Failed`, or `Skipped`; it does not wait in an ordinary Review
+queue. Accepted identity with missing album, year, exact edition, artwork,
+label, catalogue number, or country becomes `Applied with Gaps`. Strong
+source-title identity with no credible catalogue match becomes `Accepted
 Source Fallback`; unsupported release fields remain blank.
 
 Stored normalized evidence can be reclassified in bounded batches without a
-provider request. High-confidence safe gap fields may apply, medium-confidence
-fields remain unapplied, critical conflicts stay in review, and job aggregate
-counts reconcile. Soundtrack title/performer identity may apply while an exact
-edition remains a gap; soundtracks, scores, casts, and sequel entries retain
-distinct album kinds.
+provider request. High- and medium-confidence database values retain confidence
+and history; medium-confidence values are not eligible for automatic media-tag
+writeback. Operational corruption or apply failure is `Failed`, while honest
+metadata absence is a gap or source fallback. Soundtrack title/performer
+identity may apply while an exact edition remains a gap; soundtracks, scores,
+casts, and sequel entries retain distinct album kinds.
 
 ## Authority and precedence
 
@@ -145,13 +146,26 @@ Automatic observations use a centralized precedence policy:
 6. YouTube/source fallback;
 7. filename fallback or unknown.
 
-When automatic intelligence is enabled, a strong version-consistent Discogs
-match is preferred; MusicBrainz is secondary corroboration/fallback. Provider
-preference never overrides confidence: only fields meeting the automatic
-threshold and without a meaningful conflict may apply. A medium/low-confidence
-field or provider/release/date/version disagreement stays review-only. YouTube
-title parsing supplies search hints, while uploader/channel and upload date
-remain source provenance rather than default artist or release date.
+When automatic intelligence is enabled, a version-consistent Discogs match is
+preferred; MusicBrainz is secondary corroboration/fallback. Embedded values,
+provider-adjudicated source-title hints, and source fallback follow. Field
+confidence and reasons are retained, and hard version/duration mismatches do
+not erase the source qualifier. YouTube title parsing supplies two orientation
+hypotheses rather than overruling provider identity; uploader/channel and
+upload date remain source provenance rather than default artist or release
+date.
+
+For a safe top-level dash split, the parser retains immutable
+`left_is_artist` and `right_is_artist` hypotheses with the same raw title,
+year, version, featured-credit, and presentation clues. Discogs evaluates the
+conventional orientation first and the reverse only when the first result is
+not conclusive. MusicBrainz is a single secondary corroboration/fallback.
+Normalized intelligence evidence records the evaluated count, selected
+orientation, confidence, bounded request counts, and reason codes; it never
+stores a query, token, or raw provider response. Strict unique canonical-artist
+evidence may resolve an item offline. Otherwise current values are preserved
+as an accepted source fallback that remains eligible for provider
+adjudication.
 
 Locked values are not replaced by automatic imports. A lower-priority or empty
 automatic observation cannot erase a stronger populated value, but the

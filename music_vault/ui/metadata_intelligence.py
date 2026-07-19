@@ -30,14 +30,13 @@ from music_vault.metadata.schema import EDITABLE_METADATA_FIELDS
 
 
 REVIEW_FILTERS = (
-    ("Needs Review", "needs_review"),
+    ("All Outcomes", None),
     ("Applied", "applied"),
     ("Applied with Gaps", "applied_with_gaps"),
-    ("Source Fallback", "source_fallback"),
+    ("Accepted Source Fallback", "source_fallback"),
     ("Failed", "failed"),
     ("No Match", "no_match"),
     ("Skipped", "skipped"),
-    ("All Items", None),
     ("Provider Disagreement", "provider_disagreement"),
     ("Version Conflict", "version_conflict"),
     ("Album Ambiguity", "album_ambiguity"),
@@ -50,8 +49,8 @@ _STATE_LABELS = {
     "applied": "Applied",
     "applied_with_gaps": "Applied with Gaps",
     "source_fallback": "Accepted Source Fallback",
-    "review": "Needs Review",
-    "ready": "Needs Review",
+    "review": "Legacy Pending",
+    "ready": "Legacy Pending",
     "failed": "Failed",
     "no_match": "No Match",
     "skipped": "Skipped",
@@ -163,9 +162,10 @@ class MetadataIntelligenceDialog(QDialog):
         title = QLabel("Metadata Intelligence")
         title.setObjectName("PageTitle")
         description = QLabel(
-            "Review provider agreement, version/date ambiguity, YouTube-exclusive "
-            "fallbacks, and high-confidence field-level changes. Personal provider "
-            "credentials are never shown here."
+            "Inspect automatic best-available outcomes, provider provenance, "
+            "version/date gaps, and source fallbacks. Rare mistakes can still be "
+            "corrected in the metadata editor. Personal provider credentials are "
+            "never shown here."
         )
         description.setObjectName("MutedLabel")
         description.setWordWrap(True)
@@ -178,15 +178,15 @@ class MetadataIntelligenceDialog(QDialog):
         self.filter_combo.setObjectName("MetadataIntelligenceFilter")
         for label, value in REVIEW_FILTERS:
             self.filter_combo.addItem(label, value)
-        default_index = self.filter_combo.findData("needs_review")
+        default_index = self.filter_combo.findData(None)
         if default_index >= 0:
             self.filter_combo.setCurrentIndex(default_index)
         self.filter_combo.currentIndexChanged.connect(self.refresh)
         controls.addWidget(self.filter_combo)
-        self.show_incomplete_checkbox = QCheckBox("Show incomplete metadata")
+        self.show_incomplete_checkbox = QCheckBox("Include incomplete outcomes")
         self.show_incomplete_checkbox.setObjectName("MetadataShowIncomplete")
         self.show_incomplete_checkbox.setToolTip(
-            "Include Applied with Gaps beside Needs Review without increasing the review count."
+            "Include Applied with Gaps when an audit filter is selected."
         )
         self.show_incomplete_checkbox.toggled.connect(self.refresh)
         controls.addWidget(self.show_incomplete_checkbox)
@@ -223,7 +223,7 @@ class MetadataIntelligenceDialog(QDialog):
                 "Release Choices",
                 "Artwork",
                 "Proposed Fields",
-                "Review Reason",
+                "Decision Detail",
             ]
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -242,13 +242,13 @@ class MetadataIntelligenceDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._populate_field_choices)
         layout.addWidget(self.table, 1)
 
-        field_group = QGroupBox("Apply Selected Review Fields")
+        field_group = QGroupBox("Optional Manual Correction")
         field_group.setObjectName("MetadataReviewFieldGroup")
         field_group_layout = QVBoxLayout(field_group)
         field_group_layout.setContentsMargins(10, 8, 10, 8)
         field_group_layout.setSpacing(6)
         self.field_choice_hint = QLabel(
-            "Select a review row to choose individual proposed fields. "
+            "Select a legacy pending row to choose individual proposed fields. "
             "Confirmed values are locked and retain metadata history."
         )
         self.field_choice_hint.setObjectName("MutedLabel")
@@ -407,10 +407,15 @@ class MetadataIntelligenceDialog(QDialog):
                 (job_id,),
             ).fetchall()
         }
-        needs_review = state_counts.get("review", 0) + state_counts.get("ready", 0)
+        pending = (
+            state_counts.get("queued", 0)
+            + state_counts.get("analyzing", 0)
+            + state_counts.get("review", 0)
+            + state_counts.get("ready", 0)
+        )
         self.summary.setText(
             f"Job: {status.replace('_', ' ').title()}  •  "
-            f"Needs Review: {needs_review}  •  Applied: {state_counts.get('applied', 0)}  •  "
+            f"Pending: {pending}  •  Applied: {state_counts.get('applied', 0)}  •  "
             f"Applied with Gaps: {state_counts.get('applied_with_gaps', 0)}  •  "
             f"Source Fallback: {state_counts.get('source_fallback', 0)}  •  "
             f"Failed: {state_counts.get('failed', 0)}  •  "

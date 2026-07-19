@@ -105,8 +105,7 @@ def test_batch10_3_source_ui_smoke_uses_real_window_handlers_offline(
         assert evidence["score_card_count"] >= 1
         assert evidence["corrected_version_alias_count"] >= 1
         assert evidence["review_outcome_counts"] == {
-            "applied_with_gaps": 1,
-            "review": 1,
+            "applied_with_gaps": 2,
             "source_fallback": 1,
         }
         assert evidence["network_attempt_count"] == 0

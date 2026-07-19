@@ -83,7 +83,15 @@ _RECOGNIZED_NONCRITICAL_REASONS = frozenset(
     }
 )
 _NESTED_EVIDENCE_MAPPINGS = frozenset(
-    {"_current", "_reasons", "_discogs", "_musicbrainz", "_sources", "_artwork"}
+    {
+        "_current",
+        "_reasons",
+        "_discogs",
+        "_musicbrainz",
+        "_sources",
+        "_artwork",
+        "_orientation",
+    }
 )
 
 
@@ -171,10 +179,49 @@ def _strong_source_fallback(
         title
         and artist
         and pattern in STRONG_TITLE_PATTERNS
+        and _orientation_fallback_ready(hints, proposal)
         and agreement in {"none", "unknown"}
         and not has_provider
         and review_reason
         in {"youtube_exclusive", "strong_source_fallback", "no_provider_match", ""}
+    )
+
+
+def _orientation_fallback_ready(
+    hints: Mapping[str, Any], proposal: Mapping[str, Any]
+) -> bool:
+    """Require an auditable decision before closing an ambiguous dash item."""
+
+    if str(hints.get("pattern") or "").strip() != "artist_dash_title":
+        return True
+    evidence = _mapping(proposal.get("_orientation")) or _mapping(
+        hints.get("orientation")
+    )
+    if not evidence:
+        return False
+    try:
+        evaluated = int(evidence.get("evaluated_count", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        evaluated = 0
+    reasons = evidence.get("reasons", ())
+    if isinstance(reasons, str):
+        reasons = (reasons,)
+    reason_set = {
+        str(value).strip().casefold()
+        for value in reasons
+        if str(value).strip()
+    }
+    selected = str(evidence.get("selected") or "").strip().casefold()
+    if selected not in {"left_is_artist", "right_is_artist"}:
+        return False
+    provider_confirmed = evidence.get("provider_confirmed") is True
+    requires_provider = evidence.get("requires_provider_adjudication") is True
+    if provider_confirmed and requires_provider:
+        return False
+    return bool(
+        provider_confirmed
+        or evaluated >= 2
+        or "unique_local_artist_identity" in reason_set
     )
 
 
@@ -345,6 +392,91 @@ def classify_stored_review_evidence(
     )
 
 
+def terminalize_stored_review_evidence(
+    *,
+    parsed_hints: object,
+    field_proposal: object,
+    field_confidence: object,
+    provider_agreement: object,
+    review_reason: object,
+) -> ReviewDecision:
+    """Resolve a legacy Review row to a terminal best-available outcome.
+
+    The older classifier remains available for audit compatibility, but the
+    product pipeline no longer leaves ordinary uncertainty waiting for manual
+    approval.  Corrupt saved evidence is an operational failure; otherwise we
+    keep the uncertainty diagnostics and accept provider or source evidence.
+    No network access is performed here.
+    """
+
+    decision = classify_stored_review_evidence(
+        parsed_hints=parsed_hints,
+        field_proposal=field_proposal,
+        field_confidence=field_confidence,
+        provider_agreement=provider_agreement,
+        review_reason=review_reason,
+    )
+    if decision.outcome is not ReviewOutcome.NEEDS_REVIEW:
+        return decision
+    if "malformed_stored_evidence" in decision.critical_conflicts:
+        return ReviewDecision(
+            ReviewOutcome.FAILED,
+            "corrupt_stored_evidence",
+            decision.critical_conflicts,
+            decision.secondary_gaps,
+            decision.safe_critical_fields,
+            decision.soundtrack,
+        )
+
+    hints = _mapping(parsed_hints)
+    proposal = _mapping(field_proposal)
+    has_provider = bool(
+        _mapping(proposal.get("_discogs"))
+        or _mapping(proposal.get("_musicbrainz"))
+    )
+    stored_reason = str(review_reason or "").strip().casefold()
+    if stored_reason in {
+        "file_write_failed",
+        "file_write_rollback_failed",
+        "database_transaction_failed",
+        "database_apply_failed",
+    } or (stored_reason == "provider_or_apply_failure" and not has_provider):
+        return ReviewDecision(
+            ReviewOutcome.FAILED,
+            "stored_operational_failure",
+            decision.critical_conflicts,
+            decision.secondary_gaps,
+            decision.safe_critical_fields,
+            decision.soundtrack,
+        )
+    stored_pattern = str(hints.get("pattern") or "").strip()
+    has_source_identity = bool(
+        (hints.get("title") or proposal.get("title"))
+        and (hints.get("artist") or proposal.get("artist"))
+        and stored_pattern in STRONG_TITLE_PATTERNS
+        and _orientation_fallback_ready(hints, proposal)
+    )
+    if has_provider:
+        outcome = ReviewOutcome.APPLIED_WITH_GAPS
+        reason = "best_available_provider_evidence"
+    elif has_source_identity:
+        outcome = ReviewOutcome.SOURCE_FALLBACK
+        reason = "accepted_source_fallback"
+    else:
+        # Preserve the current effective values and close the obsolete Review
+        # row with gaps.  Absence of an exact album/year is not a failure.
+        outcome = ReviewOutcome.APPLIED_WITH_GAPS
+        reason = "preserved_existing_with_gaps"
+    return ReviewDecision(
+        outcome,
+        reason,
+        decision.critical_conflicts,
+        decision.secondary_gaps,
+        decision.safe_critical_fields,
+        decision.soundtrack,
+    )
+
+
 def classify_ensemble_outcome(
     ensemble: MetadataEnsemble,
     *,
@@ -399,11 +531,12 @@ def classify_ensemble_outcome(
         for candidate in (ensemble.discogs_candidate, ensemble.musicbrainz_candidate)
         if candidate is not None
     )
-    if local_duration is not None:
-        for candidate in candidates:
-            candidate_duration = getattr(candidate, "duration_seconds", None)
-            if candidate_duration is None:
-                continue
+    if local_duration is not None and candidates:
+        # Discogs is authoritative when present. A mismatching secondary
+        # MusicBrainz candidate must not invalidate a coherent Discogs match.
+        candidate = ensemble.discogs_candidate or ensemble.musicbrainz_candidate
+        candidate_duration = getattr(candidate, "duration_seconds", None)
+        if candidate_duration is not None:
             delta = abs(float(local_duration) - float(candidate_duration))
             if delta > max(30.0, float(local_duration) * 0.2):
                 critical_conflicts.add("duration")
@@ -435,8 +568,28 @@ def classify_ensemble_outcome(
             if "missing_primary_artist_identity" in critical_conflicts
             else "critical_provider_conflict"
         )
+        if candidates:
+            return ReviewDecision(
+                ReviewOutcome.APPLIED_WITH_GAPS,
+                "best_available_identity_with_conflicts",
+                tuple(sorted(critical_conflicts)),
+                tuple(sorted(secondary_gaps)),
+                soundtrack=soundtrack,
+            )
+        if (
+            parsed_hints.get("title")
+            and parsed_hints.get("artist")
+            and _orientation_fallback_ready(parsed_hints, {})
+        ):
+            return ReviewDecision(
+                ReviewOutcome.SOURCE_FALLBACK,
+                "accepted_source_fallback",
+                tuple(sorted(critical_conflicts)),
+                tuple(sorted(secondary_gaps)),
+                soundtrack=soundtrack,
+            )
         return ReviewDecision(
-            ReviewOutcome.NEEDS_REVIEW,
+            ReviewOutcome.SKIPPED,
             reason,
             tuple(sorted(critical_conflicts)),
             tuple(sorted(secondary_gaps)),
@@ -472,7 +625,7 @@ def classify_ensemble_outcome(
             secondary_gaps=tuple(sorted(secondary_gaps)),
             soundtrack=soundtrack,
         )
-    return ReviewDecision(ReviewOutcome.NO_MATCH, "no_credible_match", soundtrack=soundtrack)
+    return ReviewDecision(ReviewOutcome.SKIPPED, "no_credible_match", soundtrack=soundtrack)
 
 
 __all__ = [
@@ -482,4 +635,5 @@ __all__ = [
     "ReviewOutcome",
     "classify_ensemble_outcome",
     "classify_stored_review_evidence",
+    "terminalize_stored_review_evidence",
 ]

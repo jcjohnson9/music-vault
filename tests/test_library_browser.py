@@ -22,6 +22,7 @@ from music_vault.core.library_browser import (
     normalize_identity,
     open_readonly_database,
     query_album_summaries,
+    query_album_tracks,
     query_artist_summaries,
 )
 
@@ -178,21 +179,41 @@ def test_canonical_album_edition_count_includes_date_only_reissues(
     assert summaries[0].edition_count == 2
 
 
-def test_missing_album_identity_does_not_collide_with_literal_unknown_album(
+def test_missing_and_literal_unknown_album_share_one_virtual_collection(
     browser_db: MusicVaultDB,
     tmp_path: Path,
 ):
-    _add_track(browser_db, tmp_path, "missing", artist="Artist", album=None)
-    _add_track(browser_db, tmp_path, "literal", artist="Artist", album="Unknown Album")
+    missing = _add_track(browser_db, tmp_path, "missing", artist="Artist", album=None)
+    literal = _add_track(
+        browser_db,
+        tmp_path,
+        "literal",
+        artist="Artist",
+        album="Unknown Album",
+        cover_path=str(tmp_path / "must-not-brand-virtual-card.png"),
+    )
 
-    unknowns = [
+    summaries = query_album_summaries(browser_db.conn)
+    virtuals = [
         summary
-        for summary in query_album_summaries(browser_db.conn)
-        if summary.album_title == "Unknown Album"
+        for summary in summaries
+        if summary.album_title == "Singles & Uncatalogued"
     ]
-    assert len(unknowns) == 2
-    assert {summary.key.title_key for summary in unknowns} == {"", "unknown album"}
-    assert len({summary.browser_key for summary in unknowns}) == 2
+    assert len(virtuals) == 1
+    virtual = virtuals[0]
+    assert virtual.key.virtual_kind == "singles_uncatalogued"
+    assert virtual.key.title_key == ""
+    assert virtual.track_count == 2
+    assert virtual.representative_cover_path is None
+    assert {int(row["id"]) for row in query_album_tracks(browser_db.conn, virtual.key)} == {
+        missing,
+        literal,
+    }
+    assert not any(summary.album_title == "Unknown Album" for summary in summaries)
+    assert browser_db.get_track(literal)["album"] == "Unknown Album"
+    assert browser_db.conn.execute(
+        "SELECT COUNT(*) FROM track_album_memberships WHERE track_id=?", (literal,)
+    ).fetchone()[0] == 0
 
 
 def test_album_cover_selection_is_lowest_track_id_with_nonblank_cover(

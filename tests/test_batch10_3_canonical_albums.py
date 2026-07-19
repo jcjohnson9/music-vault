@@ -33,6 +33,8 @@ def _insert_track(
     album: str | None,
     album_artist: str | None,
     release_date: str | None = None,
+    original_release_date: str | None = None,
+    version_type: str | None = None,
     cover_path: Path | None = None,
     discogs_release_id: str | None = None,
     discogs_master_id: str | None = None,
@@ -41,9 +43,10 @@ def _insert_track(
         db.conn.execute(
             """
             INSERT INTO tracks (
-                path,title,artist,album,album_artist,release_date,year,cover_path,
+                path,title,artist,album,album_artist,release_date,
+                original_release_date,version_type,year,cover_path,
                 discogs_release_id,discogs_master_id,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
             """,
             (
                 str(path),
@@ -52,6 +55,8 @@ def _insert_track(
                 album,
                 album_artist,
                 release_date,
+                original_release_date,
+                version_type,
                 release_date[:4] if release_date else None,
                 str(cover_path) if cover_path else None,
                 discogs_release_id,
@@ -133,6 +138,10 @@ def test_edition_parser_does_not_strip_meaningful_work_identity():
     assert split_edition_label("Original Broadway Cast") == (
         "Original Broadway Cast",
         None,
+    )
+    assert split_edition_label("Record (2019 Reissue)") == (
+        "Record",
+        "2019 Reissue",
     )
 
 
@@ -526,6 +535,156 @@ def test_fallback_groups_year_and_cover_editions_but_not_live_work(tmp_path: Pat
     db.close()
 
 
+def test_context_only_release_date_is_preserved_as_membership_edition_date(
+    tmp_path: Path,
+):
+    db = MusicVaultDB(tmp_path / "context-edition-date.sqlite3")
+    track_id = _insert_track(
+        db,
+        tmp_path / "context-only.flac",
+        title="Context Only",
+        artist="Artist",
+        album="Record (2024 Reissue)",
+        album_artist="Artist",
+    )
+    db.conn.execute(
+        """
+        INSERT INTO track_release_context(
+            track_id,release_date,confidence,updated_at
+        ) VALUES (?, '2024-03-15', 96, CURRENT_TIMESTAMP)
+        """,
+        (track_id,),
+    )
+
+    seed_existing_canonical_albums(db.conn)
+
+    membership = db.conn.execute(
+        """
+        SELECT edition_label,edition_release_date
+        FROM track_album_memberships WHERE track_id=?
+        """,
+        (track_id,),
+    ).fetchone()
+    assert tuple(membership) == ("2024 Reissue", "2024-03-15")
+    db.close()
+
+
+def test_multi_performer_soundtrack_uses_neutral_album_artist_grouping(
+    tmp_path: Path,
+):
+    db = MusicVaultDB(tmp_path / "soundtrack-album-artists.sqlite3")
+    for index, performer in enumerate(("Performer One", "Performer Two"), start=1):
+        _insert_track(
+            db,
+            tmp_path / f"soundtrack-{index}.flac",
+            title=f"Featured Song {index}",
+            artist=performer,
+            album="Synthetic Film Soundtrack",
+            album_artist=performer,
+        )
+    _seed_field_rows(db)
+
+    seed_existing_canonical_albums(db.conn)
+
+    grouped = db.conn.execute(
+        """
+        SELECT album.album_kind,album.album_artist_display,COUNT(*)
+        FROM canonical_albums AS album
+        JOIN track_album_memberships AS membership
+          ON membership.canonical_album_id=album.id
+        GROUP BY album.id
+        """
+    ).fetchall()
+    assert [tuple(row) for row in grouped] == [
+        ("soundtrack", "Various Artists", 2)
+    ]
+    db.close()
+
+
+def test_explicit_track_version_classifies_markerless_release_context(
+    tmp_path: Path,
+):
+    db = MusicVaultDB(tmp_path / "markerless-release-kinds.sqlite3")
+    _insert_track(
+        db,
+        tmp_path / "live.flac",
+        title="Concert Song",
+        artist="Artist",
+        album="Night Sessions",
+        album_artist="Artist",
+        version_type="live",
+    )
+    _insert_track(
+        db,
+        tmp_path / "soundtrack.flac",
+        title="Film Cue",
+        artist="Composer",
+        album="Synthetic Film Music",
+        album_artist="Composer",
+        version_type="soundtrack",
+    )
+
+    seed_existing_canonical_albums(db.conn)
+
+    rows = db.conn.execute(
+        "SELECT title,album_kind FROM canonical_albums ORDER BY title"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("Night Sessions", "live_album"),
+        ("Synthetic Film Music", "soundtrack"),
+    ]
+    db.close()
+
+
+def test_credible_original_year_beats_low_confidence_earlier_value(tmp_path: Path):
+    db = MusicVaultDB(tmp_path / "credible-original-year.sqlite3")
+    low_confidence_track = _insert_track(
+        db,
+        tmp_path / "low-confidence.flac",
+        title="Low Confidence",
+        artist="Artist",
+        album="Shared Record",
+        album_artist="Artist",
+        original_release_date="1900",
+    )
+    credible_track = _insert_track(
+        db,
+        tmp_path / "credible.flac",
+        title="Credible",
+        artist="Artist",
+        album="Shared Record",
+        album_artist="Artist",
+        original_release_date="1984",
+    )
+    _seed_field_rows(db)
+    db.conn.execute(
+        """
+        UPDATE track_metadata_fields
+        SET provenance='embedded',confidence=20
+        WHERE track_id=? AND field_name='original_release_date'
+        """,
+        (low_confidence_track,),
+    )
+    db.conn.execute(
+        """
+        UPDATE track_metadata_fields
+        SET provenance='discogs',confidence=96
+        WHERE track_id=? AND field_name='original_release_date'
+        """,
+        (credible_track,),
+    )
+
+    seed_existing_canonical_albums(db.conn)
+
+    assert db.conn.execute(
+        "SELECT original_release_date FROM canonical_albums"
+    ).fetchone()[0] == "1984"
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM track_album_memberships"
+    ).fetchone()[0] == 2
+    db.close()
+
+
 def test_score_uses_release_context_across_performers_and_stays_distinct(
     tmp_path: Path,
 ):
@@ -914,43 +1073,23 @@ def test_schema6_item_check_is_rebuilt_additively_and_preserves_queued_work(
 def test_offline_business_steps_run_only_while_entering_schema7(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    import music_vault.metadata.artist_consolidation as artist_consolidation
-    import music_vault.metadata.review_reclassification as review_reclassification
+    import music_vault.metadata.acceptance_repair as acceptance_repair
 
-    calls = {"artists": 0, "review": 0}
+    calls = {"repair": 0}
+    original = acceptance_repair.apply_metadata_acceptance_repair
 
-    def consolidate_spy(connection: sqlite3.Connection, *, dry_run: bool = False):
-        assert isinstance(connection, sqlite3.Connection)
-        assert dry_run is False
-        calls["artists"] += 1
-        return artist_consolidation.ArtistConsolidationReport(
-            dry_run=False,
-            merge_group_count=0,
-            merged_artist_count=0,
-            reassigned_credit_count=0,
-            aliases_preserved=0,
-            relationships_preserved=0,
-            version_repairs=0,
-            full_credit_repairs=0,
-            conflict_count=0,
-            deleted_artist_count=0,
-        )
-
-    def review_spy(database: object, *, apply: bool = True):
+    def repair_spy(database: object):
         assert isinstance(database, MusicVaultDB)
-        assert apply is True
-        calls["review"] += 1
+        calls["repair"] += 1
+        return original(database)
 
     monkeypatch.setattr(
-        artist_consolidation, "consolidate_existing_artists", consolidate_spy
-    )
-    monkeypatch.setattr(
-        review_reclassification, "reclassify_stored_review_items", review_spy
+        acceptance_repair, "apply_metadata_acceptance_repair", repair_spy
     )
 
     path = tmp_path / "once.sqlite3"
     new = MusicVaultDB(path, backup_dir=tmp_path / "backups")
-    assert calls == {"artists": 0, "review": 0}
+    assert calls == {"repair": 0}
     _insert_track(
         new,
         tmp_path / "track.flac",
@@ -966,8 +1105,8 @@ def test_offline_business_steps_run_only_while_entering_schema7(
     new.close()
 
     migrated = MusicVaultDB(path, backup_dir=tmp_path / "backups")
-    assert calls == {"artists": 1, "review": 1}
+    assert calls == {"repair": 1}
     migrated.close()
     reopened = MusicVaultDB(path, backup_dir=tmp_path / "backups")
-    assert calls == {"artists": 1, "review": 1}
+    assert calls == {"repair": 1}
     reopened.close()

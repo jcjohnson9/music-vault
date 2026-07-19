@@ -97,8 +97,8 @@ SCENES = (
         1920,
         1080,
         1.0,
-        "Production metadata review renders all three tuned outcomes",
-        ("Applied with Gaps", "Accepted Source Fallback", "Needs Review"),
+        "Production metadata dashboard renders terminal auto-acceptance outcomes",
+        ("Applied with Gaps", "Accepted Source Fallback", "Pending: 0"),
     ),
     ReviewScene(
         "soundtrack_state",
@@ -663,6 +663,21 @@ def _seed_runtime(runtime: ReviewRuntime) -> None:
             "_musicbrainz": {},
             "_artwork": {"candidate_available": False},
             "_reasons": {},
+            "_orientation": {
+                "schema_version": 1,
+                "selected": "left_is_artist",
+                "evaluated_count": 2,
+                "confidence": 35.0,
+                "reasons": [
+                    "provisional_conventional_orientation",
+                    "provider_adjudication_required",
+                ],
+                "provider_confirmed": False,
+                "requires_provider_adjudication": True,
+                "discogs_queries": 0,
+                "musicbrainz_queries": 0,
+                "evaluations": [],
+            },
         },
         field_confidence={},
         provider_agreement="discogs_only",
@@ -704,6 +719,13 @@ def _seed_runtime(runtime: ReviewRuntime) -> None:
         provider_agreement="conflict",
         review_reason="version_conflict",
     )
+    # Batch 10.5 intentionally supersedes the old ordinary-Review outcome.
+    # Reclassify the stored synthetic evidence offline so this historical
+    # production-surface review remains useful without asserting removed UI.
+    from music_vault.metadata.review_reclassification import best_available_reclassify
+
+    best_available_reclassify(db, apply=True)
+    db.conn.commit()
 
     if int(db.conn.execute("PRAGMA user_version").fetchone()[0]) != CURRENT_SCHEMA_VERSION:
         raise RuntimeError("Synthetic review database is not on the current schema.")
@@ -1020,8 +1042,8 @@ def _validate_scene(target, runtime: ReviewRuntime, scene: ReviewScene) -> dict[
             str(dialog.table.item(row, 0).text())
             for row in range(dialog.table.rowCount())
         }
-        if states != {"Applied with Gaps", "Accepted Source Fallback", "Needs Review"}:
-            raise RuntimeError("Production metadata review did not render all tuned outcomes.")
+        if states != {"Applied with Gaps", "Accepted Source Fallback"}:
+            raise RuntimeError("Production metadata review did not render terminal outcomes.")
         state_width = dialog.table.columnWidth(0)
         required_width = max(
             dialog.table.fontMetrics().horizontalAdvance(label)

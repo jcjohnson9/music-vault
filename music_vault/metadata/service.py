@@ -511,7 +511,16 @@ class MetadataService:
                 provider_reference, confidence, observed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(observation_key) DO UPDATE SET
-                confidence=COALESCE(excluded.confidence, track_metadata_observations.confidence),
+                confidence=CASE
+                    WHEN track_metadata_observations.confidence IS NULL
+                        THEN excluded.confidence
+                    WHEN excluded.confidence IS NULL
+                        THEN track_metadata_observations.confidence
+                    ELSE MAX(
+                        track_metadata_observations.confidence,
+                        excluded.confidence
+                    )
+                END,
                 observed_at=excluded.observed_at
             """,
             (
@@ -817,7 +826,7 @@ class MetadataService:
                     or effective_value is None
                 ):
                     continue
-                if old.is_locked:
+                if old.is_locked or old.is_manual:
                     continue
                 incoming_priority = PROVENANCE_PRIORITY.get(provenance, 0)
                 if old.value is not None:

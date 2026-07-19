@@ -81,13 +81,11 @@ Release or populated-field conflicts do not promote release metadata: the
 recording may remain high confidence while conflicting album, album artist,
 date, release ID, and artwork stay unchanged for review.
 
-### Schema-v7 review outcomes
+### Schema-v7 automatic outcomes
 
-The automatic-intelligence review queue uses a narrower field-level policy:
+The automatic-intelligence pipeline uses best-available field-level outcomes:
 
-- **Needs Review** means critical title/song, primary artist, structured
-  credit, version, severe-duration, or competing-provider identity evidence is
-  unresolved.
+- **Applied** means the best supported values were accepted.
 - **Applied with Gaps** means the critical identity is safe while secondary
   album, year, exact edition, artwork, label, catalogue number, or country is
   missing or ambiguous.
@@ -100,12 +98,12 @@ manual-review count. Soundtrack title/performer identity may apply with an
 unresolved exact edition, while soundtrack, score, cast, and sequel identities
 remain structurally distinct.
 
-Existing `review`/`ready` rows can be re-evaluated from their persisted
+Existing legacy `review`/`ready` rows can be re-evaluated from their persisted
 normalized hints, field proposals/confidence, provider agreement, reason, and
 current authoritative field state. Reclassification is bounded and resumable,
-constructs no provider client, never weakens locks, applies only safe
-high-confidence gaps, and leaves critical conflicts in review. It does not
-touch media tags.
+constructs no provider client, never weakens locks, and applies best-available
+database values with history. Medium-confidence decisions do not touch media
+tags; only the existing high-confidence writeback path remains eligible.
 
 ## Query normalization is not metadata rewriting
 

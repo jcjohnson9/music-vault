@@ -155,16 +155,27 @@ The **Analyze Existing Library** action creates or resumes one private job over
 canonical tracks, regardless of how many Batch 10 sources reference each track.
 Jobs can pause, resume, cancel, and retry failures. Completed items are not
 repeated, no-match preserves current metadata, and aggregate counts reconcile.
-The dashboard filters high-confidence apply, needs review, provider/version/
-album/date/artist ambiguity, YouTube-exclusive, no-match, and failed outcomes.
+The dashboard filters applied, applied-with-gaps, accepted source-fallback,
+failed, skipped, and optional audit categories.
 
-Schema-v7 outcome tuning keeps only critical title/artist/structured-credit/
-version/duration/provider conflicts in **Needs Review**. Missing album, exact
-edition, year, artwork, label, or catalogue number becomes **Applied with
-Gaps** when identity is safe. Strong source-title identity with no critical
-conflict can become **Accepted Source Fallback**. Existing items can be
-reclassified offline from saved normalized evidence without another provider
-query.
+Schema-v7 best-available acceptance does not leave ordinary items in a Review
+queue. Discogs wins usable catalogue fields unless a hard version/duration
+mismatch exists; MusicBrainz fills missing Discogs fields, then embedded and
+structured source evidence provide fallbacks. Missing album, exact edition,
+year, artwork, label, or catalogue number becomes **Applied with Gaps**.
+Strong source-title identity can become **Accepted Source Fallback**. Existing
+items can be reclassified offline from saved normalized evidence without
+another provider query.
+
+Dash-delimited source titles use a bounded dual-orientation policy. A coherent,
+high-confidence first Discogs match ends the search; otherwise the reverse
+title/artist orientation is queried once and the two normalized leaders are
+compared. MusicBrainz may be queried once as secondary evidence. Duration,
+version, year, track-list, release identity, and strict local canonical-artist
+evidence contribute to the decision. The uploader is provenance, not artist
+proof. Provider evidence overrides an incorrect parser orientation, while
+manual and confirmed locks remain authoritative. Only normalized candidate
+facts and safe decision reason codes persist.
 
 Soundtrack-aware classification can accept a strong song and performer while
 leaving exact soundtrack edition or year as a gap. Soundtrack, score, cast,
@@ -224,9 +235,11 @@ project asset, or used as Music Vault branding.
 Canonical album grouping does not propagate a selected cover. A browser card
 may display the best existing valid cover among its member tracks, but no
 track's artwork path is copied, replaced, standardized, deleted, or embedded.
-Missing canonical artist portraits may use a high-confidence Discogs artist
-image before the existing strict Wikimedia chain, only after user opt-in;
-album artwork is never substituted as an artist portrait.
+Missing canonical artist portraits first use MusicBrainz-linked Wikimedia,
+then a validated full-size Discogs artist image, then strict direct Wikimedia,
+only after user opt-in. Existing valid cached portraits are not replaced,
+Discogs `uri150` thumbnails are rejected for automatic selection, and album
+artwork is never substituted as an artist portrait.
 
 ## Networking, rate limits, cache, and privacy
 

@@ -12,9 +12,18 @@ from music_vault.core.db import MusicVaultDB
 from music_vault.core.runtime_policy import RuntimePolicy, runtime_policy_for
 from music_vault.core.safety import sanitize_error_text
 
-from .artist_credits import ArtistCreditInput, ArtistCreditService
-from .canonical_albums import upsert_track_canonical_album
-from .ensemble import FieldAction, MetadataEnsemble, build_metadata_ensemble
+from .artist_credits import (
+    ArtistCreditInput,
+    ArtistCreditService,
+    normalize_artist_name,
+)
+from .canonical_albums import is_uncatalogued_album, upsert_track_canonical_album
+from .ensemble import (
+    FieldAction,
+    MetadataEnsemble,
+    build_metadata_ensemble,
+    versions_compatible,
+)
 from .intelligence_schema import MetadataIntelligenceJobStore
 from .intelligence_settings import (
     DiscogsTokenStore,
@@ -25,8 +34,14 @@ from .providers import ProviderQuery, ProviderReleaseCandidate
 from .review_policy import ReviewOutcome, classify_ensemble_outcome
 from .schema import EDITABLE_METADATA_FIELDS
 from .service import AutomaticMetadataField, MetadataService
+from .soundtrack import classify_soundtrack
 from .tag_writer import MediaBackup, SafeTagWriter, TagWriteError, TagWriteResult
-from .title_parser import ParsedTitle, parse_youtube_title
+from .title_parser import (
+    ParsedTitle,
+    parse_youtube_title,
+    title_orientation_hypotheses,
+)
+from .title_orientation import OrientationDecision, assess_orientation, choose_orientation
 
 
 AUTOMATIC_IMPORT_JOB_ID = "automatic-new-imports"
@@ -51,6 +66,18 @@ class _CommittedTagWrite:
 
     backup: MediaBackup
     result: TagWriteResult
+
+
+@dataclass(frozen=True)
+class _ProviderAdjudication:
+    """Normalized, bounded provider evidence for one intelligence item."""
+
+    parsed: ParsedTitle
+    orientation: OrientationDecision | None
+    discogs_candidates: tuple[object, ...]
+    musicbrainz_candidates: tuple[object, ...]
+    provider_failures: tuple[str, ...]
+    token: str
 
 
 def _as_mapping(value: object) -> dict[str, object]:
@@ -169,10 +196,395 @@ class MetadataIntelligenceService:
         }
         # ProviderQuery gained album as an additive Batch 10.1 hint; tolerate a
         # test double based on the smaller early contract.
+        album_hint = snapshot.value("album")
+        if is_uncatalogued_album(album_hint):
+            album_hint = None
         try:
-            return ProviderQuery(album=snapshot.value("album"), **kwargs)
+            return ProviderQuery(album=album_hint, **kwargs)
         except TypeError:
             return ProviderQuery(**kwargs)
+
+    @classmethod
+    def _query_variants(cls, snapshot, track, parsed: ParsedTitle) -> tuple[ProviderQuery, ...]:
+        """Build at most the two valid source-title orientations.
+
+        Soundtrack context is carried on each query rather than expanded into
+        additional network searches.  This keeps one metadata item inside the
+        Batch 10.6 provider budget while preserving release context.
+        """
+
+        primary = cls._query(snapshot, track, parsed)
+        work_title = snapshot.value("album")
+        if is_uncatalogued_album(work_title):
+            work_title = None
+        soundtrack = classify_soundtrack(
+            title=parsed.title_hint or primary.title,
+            album=work_title,
+            version_type=parsed.version_type,
+            source_title=parsed.raw_title,
+            release_format=snapshot.value("release_format"),
+            album_artist=snapshot.value("album_artist"),
+        )
+        if soundtrack.is_soundtrack and parsed.version_type in {"unknown", "soundtrack"}:
+            primary = dataclasses.replace(primary, version_type="soundtrack")
+        queries = [primary]
+        hypotheses = title_orientation_hypotheses(parsed)
+        if len(hypotheses) > 1:
+            reverse = hypotheses[1]
+            kwargs = {
+                "title": reverse.title,
+                "artist": reverse.artist,
+                "duration_seconds": primary.duration_seconds,
+                "version_type": primary.version_type,
+                "version_label": primary.version_label,
+                "year_hint": primary.year_hint,
+            }
+            try:
+                alternate = ProviderQuery(album=primary.album, **kwargs)
+            except TypeError:
+                alternate = ProviderQuery(**kwargs)
+            if (
+                alternate.title.casefold(),
+                (alternate.artist or "").casefold(),
+            ) != (
+                primary.title.casefold(),
+                (primary.artist or "").casefold(),
+            ):
+                queries.append(alternate)
+        return tuple(queries[:2])
+
+    @staticmethod
+    def _query_leaders(
+        candidate_groups: Sequence[Sequence[object]],
+    ) -> tuple[object, ...]:
+        """Keep each provider query's ranked leader before orientation comparison."""
+
+        return tuple(group[0] for group in candidate_groups if group)
+
+    @staticmethod
+    def _deduplicate_candidates(candidates: Sequence[object]) -> tuple[object, ...]:
+        """Keep the highest-scored copy of each normalized provider result."""
+
+        ordered = sorted(
+            candidates,
+            key=lambda item: -float(
+                getattr(item, "provider_score", getattr(item, "score", 0.0)) or 0.0
+            ),
+        )
+        result: list[object] = []
+        seen: set[tuple[str, ...]] = set()
+        for item in ordered:
+            key = tuple(
+                str(getattr(item, name, None) or "").strip().casefold()
+                for name in ("provider", "release_id", "recording_id", "title", "artist")
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return tuple(result)
+
+    @staticmethod
+    def _unique_local_orientation(
+        db: MusicVaultDB,
+        track_id: int,
+        parsed: ParsedTitle,
+    ) -> str | None:
+        """Return the sole independently-supported local artist orientation.
+
+        A one-off artist row created only from the track being adjudicated is
+        not canonical evidence.  Provider identity, an explicit alias, or a
+        credit on another track is required, and both/neither sides fail
+        closed.
+        """
+
+        hypotheses = title_orientation_hypotheses(parsed)
+        if len(hypotheses) != 2:
+            return None
+        tables = {
+            str(row[0])
+            for row in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "artists" not in tables:
+            return None
+
+        def supported_ids(value: str) -> set[int]:
+            try:
+                normalized = normalize_artist_name(value)
+            except ValueError:
+                return set()
+            ids = {
+                int(row[0])
+                for row in db.conn.execute(
+                    "SELECT id FROM artists WHERE normalized_name=?",
+                    (normalized,),
+                ).fetchall()
+            }
+            if "artist_aliases" in tables:
+                ids.update(
+                    int(row[0])
+                    for row in db.conn.execute(
+                        "SELECT artist_id FROM artist_aliases WHERE normalized_alias=?",
+                        (normalized,),
+                    ).fetchall()
+                )
+            supported: set[int] = set()
+            for artist_id in ids:
+                artist = db.conn.execute(
+                    "SELECT discogs_artist_id,musicbrainz_artist_id FROM artists WHERE id=?",
+                    (artist_id,),
+                ).fetchone()
+                provider_identity = bool(
+                    artist
+                    and (
+                        str(artist[0] or "").strip()
+                        or str(artist[1] or "").strip()
+                    )
+                )
+                other_credit = False
+                if "track_artist_credits" in tables:
+                    other_credit = (
+                        db.conn.execute(
+                            "SELECT 1 FROM track_artist_credits "
+                            "WHERE artist_id=? AND track_id<>? LIMIT 1",
+                            (artist_id, int(track_id)),
+                        ).fetchone()
+                        is not None
+                    )
+                explicit_alias = False
+                if "artist_aliases" in tables:
+                    explicit_alias = (
+                        db.conn.execute(
+                            "SELECT 1 FROM artist_aliases WHERE artist_id=? LIMIT 1",
+                            (artist_id,),
+                        ).fetchone()
+                        is not None
+                    )
+                if provider_identity or other_credit or explicit_alias:
+                    supported.add(artist_id)
+            return supported
+
+        matching = [
+            hypothesis.orientation
+            for hypothesis in hypotheses
+            if len(supported_ids(hypothesis.artist)) == 1
+        ]
+        return matching[0] if len(matching) == 1 else None
+
+    def _adjudicate_providers(
+        self,
+        db: MusicVaultDB,
+        snapshot,
+        track,
+        parsed: ParsedTitle,
+        settings: Mapping[str, object],
+        cancel_event: threading.Event | None,
+    ) -> _ProviderAdjudication:
+        """Query providers sequentially while retaining orientation identity."""
+
+        queries = self._query_variants(snapshot, track, parsed)
+        hypotheses = title_orientation_hypotheses(parsed)
+        provider_failures: list[str] = []
+        token = ""
+
+        # Non-dash and explicit one-orientation input keeps the established
+        # single-query provider behavior.
+        if len(hypotheses) != 2:
+            discogs_candidates: tuple[object, ...] = ()
+            musicbrainz_candidates: tuple[object, ...] = ()
+            query = queries[0]
+            if settings.get("metadata_discogs_enabled") is True:
+                token = self.token_store.read()
+                if token:
+                    try:
+                        provider = self._discogs_provider(token)
+                        discogs_candidates = self._deduplicate_candidates(
+                            tuple(provider.search(query, cancel_event=cancel_event))
+                        )
+                    except Exception as exc:
+                        provider_failures.append(sanitize_error_text(exc))
+                else:
+                    provider_failures.append("discogs_token_required")
+            if settings.get("metadata_musicbrainz_secondary_enabled") is True:
+                try:
+                    provider = self._musicbrainz_provider()
+                    musicbrainz_candidates = self._deduplicate_candidates(
+                        tuple(
+                            provider.search(
+                                query.title,
+                                query.artist,
+                                cancel_event=cancel_event,
+                            )
+                        )
+                    )
+                except Exception as exc:
+                    provider_failures.append(sanitize_error_text(exc))
+            return _ProviderAdjudication(
+                parsed,
+                None,
+                discogs_candidates,
+                musicbrainz_candidates,
+                tuple(provider_failures),
+                token,
+            )
+
+        current_artist = snapshot.value("artist")
+        current_title = snapshot.value("title")
+        local_duration = (
+            float(track["duration_seconds"])
+            if track["duration_seconds"] is not None
+            else None
+        )
+        unique_local = self._unique_local_orientation(db, int(track["id"]), parsed)
+        discogs_by_orientation: dict[str, tuple[object, ...]] = {}
+        if settings.get("metadata_discogs_enabled") is True:
+            token = self.token_store.read()
+            if token:
+                try:
+                    provider = self._discogs_provider(token)
+                    for index, (hypothesis, query) in enumerate(
+                        zip(hypotheses, queries)
+                    ):
+                        if cancel_event is not None and cancel_event.is_set():
+                            break
+                        group = self._deduplicate_candidates(
+                            tuple(provider.search(query, cancel_event=cancel_event))
+                        )
+                        discogs_by_orientation[hypothesis.orientation] = group
+                        provisional = choose_orientation(
+                            hypotheses,
+                            discogs_by_orientation,
+                            unique_local_orientation=unique_local,
+                            local_evidence_evaluated=True,
+                            current_artist=current_artist,
+                            current_title=current_title,
+                            local_duration=local_duration,
+                        )
+                        if (
+                            index == 0
+                            and provisional.provider_confirmed
+                            and provisional.selected_orientation
+                            == hypothesis.orientation
+                            and any(
+                                assessment.orientation == hypothesis.orientation
+                                and assessment.provider == "discogs"
+                                and assessment.conclusive
+                                for assessment in provisional.assessments
+                            )
+                        ):
+                            break
+                except Exception as exc:
+                    provider_failures.append(sanitize_error_text(exc))
+            else:
+                provider_failures.append("discogs_token_required")
+
+        provisional = choose_orientation(
+            hypotheses,
+            discogs_by_orientation,
+            unique_local_orientation=unique_local,
+            local_evidence_evaluated=True,
+            current_artist=current_artist,
+            current_title=current_title,
+            local_duration=local_duration,
+        )
+        musicbrainz_candidates: tuple[object, ...] = ()
+        musicbrainz_orientation: str | None = None
+        musicbrainz_coherent = False
+        musicbrainz_query_attempted = False
+        if (
+            settings.get("metadata_musicbrainz_secondary_enabled") is True
+            and not (cancel_event is not None and cancel_event.is_set())
+        ):
+            selected_name = provisional.selected_orientation or hypotheses[0].orientation
+            selected_index = next(
+                (
+                    index
+                    for index, hypothesis in enumerate(hypotheses)
+                    if hypothesis.orientation == selected_name
+                ),
+                0,
+            )
+            query = queries[selected_index]
+            try:
+                provider = self._musicbrainz_provider()
+                musicbrainz_query_attempted = True
+                musicbrainz_candidates = self._deduplicate_candidates(
+                    tuple(
+                        provider.search(
+                            query.title,
+                            query.artist,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                )
+                if musicbrainz_candidates:
+                    leader = musicbrainz_candidates[0]
+                    assessments = tuple(
+                        assess_orientation(
+                            hypothesis,
+                            leader,
+                            provider="musicbrainz",
+                            local_duration=local_duration,
+                        )
+                        for hypothesis in hypotheses
+                    )
+                    best = max(
+                        assessments,
+                        key=lambda item: (item.coherent, item.score),
+                    )
+                    if best.coherent:
+                        musicbrainz_orientation = best.orientation
+                        musicbrainz_coherent = True
+            except Exception as exc:
+                provider_failures.append(sanitize_error_text(exc))
+
+        decision = choose_orientation(
+            hypotheses,
+            discogs_by_orientation,
+            musicbrainz_candidate=(
+                musicbrainz_candidates[0] if musicbrainz_candidates else None
+            ),
+            musicbrainz_orientation=musicbrainz_orientation,
+            musicbrainz_query_attempted=musicbrainz_query_attempted,
+            unique_local_orientation=unique_local,
+            local_evidence_evaluated=True,
+            current_artist=current_artist,
+            current_title=current_title,
+            local_duration=local_duration,
+        )
+        selected_discogs = discogs_by_orientation.get(
+            decision.selected_orientation or "", ()
+        )
+        if not any(
+            candidate is decision.selected_candidate
+            for candidate in selected_discogs
+        ):
+            selected_discogs = ()
+        elif decision.selected_candidate is not None:
+            # The orientation assessor may select a coherent lower-ranked
+            # candidate over a higher provider-score identity mismatch.  The
+            # ensemble must receive that exact candidate first and alone.
+            selected_discogs = (decision.selected_candidate,)
+        if not (
+            musicbrainz_coherent
+            and musicbrainz_orientation == decision.selected_orientation
+        ):
+            musicbrainz_candidates = ()
+        selected_parsed = (
+            parsed.for_orientation(decision.selected)
+            if decision.selected is not None
+            else parsed
+        )
+        return _ProviderAdjudication(
+            selected_parsed,
+            decision,
+            tuple(selected_discogs),
+            tuple(musicbrainz_candidates),
+            tuple(provider_failures),
+            token,
+        )
 
     @staticmethod
     def _current_values(snapshot, track, release_context=None) -> dict[str, object]:
@@ -202,8 +614,12 @@ class MetadataIntelligenceService:
         return values
 
     @staticmethod
-    def _parsed_summary(parsed: ParsedTitle, uploader: str | None) -> dict[str, object]:
-        return {
+    def _parsed_summary(
+        parsed: ParsedTitle,
+        uploader: str | None,
+        orientation: OrientationDecision | None = None,
+    ) -> dict[str, object]:
+        summary: dict[str, object] = {
             "raw_title": parsed.raw_title,
             "title": parsed.title_hint,
             "artist": parsed.artist_hint,
@@ -213,8 +629,25 @@ class MetadataIntelligenceService:
             "version_label": parsed.version_label,
             "presentation_suffixes": list(parsed.presentation_suffixes),
             "pattern": parsed.pattern,
+            "orientation_hypotheses": [
+                {
+                    "artist": item.artist,
+                    "title": item.title,
+                    "orientation": item.orientation,
+                    "year_hint": item.year_hint,
+                    "version_type": item.version_type,
+                    "version_label": item.version_label,
+                    "featured_artist": item.featured_artist,
+                    "source_pattern": item.source_pattern,
+                    "confidence_reasons": list(item.confidence_reasons),
+                }
+                for item in title_orientation_hypotheses(parsed)
+            ],
             "uploader": uploader,
         }
+        if orientation is not None:
+            summary["orientation"] = orientation.to_dict()
+        return summary
 
     @staticmethod
     def _agreement(ensemble: MetadataEnsemble) -> str:
@@ -264,6 +697,11 @@ class MetadataIntelligenceService:
             "country",
             "release_format",
             "provider_reference",
+            "release_id",
+            "master_id",
+            "release_family_id",
+            "track_position",
+            "recording_id",
         )
         summary = {
             name: _safe_scalar(getattr(candidate, name, None))
@@ -310,11 +748,38 @@ class MetadataIntelligenceService:
         )
         if score is not None:
             summary["score"] = _safe_scalar(score)
+        field_scores = getattr(candidate, "field_scores", None)
+        if isinstance(field_scores, Mapping):
+            summary["field_scores"] = {
+                str(name): _safe_scalar(value)
+                for name, value in field_scores.items()
+                if isinstance(name, str) and isinstance(value, (int, float))
+            }
         summary["artwork_available"] = bool(
             getattr(candidate, "artwork", None)
             or getattr(candidate, "artwork_available", False)
         )
         return summary
+
+    @staticmethod
+    def _database_accepted_field(
+        ensemble: MetadataEnsemble,
+        field_name: str,
+        provider: str,
+    ) -> bool:
+        resolution = ensemble.field(field_name)
+        return bool(
+            resolution is not None
+            and resolution.source == provider
+            and resolution.value not in (None, "")
+            and resolution.score >= 60.0
+            and not resolution.conflict
+            and resolution.action is not FieldAction.REVIEW
+        )
+
+    @staticmethod
+    def _hard_version_conflict(ensemble: MetadataEnsemble) -> bool:
+        return "version_identity_conflict" in ensemble.reasons
 
     def _apply_release_context(
         self,
@@ -325,8 +790,49 @@ class MetadataIntelligenceService:
         *,
         provider_release_family_id: str | None = None,
     ) -> None:
-        if candidate.provider_score < 85 or ensemble.provider_disagreement:
+        accepted = {
+            name
+            for name in (
+                "discogs_release_id",
+                "discogs_master_id",
+                "provider_release_family_id",
+                "album",
+                "release_date",
+                "original_release_date",
+            )
+            if self._database_accepted_field(ensemble, name, "discogs")
+        }
+        if not accepted or self._hard_version_conflict(ensemble):
             return
+        accepted_scores = [
+            float(resolution.score)
+            for name in accepted
+            if (resolution := ensemble.field(name)) is not None
+        ]
+        confidence = max(accepted_scores, default=float(candidate.provider_score))
+        release_id = (
+            candidate.release_id if "discogs_release_id" in accepted else None
+        )
+        master_id = (
+            candidate.master_id if "discogs_master_id" in accepted else None
+        )
+        family_id = (
+            provider_release_family_id
+            if "provider_release_family_id" in accepted
+            else None
+        )
+        release_title = candidate.album if "album" in accepted else None
+        release_date = (
+            candidate.release_date if "release_date" in accepted else None
+        )
+        original_release_date = (
+            candidate.original_release_date
+            if "original_release_date" in accepted
+            else None
+        )
+        contextual = confidence >= 60.0 and bool(
+            release_id or master_id or family_id or release_title
+        )
         now = db.conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0]
         db.conn.execute(
             """
@@ -338,35 +844,60 @@ class MetadataIntelligenceService:
                 confidence, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_id) DO UPDATE SET
-                discogs_release_id=excluded.discogs_release_id,
-                discogs_master_id=excluded.discogs_master_id,
-                provider_release_family_id=COALESCE(
-                    excluded.provider_release_family_id,
-                    track_release_context.provider_release_family_id
+                discogs_release_id=COALESCE(
+                    track_release_context.discogs_release_id,
+                    excluded.discogs_release_id
                 ),
-                release_title=excluded.release_title,
-                release_country=excluded.release_country,
-                release_format=excluded.release_format,
-                label_name=excluded.label_name,
-                release_date=excluded.release_date,
-                original_release_date=excluded.original_release_date,
-                provider_reference=excluded.provider_reference,
-                confidence=excluded.confidence,
+                discogs_master_id=COALESCE(
+                    track_release_context.discogs_master_id,
+                    excluded.discogs_master_id
+                ),
+                provider_release_family_id=COALESCE(
+                    track_release_context.provider_release_family_id,
+                    excluded.provider_release_family_id
+                ),
+                release_title=COALESCE(
+                    track_release_context.release_title,excluded.release_title
+                ),
+                release_country=COALESCE(
+                    track_release_context.release_country,excluded.release_country
+                ),
+                release_format=COALESCE(
+                    track_release_context.release_format,excluded.release_format
+                ),
+                label_name=COALESCE(
+                    track_release_context.label_name,excluded.label_name
+                ),
+                release_date=COALESCE(
+                    track_release_context.release_date,excluded.release_date
+                ),
+                original_release_date=COALESCE(
+                    track_release_context.original_release_date,
+                    excluded.original_release_date
+                ),
+                provider_reference=COALESCE(
+                    track_release_context.provider_reference,
+                    excluded.provider_reference
+                ),
+                confidence=MAX(
+                    COALESCE(track_release_context.confidence,0),
+                    COALESCE(excluded.confidence,0)
+                ),
                 updated_at=excluded.updated_at
             """,
             (
                 int(track_id),
-                candidate.release_id,
-                candidate.master_id,
-                provider_release_family_id,
-                candidate.album,
-                candidate.country,
-                candidate.release_format,
-                candidate.label,
-                candidate.release_date,
-                candidate.original_release_date,
+                release_id,
+                master_id,
+                family_id,
+                release_title,
+                candidate.country if contextual else None,
+                candidate.release_format if contextual else None,
+                candidate.label if contextual else None,
+                release_date,
+                original_release_date,
                 candidate.provider_reference,
-                float(candidate.provider_score),
+                confidence,
                 str(now),
             ),
         )
@@ -378,22 +909,35 @@ class MetadataIntelligenceService:
         ensemble: MetadataEnsemble,
     ) -> None:
         candidate = ensemble.discogs_candidate
-        if candidate is None or candidate.provider_score < 85 or ensemble.provider_disagreement:
+        if candidate is None or self._hard_version_conflict(ensemble):
             return
-        safe_fields = {item.field_name for item in ensemble.fields if item.safe_to_apply}
+        accepted_fields = {
+            name
+            for name in (
+                "discogs_release_id",
+                "discogs_master_id",
+                "discogs_track_position",
+                "provider_release_family_id",
+            )
+            if self._database_accepted_field(ensemble, name, "discogs")
+        }
         values = {
-            "discogs_release_id": candidate.release_id if "discogs_release_id" in safe_fields else None,
-            "discogs_master_id": candidate.master_id if "discogs_master_id" in safe_fields else None,
+            "discogs_release_id": candidate.release_id if "discogs_release_id" in accepted_fields else None,
+            "discogs_master_id": candidate.master_id if "discogs_master_id" in accepted_fields else None,
             "discogs_track_position": (
-                candidate.track_position if "discogs_track_position" in safe_fields else None
+                candidate.track_position if "discogs_track_position" in accepted_fields else None
             ),
-            "recording_group_key": ensemble.recording_group_key,
+            "recording_group_key": (
+                ensemble.recording_group_key if accepted_fields else None
+            ),
         }
         family_resolution = ensemble.field("provider_release_family_id")
         provider_release_family_id = (
             str(family_resolution.value).strip()
             if family_resolution is not None
-            and family_resolution.safe_to_apply
+            and self._database_accepted_field(
+                ensemble, "provider_release_family_id", "discogs"
+            )
             and family_resolution.value not in (None, "")
             else None
         )
@@ -424,24 +968,29 @@ class MetadataIntelligenceService:
         ensemble: MetadataEnsemble,
     ) -> None:
         candidate = ensemble.musicbrainz_candidate
-        if candidate is None:
+        if candidate is None or self._hard_version_conflict(ensemble):
             return
-        safe_fields = {item.field_name for item in ensemble.fields if item.safe_to_apply}
         recording_id = (
             getattr(candidate, "recording_id", None)
-            if "musicbrainz_recording_id" in safe_fields
+            if self._database_accepted_field(
+                ensemble, "musicbrainz_recording_id", "musicbrainz"
+            )
             else None
         )
         release_id = (
             getattr(candidate, "release_id", None)
-            if "musicbrainz_release_id" in safe_fields
+            if self._database_accepted_field(
+                ensemble, "musicbrainz_release_id", "musicbrainz"
+            )
             else None
         )
         release_group_resolution = ensemble.field("musicbrainz_release_group_id")
         release_group_id = (
             str(release_group_resolution.value).strip()
             if release_group_resolution is not None
-            and release_group_resolution.safe_to_apply
+            and self._database_accepted_field(
+                ensemble, "musicbrainz_release_group_id", "musicbrainz"
+            )
             and release_group_resolution.value not in (None, "")
             else None
         )
@@ -501,11 +1050,43 @@ class MetadataIntelligenceService:
             previous_join = credit.join_phrase
         return inputs
 
+    @staticmethod
+    def _credit_inputs_from_values(values: Sequence[object]) -> list[ArtistCreditInput]:
+        inputs: list[ArtistCreditInput] = []
+        previous_join = ""
+        for index, raw in enumerate(values):
+            value = _as_mapping(raw)
+            name = str(value.get("name") or value.get("display_name") or "").strip()
+            if not name:
+                continue
+            inputs.append(
+                ArtistCreditInput(
+                    display_name=name,
+                    role=str(value.get("role") or "primary"),
+                    join_phrase=previous_join if index else "",
+                    entity_type=str(value.get("entity_type") or "unknown"),
+                    discogs_artist_id=(
+                        str(value.get("artist_id") or value.get("discogs_artist_id"))
+                        if value.get("artist_id") or value.get("discogs_artist_id")
+                        else None
+                    ),
+                    musicbrainz_artist_id=(
+                        str(value.get("musicbrainz_artist_id"))
+                        if value.get("musicbrainz_artist_id")
+                        else None
+                    ),
+                )
+            )
+            previous_join = str(value.get("join_phrase") or "")
+        return inputs
+
     def _write_tags(
         self,
         db: MusicVaultDB,
         item,
         result,
+        *,
+        high_confidence_fields: frozenset[str],
     ) -> tuple[str, _CommittedTagWrite | None]:
         if not result.changed:
             return "not_needed", None
@@ -526,7 +1107,9 @@ class MetadataIntelligenceService:
                 "version_type",
                 "version_label",
             )
-            if name in result.changed_fields and getattr(approved, name) not in (None, "")
+            if name in result.changed_fields
+            and name in high_confidence_fields
+            and getattr(approved, name) not in (None, "")
         }
         row = db.get_track(item.track_id)
         for name in (
@@ -535,15 +1118,20 @@ class MetadataIntelligenceService:
             "musicbrainz_recording_id",
             "musicbrainz_release_id",
         ):
-            if name in row.keys() and row[name] not in (None, ""):
+            if (
+                name in high_confidence_fields
+                and name in row.keys()
+                and row[name] not in (None, "")
+            ):
                 patch[name] = row[name]
-        credits = ArtistCreditService(db).track_credits(item.track_id)
-        discogs_artist_ids = [credit.artist.discogs_artist_id for credit in credits if credit.artist.discogs_artist_id]
-        musicbrainz_artist_ids = [credit.artist.musicbrainz_artist_id for credit in credits if credit.artist.musicbrainz_artist_id]
-        if discogs_artist_ids:
-            patch["discogs_artist_ids"] = ";".join(discogs_artist_ids)
-        if musicbrainz_artist_ids:
-            patch["musicbrainz_artist_ids"] = ";".join(musicbrainz_artist_ids)
+        if {"artist", "artist_credits"} & high_confidence_fields:
+            credits = ArtistCreditService(db).track_credits(item.track_id)
+            discogs_artist_ids = [credit.artist.discogs_artist_id for credit in credits if credit.artist.discogs_artist_id]
+            musicbrainz_artist_ids = [credit.artist.musicbrainz_artist_id for credit in credits if credit.artist.musicbrainz_artist_id]
+            if discogs_artist_ids:
+                patch["discogs_artist_ids"] = ";".join(discogs_artist_ids)
+            if musicbrainz_artist_ids:
+                patch["musicbrainz_artist_ids"] = ";".join(musicbrainz_artist_ids)
         if not patch:
             return "not_needed", None
         backup_directory = Path(db.db_path).parent / "backups" / "metadata_jobs" / str(item.job_id)
@@ -653,43 +1241,32 @@ class MetadataIntelligenceService:
         raw_title = source.get("title") or snapshot.value("title") or Path(snapshot.path).stem
         uploader = source.get("artist") if snapshot.source_kind == "youtube" else None
         parsed = parse_youtube_title(raw_title)
-        query = self._query(snapshot, track, parsed)
-
-        discogs_candidates: Sequence[ProviderReleaseCandidate] = ()
-        musicbrainz_candidates: Sequence[object] = ()
-        provider_failures: list[str] = []
-        token = ""
-        if settings.get("metadata_discogs_enabled") is True:
-            token = self.token_store.read()
-            if token:
-                try:
-                    discogs_candidates = tuple(
-                        self._discogs_provider(token).search(
-                            query,
-                            cancel_event=cancel_event,
-                        )
-                    )
-                except Exception as exc:
-                    provider_failures.append(sanitize_error_text(exc))
-            else:
-                provider_failures.append("discogs_token_required")
-        if settings.get("metadata_musicbrainz_secondary_enabled") is True:
-            try:
-                musicbrainz_candidates = tuple(
-                    self._musicbrainz_provider().search(
-                        query.title,
-                        query.artist,
-                        cancel_event=cancel_event,
-                    )
-                )
-            except Exception as exc:
-                provider_failures.append(sanitize_error_text(exc))
+        adjudication = self._adjudicate_providers(
+            db,
+            snapshot,
+            track,
+            parsed,
+            settings,
+            cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            store.mark_item(item.id, "cancelled")
+            return "cancelled"
+        parsed = adjudication.parsed
+        discogs_candidates = adjudication.discogs_candidates
+        musicbrainz_candidates = adjudication.musicbrainz_candidates
+        provider_failures = list(adjudication.provider_failures)
+        token = adjudication.token
 
         youtube_exclusive = bool(
             snapshot.source_kind == "youtube"
             and parsed.strong_pattern
             and not discogs_candidates
             and not musicbrainz_candidates
+            and (
+                adjudication.orientation is None
+                or adjudication.orientation.fallback_terminalizable
+            )
         )
         release_context = db.conn.execute(
             "SELECT * FROM track_release_context WHERE track_id=?",
@@ -697,13 +1274,22 @@ class MetadataIntelligenceService:
         ).fetchone()
         current = self._current_values(snapshot, track, release_context)
         locked = {
-            name for name, field in snapshot.fields.items() if field.is_locked
+            name
+            for name, field in snapshot.fields.items()
+            if field.is_locked or field.is_manual
         }
         source_version = parsed.version_type
         top_discogs = discogs_candidates[0] if discogs_candidates else None
         unofficial_live = bool(
             source_version == "live"
-            and (top_discogs is None or not bool(top_discogs.is_official))
+            and (
+                top_discogs is None
+                or not bool(top_discogs.is_official)
+                or not versions_compatible(
+                    source_version,
+                    getattr(top_discogs, "version_type", "unknown"),
+                )
+            )
         )
         ensemble = build_metadata_ensemble(
             current=current,
@@ -720,6 +1306,25 @@ class MetadataIntelligenceService:
             youtube_exclusive=youtube_exclusive,
             unofficial_live=unofficial_live,
         )
+        provider_duration_mismatch = {
+            "discogs": False,
+            "musicbrainz": False,
+        }
+        if track["duration_seconds"] is not None:
+            local_duration = float(track["duration_seconds"])
+            for provider_name, provider_candidate in (
+                ("discogs", ensemble.discogs_candidate),
+                ("musicbrainz", ensemble.musicbrainz_candidate),
+            ):
+                candidate_duration = getattr(
+                    provider_candidate, "duration_seconds", None
+                )
+                if candidate_duration is None:
+                    continue
+                if abs(local_duration - float(candidate_duration)) > max(
+                    30.0, local_duration * 0.2
+                ):
+                    provider_duration_mismatch[provider_name] = True
         artwork_record, artwork_result = self._discogs_artwork_for_gap(
             token=token,
             candidate=ensemble.discogs_candidate,
@@ -728,6 +1333,7 @@ class MetadataIntelligenceService:
             accepted=bool(
                 not ensemble.provider_disagreement
                 and "version_identity_conflict" not in ensemble.reasons
+                and not provider_duration_mismatch["discogs"]
             ),
         )
         proposals: dict[str, object] = {
@@ -767,6 +1373,8 @@ class MetadataIntelligenceService:
             ),
             "result": artwork_result,
         }
+        if adjudication.orientation is not None:
+            proposals["_orientation"] = adjudication.orientation.to_dict()
         confidences = {
             field.field_name: field.score
             for field in ensemble.fields
@@ -778,13 +1386,30 @@ class MetadataIntelligenceService:
                 confidence=field.score,
                 provider=field.source,
                 provider_reference=field.provider_reference,
-                conflict=field.conflict,
+                conflict=(
+                    field.conflict
+                    or bool(
+                        field.source in provider_duration_mismatch
+                        and provider_duration_mismatch[field.source]
+                    )
+                ),
             )
             for field in ensemble.fields
             if field.field_name in EDITABLE_METADATA_FIELDS
             and field.field_name != "artwork"
             and field.value not in (None, "")
+            and field.action is not FieldAction.REVIEW
         }
+        high_confidence_fields = frozenset(
+            field.field_name
+            for field in ensemble.fields
+            if field.safe_to_apply
+            and not field.conflict
+            and not (
+                field.source in provider_duration_mismatch
+                and provider_duration_mismatch[field.source]
+            )
+        )
         candidate = ensemble.discogs_candidate
         file_write_result = "not_requested"
         committed_tags: _CommittedTagWrite | None = None
@@ -828,23 +1453,60 @@ class MetadataIntelligenceService:
                 result = metadata.apply_automatic_fields(
                     item.track_id,
                     effective_automatic,
-                    minimum_confidence=85,
+                    minimum_confidence=60,
+                    reason="best_available_automatic_metadata",
                     commit=False,
                 )
-                self._apply_provider_identity(db, item.track_id, ensemble)
-                self._apply_musicbrainz_identity(db, item.track_id, ensemble)
+                if not provider_duration_mismatch["discogs"]:
+                    self._apply_provider_identity(db, item.track_id, ensemble)
+                if not provider_duration_mismatch["musicbrainz"]:
+                    self._apply_musicbrainz_identity(db, item.track_id, ensemble)
                 credits_field = ensemble.field("artist_credits")
+                credit_inputs: list[ArtistCreditInput] = []
+                credit_provenance = ""
+                credit_reference = None
                 if (
                     candidate is not None
+                    and not provider_duration_mismatch["discogs"]
                     and credits_field is not None
-                    and credits_field.safe_to_apply
+                    and credits_field.source == "discogs"
+                    and credits_field.score >= 60.0
+                    and not credits_field.conflict
+                    and credits_field.action is not FieldAction.REVIEW
                     and candidate.artist_credits
+                ):
+                    credit_inputs = self._credit_inputs(candidate)
+                    credit_provenance = "discogs_best_available"
+                    credit_reference = candidate.provider_reference
+                elif (
+                    credits_field is not None
+                    and credits_field.source == "youtube_title_parsed"
+                    and credits_field.score >= 60.0
+                    and not credits_field.conflict
+                    and credits_field.action is not FieldAction.REVIEW
+                    and isinstance(credits_field.value, Sequence)
+                ):
+                    credit_inputs = self._credit_inputs_from_values(
+                        credits_field.value
+                    )
+                    credit_provenance = "youtube_title_parsed"
+                latest_artist = metadata.snapshot(item.track_id).fields["artist"]
+                protected_credit = db.conn.execute(
+                    "SELECT 1 FROM track_artist_credits "
+                    "WHERE track_id=? AND (is_manual=1 OR is_locked=1) LIMIT 1",
+                    (int(item.track_id),),
+                ).fetchone()
+                if (
+                    credit_inputs
+                    and not latest_artist.is_manual
+                    and not latest_artist.is_locked
+                    and protected_credit is None
                 ):
                     ArtistCreditService(db).replace_track_credits(
                         item.track_id,
-                        self._credit_inputs(candidate),
-                        provenance="discogs_high_confidence",
-                        provider_reference=candidate.provider_reference,
+                        credit_inputs,
+                        provenance=credit_provenance,
+                        provider_reference=credit_reference,
                         confidence=credits_field.score,
                         commit=False,
                     )
@@ -854,31 +1516,41 @@ class MetadataIntelligenceService:
                 # artist display that the accepted evidence just replaced.
                 upsert_track_canonical_album(db.conn, int(item.track_id))
                 if settings.get("metadata_writeback_enabled") is True and result.changed:
-                    file_write_result, committed_tags = self._write_tags(db, item, result)
+                    file_write_result, committed_tags = self._write_tags(
+                        db,
+                        item,
+                        result,
+                        high_confidence_fields=high_confidence_fields,
+                    )
         except TagWriteError:
             # Preparation/commit failures restore internally; the surrounding
             # SQLite context rolls back fields, IDs, release context and credits.
             file_write_result = "restored"
             store.mark_item(
                 item.id,
-                "review",
-                parsed_hints=self._parsed_summary(parsed, uploader),
+                "failed",
+                parsed_hints=self._parsed_summary(
+                    parsed, uploader, adjudication.orientation
+                ),
                 discogs_release_id=(candidate.release_id if candidate else None),
                 discogs_master_id=(candidate.master_id if candidate else None),
                 field_proposal=proposals,
                 field_confidence=confidences,
                 provider_agreement=self._agreement(ensemble),
-                review_reason="file_write_failed",
+                review_reason="file_write_rollback_failure",
                 file_write_result=file_write_result,
                 artwork_result=artwork_result,
+                error="media_tag_write_failed",
             )
-            return "review"
+            return "failed"
         except Exception:
             if committed_tags is not None:
                 self._restore_committed_tags(committed_tags)
             raise
 
-        parsed_summary = self._parsed_summary(parsed, uploader)
+        parsed_summary = self._parsed_summary(
+            parsed, uploader, adjudication.orientation
+        )
         decision = classify_ensemble_outcome(
             ensemble,
             current=current,

@@ -13,6 +13,9 @@ CANONICAL_ALBUMS_TABLE = "canonical_albums"
 TRACK_ALBUM_MEMBERSHIPS_TABLE = "track_album_memberships"
 ARTIST_ALIASES_TABLE = "artist_aliases"
 ARTIST_RELATIONSHIPS_TABLE = "artist_relationships"
+SINGLES_UNCATALOGUED_TITLE = "Singles & Uncatalogued"
+SINGLES_UNCATALOGUED_KEY = "virtual:singles-and-uncatalogued"
+_UNCATALOGUED_ALBUM_PLACEHOLDERS = frozenset({"", "unknown", "unknown album"})
 
 ALBUM_KINDS = (
     "album",
@@ -50,7 +53,7 @@ _EDITION_LABELS = (
     r"expanded(?:\s+edition)?",
     r"(?:\d+(?:st|nd|rd|th)\s+)?anniversary\s+edition",
     r"(?:\d{4}\s+)?remaster(?:ed)?",
-    r"reissue",
+    r"(?:\d{4}\s+)?reissue",
     r"bonus\s+edition",
     r"special\s+edition",
     r"collector['\u2019]?s\s+edition",
@@ -73,6 +76,12 @@ def normalize_album_identity(value: object) -> str:
     """Normalize identity spelling without discarding meaningful punctuation."""
 
     return _display(value).casefold()
+
+
+def is_uncatalogued_album(value: object) -> bool:
+    """Return whether an album value is a narrow legacy missing-value marker."""
+
+    return normalize_album_identity(value) in _UNCATALOGUED_ALBUM_PLACEHOLDERS
 
 
 def split_edition_label(title: object) -> tuple[str, str | None]:
@@ -169,6 +178,11 @@ def canonical_album_identity(
     """
 
     display_title, edition_label = split_edition_label(title)
+    if is_uncatalogued_album(display_title):
+        raise ValueError(
+            "An uncatalogued album has no durable canonical identity; use the virtual "
+            "Singles & Uncatalogued collection for display."
+        )
     display_artist = _display(album_artist) or "Unknown Album Artist"
     normalized_title = normalize_album_identity(display_title)
     normalized_artist = normalize_album_identity(display_artist)
@@ -362,12 +376,15 @@ def _album_rows(
     return conn.execute(
         f"""
         SELECT t.id AS track_id, t.album, t.album_artist, t.artist,
-               t.release_date, t.original_release_date, t.cover_path,
+               t.release_date, t.original_release_date, t.version_type,
+               t.cover_path,
                t.discogs_release_id, t.discogs_master_id,
                t.discogs_track_position,
                rc.discogs_release_id AS context_discogs_release_id,
                rc.discogs_master_id AS context_discogs_master_id,
-               rc.release_format, rc.original_release_date AS context_original_release_date,
+               rc.release_format,
+               rc.release_date AS context_release_date,
+               rc.original_release_date AS context_original_release_date,
                rc.provider_reference, rc.confidence,
                {mb_group_expression} AS musicbrainz_release_group_id,
                {family_expression} AS provider_release_family_id,
@@ -391,6 +408,52 @@ def _album_rows(
                    FROM track_metadata_fields field
                    WHERE field.track_id=t.id AND field.field_name='album_artist'
                ), 0) AS album_artist_is_locked,
+               COALESCE((
+                   SELECT field.provenance
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id AND field.field_name='album_artist'
+               ), '') AS album_artist_provenance,
+               COALESCE((
+                   SELECT field.confidence
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id AND field.field_name='album_artist'
+               ), 0) AS album_artist_confidence,
+               COALESCE((
+                   SELECT field.provenance
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id
+                     AND field.field_name='original_release_date'
+               ), '') AS original_date_provenance,
+               (
+                   SELECT field.confidence
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id
+                     AND field.field_name='original_release_date'
+               ) AS original_date_confidence,
+               COALESCE((
+                   SELECT field.is_manual OR field.is_locked
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id
+                     AND field.field_name='original_release_date'
+               ), 0) AS original_date_authoritative,
+               COALESCE((
+                   SELECT field.provenance
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id
+                     AND field.field_name='release_date'
+               ), '') AS release_date_provenance,
+               (
+                   SELECT field.confidence
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id
+                     AND field.field_name='release_date'
+               ) AS release_date_confidence,
+               COALESCE((
+                   SELECT field.is_manual OR field.is_locked
+                   FROM track_metadata_fields field
+                   WHERE field.track_id=t.id
+                     AND field.field_name='release_date'
+               ), 0) AS release_date_authoritative,
                (
                    SELECT artist.display_name
                    FROM track_artist_credits credit
@@ -414,10 +477,79 @@ def _prepared_album_rows(
 ) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     for row in _album_rows(conn, track_ids):
-        if not _display(row["album"]):
+        if is_uncatalogued_album(row["album"]):
             continue
+
+        def date_is_credible(
+            value: str | None,
+            *,
+            authoritative: object,
+            provenance: object,
+            confidence: object,
+        ) -> bool:
+            if not value:
+                return False
+            if bool(authoritative):
+                return True
+            if confidence is not None:
+                return float(confidence) >= 60.0
+            # Schema-v7 seeding intentionally leaves confidence NULL for
+            # direct embedded/provider observations. Preserve those known
+            # dates, while an explicit low score remains non-credible.
+            return str(provenance or "").strip().casefold() in {
+                "embedded",
+                "discogs",
+                "discogs_best_available",
+                "musicbrainz",
+                "provider_confirmed",
+            }
+
+        explicit_original_date = _display(row["original_release_date"]) or None
+        context_original_date = (
+            _display(row["context_original_release_date"]) or None
+        )
+        fallback_release_date = _display(row["release_date"]) or None
+        original_release_date = (
+            explicit_original_date or context_original_date or fallback_release_date
+        )
+        original_release_date_credible = bool(
+            (
+                explicit_original_date
+                and date_is_credible(
+                    explicit_original_date,
+                    authoritative=row["original_date_authoritative"],
+                    provenance=row["original_date_provenance"],
+                    confidence=row["original_date_confidence"],
+                )
+            )
+            or (
+                not explicit_original_date
+                and context_original_date
+                and float(row["confidence"] or 0) >= 60.0
+            )
+            or (
+                not explicit_original_date
+                and not context_original_date
+                and date_is_credible(
+                    fallback_release_date,
+                    authoritative=row["release_date_authoritative"],
+                    provenance=row["release_date_provenance"],
+                    confidence=row["release_date_confidence"],
+                )
+            )
+        )
+        version_type = _display(row["version_type"]).casefold()
+        explicit_kind = (
+            "live_album"
+            if version_type == "live"
+            else "soundtrack"
+            if version_type == "soundtrack"
+            else None
+        )
         kind = classify_album_kind(
-            row["album"], release_format=row["release_format"]
+            row["album"],
+            release_format=row["release_format"],
+            explicit_kind=explicit_kind,
         )
         release_context_kind = kind in {
             "soundtrack",
@@ -430,7 +562,27 @@ def _prepared_album_rows(
             # many performing artists. Keep a real saved album artist when
             # present; otherwise use neutral release context so the work does
             # not split into one fallback album per performer.
-            album_artist = _display(row["album_artist"]) or "Various Artists"
+            trusted_album_artist = bool(
+                row["album_artist_is_manual"]
+                or row["album_artist_is_locked"]
+                or (
+                    float(row["album_artist_confidence"] or 0) >= 60.0
+                    and str(row["album_artist_provenance"] or "")
+                    .strip()
+                    .casefold()
+                    in {
+                        "discogs",
+                        "discogs_best_available",
+                        "musicbrainz",
+                        "provider_confirmed",
+                    }
+                )
+            )
+            album_artist = (
+                _display(row["album_artist"])
+                if trusted_album_artist and _display(row["album_artist"])
+                else "Various Artists"
+            )
         else:
             # For ordinary artist releases the consolidated structured primary
             # credit is the canonical fallback identity. Raw album-artist
@@ -486,16 +638,14 @@ def _prepared_album_rows(
                 "album_artist_authoritative": bool(
                     row["album_artist_is_manual"] or row["album_artist_is_locked"]
                 ),
-                "original_release_date": (
-                    _display(
-                        row["original_release_date"]
-                        or row["context_original_release_date"]
-                        or row["release_date"]
-                    )
+                "original_release_date": original_release_date,
+                "original_release_date_credible": original_release_date_credible,
+                "discogs_release_id": discogs_release_id,
+                "edition_release_date": (
+                    _display(row["context_release_date"])
+                    or _display(row["release_date"])
                     or None
                 ),
-                "discogs_release_id": discogs_release_id,
-                "edition_release_date": _display(row["release_date"]) or None,
                 "track_position": _display(row["discogs_track_position"]) or None,
                 "provenance": (
                     "discogs"
@@ -874,7 +1024,11 @@ def seed_existing_canonical_albums(conn: sqlite3.Connection) -> dict[str, Any]:
     for item in prepared:
         value = item["original_release_date"]
         key = item["identity"].canonical_key
-        if value and (key not in original_dates or value < original_dates[key]):
+        if (
+            value
+            and item.get("original_release_date_credible")
+            and (key not in original_dates or value < original_dates[key])
+        ):
             original_dates[key] = value
     timestamp = str(conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0])
     for item in prepared:
@@ -1041,7 +1195,11 @@ def upsert_track_canonical_album(
     candidate_album_id = _get_or_create_canonical_album(
         conn,
         item,
-        original_release_date=item["original_release_date"],
+        original_release_date=(
+            item["original_release_date"]
+            if item.get("original_release_date_credible")
+            else None
+        ),
         timestamp=timestamp,
     )
     album_row = conn.execute(
@@ -1059,7 +1217,11 @@ def upsert_track_canonical_album(
             item,
             timestamp=timestamp,
         )
-    original_date = item["original_release_date"]
+    original_date = (
+        item["original_release_date"]
+        if item.get("original_release_date_credible")
+        else None
+    )
     stored_original_date = _display(album_row["original_release_date"]) or None
     if original_date and (
         stored_original_date is None or str(original_date) < stored_original_date
@@ -1196,6 +1358,25 @@ def representative_album_cover(
     )
 
 
+def uncatalogued_track_ids(conn: sqlite3.Connection) -> tuple[int, ...]:
+    """Return tracks for the virtual collection without writing album metadata."""
+
+    return tuple(
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT t.id
+            FROM tracks AS t
+            LEFT JOIN track_album_memberships AS membership
+              ON membership.track_id=t.id
+            WHERE LOWER(TRIM(COALESCE(t.album, ''))) IN ('', 'unknown', 'unknown album')
+              AND membership.track_id IS NULL
+            ORDER BY t.id
+            """
+        ).fetchall()
+    )
+
+
 __all__ = [
     "ALBUM_KINDS",
     "ARTIST_ALIAS_KINDS",
@@ -1206,10 +1387,13 @@ __all__ = [
     "ARTIST_RELATIONSHIPS_TABLE",
     "CanonicalAlbumIdentity",
     "CanonicalAlbumIdentityConflict",
+    "SINGLES_UNCATALOGUED_KEY",
+    "SINGLES_UNCATALOGUED_TITLE",
     "analyze_canonical_album_backfill",
     "canonical_album_identity",
     "classify_album_kind",
     "create_canonical_media_schema",
+    "is_uncatalogued_album",
     "normalize_album_identity",
     "representative_album_cover",
     "representative_album_covers",
@@ -1217,4 +1401,5 @@ __all__ = [
     "seed_existing_canonical_albums",
     "split_edition_label",
     "upsert_track_canonical_album",
+    "uncatalogued_track_ids",
 ]

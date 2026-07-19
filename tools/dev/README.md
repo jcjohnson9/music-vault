@@ -212,3 +212,27 @@ mode. Repair creates a fresh schema-6 SQLite backup and permits only
   -ExpectedIdentityCount 304 `
   -ExpectedRepairCount 304
 ```
+
+## Batch 10.6 dual-orientation acceptance
+
+The packaged smoke uses the official EXE with a disposable schema-7 runtime,
+fictional metadata, injected fake providers, no credentials, and the process-
+local no-network guard. It proves the reverse-orientation path without touching
+the personal library:
+
+```powershell
+.\tools\dev\run_batch10_6_packaged_smoke.ps1
+```
+
+The live wrapper is a separate exact-one-target gate. Its default mode performs
+aggregate-only read-only discovery. The explicitly acknowledged apply mode
+creates and verifies a fresh SQLite backup before the bounded provider lookup,
+then permits only the normalized one-target database repair. It never runs a
+full-library scan or media/tag/artwork work:
+
+```powershell
+.\tools\dev\run_batch10_6_live_repair.ps1
+
+.\tools\dev\run_batch10_6_live_repair.ps1 -Mode Apply `
+  -AcknowledgeTargetedLookup batch10.6-live-one-track-orientation-repair
+```

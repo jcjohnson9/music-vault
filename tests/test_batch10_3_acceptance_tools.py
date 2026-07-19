@@ -398,8 +398,7 @@ def test_post_launch_gate_passes_then_detects_cover_path_mutation(tmp_path: Path
     assert passed["checks"]["track_release_context_stable_values_exact"] is True
     assert passed["counts"]["review_counts_before"] == {"review": 3}
     assert passed["counts"]["review_counts_after"] == {
-        "applied_with_gaps": 1,
-        "review": 1,
+        "applied_with_gaps": 2,
         "source_fallback": 1,
     }
 
@@ -419,6 +418,88 @@ def test_post_launch_gate_passes_then_detects_cover_path_mutation(tmp_path: Path
     )
     assert failed["ok"] is False
     assert failed["checks"]["track_cover_paths_exact"] is False
+
+
+def test_post_launch_gate_allows_only_exact_repair_marker_app_meta_change(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "synthetic-app-meta"
+    (root / "music_vault").mkdir(parents=True)
+    (root / "run.py").write_text("# synthetic marker\n", encoding="utf-8")
+    data, database, baseline = _schema6_runtime(root)
+    dry_run = _dry_run(root, data, database, baseline)
+    backup = data / "backups" / "explicit.sqlite3"
+    acceptance.create_verified_sqlite_backup(
+        database=database,
+        backup=backup,
+        baseline=baseline,
+    )
+    _migrate_source_mode(root, database)
+    network_report = _network_report(root)
+
+    def verify() -> dict[str, object]:
+        return live_gate.verify_migration(
+            baseline=baseline,
+            dry_run=dry_run,
+            project_root=root,
+            data_dir=data,
+            database=database,
+            backup_path=backup,
+            network_report=network_report,
+        )
+
+    assert verify()["ok"] is True
+    with sqlite3.connect(database) as connection:
+        baseline_row = tuple(
+            connection.execute(
+                "SELECT key,value FROM app_meta WHERE key<>? ORDER BY key LIMIT 1",
+                (live_gate.METADATA_ACCEPTANCE_REPAIR_MARKER,),
+            ).fetchone()
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO app_meta(key,value) VALUES('synthetic-unexpected','1')"
+        )
+    added = verify()
+    assert added["ok"] is False
+    assert added["checks"]["app_meta_baseline_rows_exact"] is False
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM app_meta WHERE key='synthetic-unexpected'")
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE app_meta SET value='synthetic-tamper' WHERE key=?",
+            (baseline_row[0],),
+        )
+    changed = verify()
+    assert changed["ok"] is False
+    assert changed["checks"]["app_meta_baseline_rows_exact"] is False
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE app_meta SET value=? WHERE key=?",
+            (baseline_row[1], baseline_row[0]),
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM app_meta WHERE key=?", (baseline_row[0],))
+    removed = verify()
+    assert removed["ok"] is False
+    assert removed["checks"]["app_meta_baseline_rows_exact"] is False
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO app_meta(key,value) VALUES(?,?)",
+            baseline_row,
+        )
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE app_meta SET value='2' WHERE key=?",
+            (live_gate.METADATA_ACCEPTANCE_REPAIR_MARKER,),
+        )
+    wrong_marker = verify()
+    assert wrong_marker["ok"] is False
+    assert wrong_marker["checks"]["batch10_5_repair_marker_exact"] is False
 
 
 def test_live_gate_accepts_exact_credit_dedupe_with_semantic_subset_preserved(

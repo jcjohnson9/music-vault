@@ -1936,9 +1936,10 @@ class MusicVaultWindow(QMainWindow):
         artist_images_title = QLabel("Artist Photos")
         artist_images_title.setObjectName("CardTitle")
         artist_images_description = QLabel(
-            "Optional private lookup for canonical artists. Discogs uses your "
-            "personal token when configured, then MusicBrainz/Wikimedia fallback; "
-            "cached photos remain local."
+            "Optional private lookup for canonical artists. Existing valid cache "
+            "wins, followed by MusicBrainz-linked Wikimedia, full-size Discogs "
+            "when your personal token is configured, then strict Wikimedia "
+            "fallback. Cached photos remain local."
         )
         artist_images_description.setObjectName("MutedLabel")
         artist_images_description.setWordWrap(True)
@@ -3006,15 +3007,14 @@ class MusicVaultWindow(QMainWindow):
 
     @staticmethod
     def artist_image_identity(summary: ArtistSummary) -> ArtistIdentity:
-        provider_kind, separator, provider_id = summary.key.provider_identity.partition(":")
         return ArtistIdentity.from_display_name(
-            summary.display_name,
-            discogs_artist_id=(
-                provider_id if separator and provider_kind == "discogs" else None
-            ),
-            musicbrainz_artist_id=(
-                provider_id if separator and provider_kind == "musicbrainz" else None
-            ),
+            summary.image_identity_name or summary.display_name,
+            discogs_artist_id=summary.discogs_artist_id,
+            musicbrainz_artist_id=summary.musicbrainz_artist_id,
+            canonical_artist_id=summary.canonical_artist_id,
+            historical_aliases=summary.historical_aliases,
+            allow_normalized_name_cache=summary.allow_normalized_name_cache,
+            allow_historical_alias_cache=summary.allow_historical_alias_cache,
         )
 
     def _rekey_consolidated_artist_portraits(self) -> int:
@@ -3034,7 +3034,7 @@ class MusicVaultWindow(QMainWindow):
                     GROUP BY normalized_alias
                     HAVING COUNT(DISTINCT artist_id)=1
                 )
-                SELECT alias.alias_name, artist.display_name,
+                SELECT alias.alias_name, artist.id AS artist_id, artist.display_name,
                        artist.discogs_artist_id, artist.musicbrainz_artist_id
                 FROM artist_aliases alias
                 JOIN unambiguous_aliases safe
@@ -3059,6 +3059,9 @@ class MusicVaultWindow(QMainWindow):
                 row["display_name"],
                 discogs_artist_id=row["discogs_artist_id"],
                 musicbrainz_artist_id=row["musicbrainz_artist_id"],
+                canonical_artist_id=row["artist_id"],
+                historical_aliases=(row["alias_name"],),
+                allow_historical_alias_cache=True,
             )
             old_identities = []
             if row["discogs_artist_id"]:
@@ -4835,8 +4838,9 @@ class MusicVaultWindow(QMainWindow):
             self,
             "Enable Artist Photos?",
             "When enabled, Music Vault sends visible artist names to public "
-            "MusicBrainz and Wikimedia/Wikipedia services and caches image "
-            "results locally. No API key is used. Continue?",
+            "MusicBrainz and Wikimedia/Wikipedia services and, when your personal "
+            "Discogs token is configured, to Discogs. Results are validated and "
+            "cached locally. Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -5542,7 +5546,7 @@ class MusicVaultWindow(QMainWindow):
                 if token_ready
                 else "Discogs: Personal token missing"
             )
-        total = analyzed = applied = review = 0
+        total = analyzed = accepted = pending = 0
         job_status = "not started"
         try:
             columns = {
@@ -5556,13 +5560,19 @@ class MusicVaultWindow(QMainWindow):
                 f"""
                 SELECT COUNT(*),
                        SUM(CASE WHEN {state_column} NOT IN ('created', 'queued', 'pending') THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN {state_column} IN ('applied', 'complete') THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN {state_column} IN ('needs_review', 'review', 'ambiguous') THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN {state_column} IN (
+                           'applied', 'complete', 'applied_with_gaps', 'source_fallback'
+                       ) THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN {state_column} IN (
+                           'created', 'queued', 'pending', 'analyzing', 'ready', 'review'
+                       ) THEN 1 ELSE 0 END)
                 FROM metadata_intelligence_items
                 """
             ).fetchone()
             if counts is not None:
-                total, analyzed, applied, review = (int(value or 0) for value in counts)
+                total, analyzed, accepted, pending = (
+                    int(value or 0) for value in counts
+                )
             job = self.db.conn.execute(
                 "SELECT status FROM metadata_intelligence_jobs "
                 "ORDER BY created_at DESC, id DESC LIMIT 1"
@@ -5574,8 +5584,8 @@ class MusicVaultWindow(QMainWindow):
         self.metadata_intelligence_status.setText(
             f"Automatic Intelligence: {'Enabled' if settings['metadata_intelligence_enabled'] else 'Disabled'}\n"
             f"Current Job: {job_status.title()}\n"
-            f"Total: {total}  •  Analyzed: {analyzed}  •  Applied: {applied}  •  "
-            f"Review Queue Count: {review}"
+            f"Total: {total}  •  Analyzed: {analyzed}  •  "
+            f"Accepted Outcomes: {accepted}  •  Pending: {pending}"
         )
 
 

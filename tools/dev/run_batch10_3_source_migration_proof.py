@@ -148,6 +148,27 @@ def _review_evidence(
             "_musicbrainz": {},
             "_artwork": {"candidate_available": False},
             "_reasons": reasons,
+            **(
+                {
+                    "_orientation": {
+                        "schema_version": 1,
+                        "selected": "left_is_artist",
+                        "evaluated_count": 2,
+                        "confidence": 35.0,
+                        "reasons": [
+                            "provisional_conventional_orientation",
+                            "provider_adjudication_required",
+                        ],
+                        "provider_confirmed": False,
+                        "requires_provider_adjudication": True,
+                        "discogs_queries": 0,
+                        "musicbrainz_queries": 0,
+                        "evaluations": [],
+                    }
+                }
+                if fallback
+                else {}
+            ),
         },
         "field_confidence": field_confidence,
         "provider_agreement": "none" if fallback else "discogs_only",
