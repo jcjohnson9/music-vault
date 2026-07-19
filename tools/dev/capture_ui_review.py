@@ -436,10 +436,12 @@ def seed_synthetic_runtime(
                 album = "A Shared Synthetic Album Title"
                 album_artist = "Aster Resolved Artist"
                 canonical_year = "2001"
+                synthetic_master_id = "99000001"
             elif index == 1:
                 album = "A Shared Synthetic Album Title"
                 album_artist = "Boreal No Match Artist"
                 canonical_year = "2001"
+                synthetic_master_id = "99000002"
             elif index == 2:
                 album = (
                     "A Very Long Synthetic Album Name Designed To Exercise Safe "
@@ -447,11 +449,13 @@ def seed_synthetic_runtime(
                 )
                 album_artist = "Cinder Ambiguous Artist"
                 canonical_year = "1999"
+                synthetic_master_id = "99000003"
             elif include_party and index >= 298:
                 party_index = index - 298
                 album = "Synthetic Party Mode"
                 album_artist = "Music Vault Review"
                 canonical_year = None
+                synthetic_master_id = "99000999"
             else:
                 album_index = (index - 3) % 97
                 album = f"Synthetic Album {album_index:03d}"
@@ -459,6 +463,7 @@ def seed_synthetic_runtime(
                 canonical_year = (
                     str(1980 + album_index % 44) if album_index % 4 else None
                 )
+                synthetic_master_id = str(99000100 + album_index)
             if include_party and index >= 298:
                 artist = "Music Vault Review"
                 cover_path = str(
@@ -485,6 +490,14 @@ def seed_synthetic_runtime(
                 source_upload_date="2024-03-02" if index == 0 else None,
             )
             track_ids.append(track_id)
+            # Give the synthetic browser fixture durable release-family
+            # identity so schema-v7 grouping remains deterministic even when
+            # its 300 tracks deliberately exercise 200 performer identities.
+            # These local-only fictional IDs never trigger provider access.
+            db.update_track_metadata(
+                track_id,
+                discogs_master_id=synthetic_master_id,
+            )
             if include_party and index >= 298:
                 party_track_ids.append(track_id)
 
@@ -703,14 +716,15 @@ def validate_output(
         runtime_checks = payload.get("runtime_checks") or {}
         behaviors = runtime_checks.get("metadata_intelligence_behaviors") or {}
         required_behaviors = {
-            "schema_6",
+            "schema_current",
             "exact_random_uploader_corrected",
             "label_excluded_from_artist_credits",
             "group_and_featured_credits_structured",
             "studio_live_tracks_remain_separate",
-            "unofficial_live_year_blank_original_date_separate",
-            "provider_conflict_requires_review",
-            "youtube_exclusive_fallback_reviewed",
+            "unofficial_live_dates_withheld",
+            "provider_conflict_terminal_best_available",
+            "ordinary_review_count_zero",
+            "youtube_exclusive_source_fallback",
             "source_memberships_preserved",
             "network_guard_active",
             "no_secret_files",

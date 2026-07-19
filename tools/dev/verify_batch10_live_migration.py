@@ -20,7 +20,14 @@ from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qs, urlparse
 
 
-EXPECTED_SCHEMA_VERSION = 6
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from music_vault.core.db import CURRENT_SCHEMA_VERSION  # noqa: E402
+
+
+EXPECTED_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 BASELINE_FORMAT_VERSION = 1
 STATUS_SCHEMA_VERSION = 1
 
@@ -1067,7 +1074,7 @@ def verify_migration(
         == int(before_db["sources"]["expected_identity_conflict_count"])
     )
     checks = {
-        "schema_is_6": after_db["schema_version"] == EXPECTED_SCHEMA_VERSION,
+        "schema_is_current": after_db["schema_version"] == EXPECTED_SCHEMA_VERSION,
         "tracks_preserved": preservation["track_count"],
         "playlists_preserved": preservation["playlist_count"],
         "memberships_preserved": preservation["membership_count"],

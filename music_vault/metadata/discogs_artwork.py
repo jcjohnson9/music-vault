@@ -26,6 +26,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import requests
 
 from music_vault.core.paths import discogs_covers_dir
+from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.metadata.artwork import (
     MAX_ARTWORK_BYTES,
     MAX_ARTWORK_PIXELS,
@@ -234,8 +235,9 @@ class DiscogsArtworkCache:
         self.index_path = (self.root / "index.json").resolve()
         if self.index_path.parent != self.root:
             raise ValueError("Discogs artwork index must remain inside its cache root.")
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.session = session
+        if self.session is not None:
+            self.session.trust_env = False
         self.resolver = resolver
         self.clock = clock
         self.max_age = min(max_age, DISCOGS_ARTWORK_MAX_AGE)
@@ -243,6 +245,14 @@ class DiscogsArtworkCache:
             raise ValueError("Discogs artwork max_age must be positive.")
         self._manifest: dict[str, Any] | None = None
         self._lock = threading.RLock()
+
+    def _network_session(self) -> requests.Session:
+        if not runtime_policy_for().allows_provider_construction(token_backed=True):
+            raise DiscogsArtworkError("provider_work_deferred")
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        return self.session
 
     def _empty_manifest(self) -> dict[str, Any]:
         return {"schema_version": DISCOGS_ARTWORK_CACHE_SCHEMA_VERSION, "entries": {}}
@@ -412,13 +422,15 @@ class DiscogsArtworkCache:
         return bytes(payload)
 
     def _download(self, source_url: str) -> tuple[PreparedArtwork, str]:
+        # Block optional provider work before URL validation reaches DNS.
+        session = self._network_session()
         current_url = source_url
         for redirect_count in range(MAX_REDIRECTS + 1):
             current_url = validate_discogs_image_url(
                 current_url, resolver=self.resolver
             )
             try:
-                response = self.session.get(
+                response = session.get(
                     current_url,
                     headers={"User-Agent": DISCOGS_USER_AGENT, "Accept": "image/*"},
                     timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
@@ -562,10 +574,7 @@ class DiscogsArtworkCache:
             ):
                 raise DiscogsArtworkError("artwork_dimensions_rejected")
         validate_discogs_release_url(candidate.provider_page_url, accepted_id)
-        validate_discogs_image_url(candidate.source_url, resolve_dns=False)
-        source_url = validate_discogs_image_url(
-            candidate.source_url, resolver=self.resolver
-        )
+        source_url = validate_discogs_image_url(candidate.source_url, resolve_dns=False)
         with self._lock:
             cached = self.lookup(candidate)
             if cached is not None:

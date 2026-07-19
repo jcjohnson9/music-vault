@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from music_vault.core.db import MusicVaultDB
@@ -131,6 +132,21 @@ def test_new_import_job_applies_discogs_fields_and_structured_credits(tmp_path: 
     ).fetchall()
     assert [(row[0], row[1], row[2]) for row in credits] == [
         ("Canonical Group", "group", "primary")
+    ]
+    stored_item = db.conn.execute(
+        "SELECT state,field_proposal FROM metadata_intelligence_items WHERE track_id=?",
+        (track_id,),
+    ).fetchone()
+    assert stored_item["state"] in {"applied", "applied_with_gaps"}
+    stored_proposal = json.loads(stored_item["field_proposal"])
+    assert stored_proposal["_discogs"]["artist_credits"] == [
+        {
+            "name": "Canonical Group",
+            "role": "primary",
+            "join_phrase": "",
+            "entity_type": "group",
+            "artist_id": "101",
+        }
     ]
     assert provider.calls and provider.calls[0].title == "Uploader Title"
     db.close()

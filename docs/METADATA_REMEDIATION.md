@@ -81,6 +81,30 @@ Release or populated-field conflicts do not promote release metadata: the
 recording may remain high confidence while conflicting album, album artist,
 date, release ID, and artwork stay unchanged for review.
 
+### Schema-v7 automatic outcomes
+
+The automatic-intelligence pipeline uses best-available field-level outcomes:
+
+- **Applied** means the best supported values were accepted.
+- **Applied with Gaps** means the critical identity is safe while secondary
+  album, year, exact edition, artwork, label, catalogue number, or country is
+  missing or ambiguous.
+- **Accepted Source Fallback** means strong saved source-title evidence supplies
+  title, artist, and version without a critical conflict when no credible
+  catalogue match exists.
+
+Missing secondary detail is not a failed remediation and does not inflate the
+manual-review count. Soundtrack title/performer identity may apply with an
+unresolved exact edition, while soundtrack, score, cast, and sequel identities
+remain structurally distinct.
+
+Existing legacy `review`/`ready` rows can be re-evaluated from their persisted
+normalized hints, field proposals/confidence, provider agreement, reason, and
+current authoritative field state. Reclassification is bounded and resumable,
+constructs no provider client, never weakens locks, and applies best-available
+database values with history. Medium-confidence decisions do not touch media
+tags; only the existing high-confidence writeback path remains eligible.
+
 ## Query normalization is not metadata rewriting
 
 Provider queries use a separate comparison representation. Unicode, case,
@@ -210,3 +234,13 @@ private-report export, rollback, and verification actions:
 Analyze and provider access are explicit. Apply, file writeback, and rollback
 require their dedicated confirmation flags. Item titles, artists, paths, and
 candidate details are never printed by aggregate actions.
+
+The separate schema-v7 stored-evidence reclassification helper defaults to a
+dry run and prints aggregate outcomes only:
+
+```powershell
+.\tools\dev\reclassify_metadata_review.ps1
+```
+
+Its explicitly confirmed apply mode still uses only local saved evidence; it
+does not contact Discogs, MusicBrainz, YouTube, LRCLIB, or another provider.

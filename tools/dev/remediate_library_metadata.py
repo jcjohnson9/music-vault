@@ -14,8 +14,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-os.environ["MUSIC_VAULT_ACCEPTANCE_NO_SECRETS"] = "1"
-
 from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB  # noqa: E402
 from music_vault.core.paths import database_path  # noqa: E402
 from music_vault.core.safety import sanitize_error_text  # noqa: E402
@@ -174,6 +172,9 @@ def _open_read_only_service(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     database: MusicVaultDB | None = None
+    no_secrets_name = "MUSIC_VAULT_ACCEPTANCE_NO_SECRETS"
+    previous_no_secrets = os.environ.get(no_secrets_name)
+    os.environ[no_secrets_name] = "1"
     try:
         _validate_arguments(args)
         path = database_path()
@@ -265,6 +266,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if database is not None:
             database.close()
+        if previous_no_secrets is None:
+            os.environ.pop(no_secrets_name, None)
+        else:
+            os.environ[no_secrets_name] = previous_no_secrets
 
 
 if __name__ == "__main__":

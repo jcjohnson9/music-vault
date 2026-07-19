@@ -47,6 +47,7 @@ SOURCE_COUNT = 3
 MAX_CASE_SECONDS = 120.0
 MAX_ARTIST_QUERY_MS = 5_000.0
 MAX_STORED_SUMMARY_BYTES_PER_ITEM = 32 * 1024
+MAX_PROVIDER_QUERIES_PER_TRACK = 6
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -330,7 +331,7 @@ def profile_case(root: Path, *, name: str, track_count: int) -> dict[str, object
         }
         metrics.update(_production_provider_guards())
         checks = {
-            "schema_is_6": schema == CURRENT_SCHEMA_VERSION == 6,
+            "schema_is_current": schema == CURRENT_SCHEMA_VERSION,
             "integrity_ok": integrity == "ok",
             "one_item_per_canonical_track": (
                 int(item_stats["item_count"]) == track_count
@@ -342,9 +343,11 @@ def profile_case(root: Path, *, name: str, track_count: int) -> dict[str, object
                 and origin_count == expected_memberships
                 and materialized_count == expected_memberships
             ),
-            "one_query_per_provider_per_track": (
-                len(discogs.calls) == track_count
-                and len(musicbrainz.calls) == track_count
+            "bounded_provider_queries_per_track": (
+                track_count <= len(discogs.calls)
+                <= track_count * MAX_PROVIDER_QUERIES_PER_TRACK
+                and track_count <= len(musicbrainz.calls)
+                <= track_count * MAX_PROVIDER_QUERIES_PER_TRACK
             ),
             "provider_calls_are_sequential": discogs.maximum_parallel_calls <= 1,
             "job_persistence_recovered": int(item_stats["max_attempts"] or 0) == 2,

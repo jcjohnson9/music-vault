@@ -107,8 +107,10 @@ _FIELD_ATTRS = {
     "discogs_release_id": "release_id",
     "discogs_master_id": "master_id",
     "discogs_track_position": "track_position",
+    "provider_release_family_id": "release_family_id",
     "musicbrainz_recording_id": "recording_id",
     "musicbrainz_release_id": "release_id",
+    "musicbrainz_release_group_id": "release_group_id",
     "artwork": "artwork",
 }
 _FIELD_ORDER = tuple(_FIELD_ATTRS)
@@ -305,7 +307,11 @@ def _resolve_field(
             FieldAction.KEEP,
             reasons=("manual_or_confirmed_lock",),
         )
-    if unofficial_live and field_name in {"release_date", "album"}:
+    if unofficial_live and field_name in {
+        "release_date",
+        "original_release_date",
+        "album",
+    }:
         return FieldResolution(
             field_name,
             current_value,
@@ -328,10 +334,12 @@ def _resolve_field(
             reasons=("no_candidate",),
         )
 
-    ordered = sorted(
+    all_ordered = sorted(
         candidates,
         key=lambda candidate: (_SOURCE_RANK.get(candidate.source, 99), -candidate.score),
     )
+    useful = [candidate for candidate in all_ordered if candidate.score >= 60.0]
+    ordered = useful or all_ordered
     discogs = next((item for item in ordered if item.source == "discogs"), None)
     musicbrainz = next((item for item in ordered if item.source == "musicbrainz"), None)
 
@@ -352,31 +360,54 @@ def _resolve_field(
             )
             reasons = list(chosen.reasons)
             agreement = True
-        elif discogs.score >= 95.0 and musicbrainz.score < 95.0:
+        else:
+            # Discogs is the catalogue authority for accepted title, artist,
+            # album, original-date and release identity.  A disagreement is
+            # retained as evidence but is not an ordinary manual-review gate.
+            # Hard version/duration mismatches are handled separately.
             chosen = discogs
-            reasons.append("strong_discogs_over_weaker_musicbrainz")
-        elif discogs.score < 90.0 and musicbrainz.score >= 92.0:
-            chosen = musicbrainz
-            reasons.append("strong_musicbrainz_over_weak_discogs")
+            reasons.append("discogs_preferred_over_musicbrainz_disagreement")
+
+    if (
+        version_conflict
+        and field_name in {"version_type", "version_label"}
+        and chosen.source in {"discogs", "musicbrainz"}
+    ):
+        source_qualifier = next(
+            (
+                candidate
+                for candidate in all_ordered
+                if candidate.source == "youtube_title_parsed"
+            ),
+            None,
+        )
+        if source_qualifier is not None:
+            chosen = source_qualifier
+            reasons = list(chosen.reasons)
+            reasons.extend(
+                ("version_identity_conflict", "source_version_qualifier_preserved")
+            )
         else:
             conflict = True
-            chosen = discogs if discogs.score >= musicbrainz.score else musicbrainz
-            reasons.append("provider_value_conflict")
-
-    if version_conflict and chosen.source in {"discogs", "musicbrainz"}:
-        conflict = True
-        reasons.append("version_identity_conflict")
+            reasons.append("version_identity_conflict")
     if "release_ambiguous" in chosen.reasons and field_name in {"album", "release_date"}:
-        conflict = True
-        reasons.append("release_context_ambiguous")
+        # Ordinary country/format/pressing ambiguity does not withhold useful
+        # catalogue metadata.  Keep the diagnostic and accept the coherent
+        # top release.
+        reasons.append("release_context_ambiguous_nonblocking")
 
     confidence = ConfidenceLevel.CONFLICT if conflict else _confidence(chosen.score)
     if conflict:
         action = FieldAction.REVIEW
-    elif confidence is ConfidenceLevel.HIGH:
+    elif confidence in {ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM}:
         action = FieldAction.APPLY
-    elif confidence in {ConfidenceLevel.MEDIUM, ConfidenceLevel.LOW}:
-        action = FieldAction.REVIEW
+    elif confidence is ConfidenceLevel.LOW and chosen.source == "youtube_title_parsed":
+        # Structured source-title fallbacks are useful database values.  Their
+        # score remains low/medium so callers can exclude them from tag writes.
+        action = FieldAction.APPLY
+        reasons.append("accepted_structured_source_fallback")
+    elif confidence is ConfidenceLevel.LOW:
+        action = FieldAction.KEEP
     else:
         action = FieldAction.KEEP
     if _canonical(current_value) == _canonical(chosen.value):
@@ -460,7 +491,9 @@ def build_metadata_ensemble(
                 )
 
     if parsed:
-        parsed_score = 86.0 if youtube_exclusive and parsed.strong_pattern else 72.0
+        # Source parsing is useful database evidence but is never strong
+        # enough by itself to cross the high-confidence media-tag boundary.
+        parsed_score = 78.0 if youtube_exclusive and parsed.strong_pattern else 72.0
         parsed_values = {
             "title": parsed.title_hint,
             "artist": parsed.artist_hint,
@@ -544,7 +577,7 @@ def build_metadata_ensemble(
     if youtube_exclusive and discogs is None and musicbrainz is None:
         reasons.append("youtube_exclusive_fallback")
     if disagreements:
-        reasons.append("provider_conflict_requires_review")
+        reasons.append("provider_conflict_preserved_as_diagnostic")
     return MetadataEnsemble(
         resolutions,
         discogs,

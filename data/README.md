@@ -46,7 +46,7 @@ files and schema-migration backups must never be committed or included in a publ
 build. Clear, reset, and undo do not automatically delete older cover files.
 
 The current v1.1.0 development line advances new and migrated local databases
-to schema version 6. Schema version 5 adds saved synchronization sources, durable
+to schema version 7. Schema version 5 adds saved synchronization sources, durable
 playlist-item occurrences, source runs, global video-to-track identities,
 identity-conflict diagnostics, and manual/source playlist origins. These tables
 may reveal private source and library organization and belong only in the local
@@ -62,6 +62,23 @@ materialized artist text, every canonical track, media path, source occurrence,
 playlist origin, and order. Labels and YouTube uploaders remain release/source
 provenance rather than artist entities. Version grouping never merges or
 deletes separate media.
+
+Schema version 7 adds canonical album cards and per-track edition memberships,
+artist aliases and verified relationships, and field-level intelligence
+outcomes. These are private SQLite records. Album grouping does not rewrite
+track album strings, dates, media paths, or `cover_path`; representative card
+art is selected from existing member-track art without propagation. Safe artist
+consolidation preserves credits, roles, aliases, provider IDs, relationships,
+portrait provenance, locks, observations, and history. Conflicting identities
+remain separate.
+
+Stored review evidence may be reclassified locally as `Applied with Gaps`,
+`Accepted Source Fallback`, or critical `Needs Review` without a provider
+request. Private proposals, reasons, identities, and source/provider references
+stay in SQLite. Only aggregate counts may appear in App Status. Canonical artist
+portrait files and attribution remain private under `artist_images/`; Discogs
+or Wikimedia fallback still requires the existing opt-in, and album artwork is
+not used as an artist portrait.
 
 Discogs artwork can fill only a missing, corrupt, or explicit-placeholder gap.
 It never automatically replaces a valid existing cover and is never embedded

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from music_vault.core.app_status import write_app_status
-from music_vault.core.db import MusicVaultDB
+from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB
 from music_vault.core import paths as runtime_paths
 from music_vault.ui import review as ui_review
 from tools.dev import profile_metadata_intelligence as profile
@@ -76,13 +76,18 @@ def test_metadata_intelligence_profiler_small_case_proves_dedup_and_persistence(
     tmp_path: Path,
 ) -> None:
     result = profile.profile_case(tmp_path, name="test_12_tracks", track_count=12)
-    assert result["schema_version"] == 6
+    assert result["schema_version"] == CURRENT_SCHEMA_VERSION
     assert result["source_membership_count"] == 36
     assert result["overlapping_membership_count"] == 24
     assert result["job_item_count"] == 12
     assert result["job_distinct_track_count"] == 12
-    assert result["discogs_query_count"] == 12
-    assert result["musicbrainz_query_count"] == 12
+    assert 12 <= result["discogs_query_count"] <= (
+        12 * profile.MAX_PROVIDER_QUERIES_PER_TRACK
+    )
+    assert 12 <= result["musicbrainz_query_count"] <= (
+        12 * profile.MAX_PROVIDER_QUERIES_PER_TRACK
+    )
+    assert result["checks"]["bounded_provider_queries_per_track"] is True
     assert result["job_max_attempt_count"] == 2
     assert all(result["checks"].values())
     assert profile.PROFILE_CASES == (("300_tracks", 300), ("1000_tracks", 1_000))
@@ -180,7 +185,9 @@ def test_live_schema_gate_preserves_values_credits_sources_media_and_secrets(
         database=database,
         backup_path=rollback,
     )
-    assert result["ok"] is True
+    assert result["ok"] is True, [
+        name for name, passed in result["checks"].items() if not passed
+    ]
     assert all(result["checks"].values())
     assert result["counts"]["tracks"] == 2
     assert result["counts"]["seeded_artist_credits"] == 2
@@ -371,11 +378,16 @@ def test_packaged_smoke_prepare_verify_is_isolated_and_offline(tmp_path: Path) -
     try:
         manifest = packaged.prepare(runtime, project)
         result = packaged.verify(runtime, project, manifest)
-        assert manifest["schema_version"] == 6
+        assert manifest["schema_version"] == CURRENT_SCHEMA_VERSION
         assert manifest["network_attempt_count"] == 0
         assert manifest["secret_file_read_count"] == 0
         assert manifest["media_file_write_count"] == 0
-        assert manifest["discogs_query_count"] == manifest["track_count"]
+        assert manifest["track_count"] <= manifest["discogs_query_count"] <= (
+            manifest["track_count"] * profile.MAX_PROVIDER_QUERIES_PER_TRACK
+        )
+        assert manifest["track_count"] <= manifest["musicbrainz_query_count"] <= (
+            manifest["track_count"] * profile.MAX_PROVIDER_QUERIES_PER_TRACK
+        )
         assert result["ok"] is True
         assert all(result["checks"].values())
         assert not (runtime / "data" / "youtube_api_key.txt").exists()
@@ -442,12 +454,13 @@ def test_in_app_metadata_intelligence_smoke_is_bounded_and_synthetic(
             SimpleNamespace(db=db),
             plan,
         )
-        assert evidence["schema_6"] is True
+        assert evidence["schema_current"] is True
         assert evidence["exact_random_uploader_corrected"] is True
         assert evidence["label_excluded_from_artist_credits"] is True
         assert evidence["group_and_featured_credits_structured"] is True
-        assert evidence["provider_conflict_requires_review"] is True
-        assert evidence["youtube_exclusive_fallback_reviewed"] is True
+        assert evidence["provider_conflict_terminal_best_available"] is True
+        assert evidence["ordinary_review_count_zero"] is True
+        assert evidence["youtube_exclusive_source_fallback"] is True
         assert evidence["network_attempt_count"] == 0
         assert evidence["synthetic_media_writes_confined_to_runtime"] is True
         assert evidence["file_writeback_enabled"] is True
@@ -482,14 +495,15 @@ def test_packaged_review_evidence_requires_explicit_frozen_behavior_marker(
         name: True
         for name in (
             "packaged_process",
-            "schema_6",
+            "schema_current",
             "exact_random_uploader_corrected",
             "label_excluded_from_artist_credits",
             "group_and_featured_credits_structured",
             "studio_live_tracks_remain_separate",
-            "unofficial_live_year_blank_original_date_separate",
-            "provider_conflict_requires_review",
-            "youtube_exclusive_fallback_reviewed",
+            "unofficial_live_dates_withheld",
+            "provider_conflict_terminal_best_available",
+            "ordinary_review_count_zero",
+            "youtube_exclusive_source_fallback",
             "source_memberships_preserved",
             "network_guard_active",
             "no_secret_files",

@@ -20,9 +20,11 @@ from typing import Any
 
 import requests
 
+from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.metadata.artist_images import validate_public_url
 from music_vault.metadata.matching import text_similarity
 from music_vault.metadata.schema import normalize_release_date
+from music_vault.metadata.soundtrack import classify_soundtrack, is_various_artists
 from music_vault.metadata.title_parser import classify_version_hint
 from music_vault.metadata.ensemble import versions_compatible
 from music_vault.version import APP_VERSION, PROJECT_URL
@@ -240,8 +242,14 @@ def _track_score(
     release_credits: tuple[ProviderArtistCredit, ...],
 ) -> tuple[float, tuple[str, ...], tuple[ProviderArtistCredit, ...]]:
     title = _clean(track.get("title")) or ""
-    credits = parse_discogs_artist_credits(track.get("artists")) or release_credits
-    artist = format_artist_credits(credits)
+    track_credits = parse_discogs_artist_credits(track.get("artists"))
+    if is_various_artists(format_artist_credits(track_credits)):
+        track_credits = ()
+    release_artist = format_artist_credits(release_credits)
+    credits = track_credits or (
+        () if is_various_artists(release_artist) else release_credits
+    )
+    artist = format_artist_credits(credits) or (query.artist or "")
     title_score = text_similarity(query.title, title, title=True)
     artist_score = text_similarity(query.artist, artist) if query.artist else 100.0
     duration = _duration_seconds(track.get("duration"))
@@ -252,6 +260,14 @@ def _track_score(
         duration_delta = abs(float(query.duration_seconds) - duration)
         duration_score = max(0.0, 100.0 - duration_delta * 5.0)
     candidate_version, _label = classify_version_hint(title)
+    if (
+        candidate_version == "unknown"
+        and str(query.version_type or "").strip().casefold() == "soundtrack"
+    ):
+        # A markerless cue may still have explicit soundtrack identity in the
+        # source query; parse_discogs_release applies the same context when it
+        # classifies the provider release as a whole.
+        candidate_version = "soundtrack"
     version_ok = versions_compatible(query.version_type or "unknown", candidate_version)
 
     score = title_score * 0.55 + artist_score * 0.35 + duration_score * 0.10
@@ -314,7 +330,11 @@ def parse_discogs_release(
         return None
 
     title = _clean(best_track.get("title")) or query.title
-    artist = format_artist_credits(best_credits) or release_artist or (query.artist or "")
+    artist = (
+        format_artist_credits(best_credits)
+        or (None if is_various_artists(release_artist) else release_artist)
+        or (query.artist or "")
+    )
     format_values = _format_descriptions(payload)
     format_text = ", ".join(format_values)
     version_type, version_label = classify_version_hint(title, format_text)
@@ -331,9 +351,6 @@ def parse_discogs_release(
         original_date = _safe_date(master_payload.get("year"))
     if original_date is None:
         original_date = _safe_date(payload.get("master_year"))
-    if version_type == "studio" and original_date:
-        # A late reissue must not become the canonical original studio year.
-        release_date = original_date
     if version_type == "live" and not is_official:
         release_date = None
 
@@ -343,15 +360,42 @@ def parse_discogs_release(
     if not is_official:
         reasons.append("unofficial_release")
     album = _clean(payload.get("title"))
-    if is_compilation or (version_type == "live" and not is_official):
+    soundtrack = classify_soundtrack(
+        title=title,
+        album=album,
+        version_type=(
+            "soundtrack"
+            if str(query.version_type or "").casefold() == "soundtrack"
+            else version_type
+        ),
+        source_title=query.title,
+        release_format=format_text,
+        album_artist=release_artist,
+        provider_credits=best_credits,
+    )
+    if soundtrack.is_soundtrack and version_type in {"unknown", "studio"}:
+        version_type = "soundtrack"
+    if version_type == "live" and not is_official:
         album = None
 
     provider_page_url = f"https://www.discogs.com/release/{release_id}"
     score = best_score
-    if is_compilation:
+    if is_compilation and not soundtrack.is_soundtrack:
         score = max(0.0, score - 12.0)
     if not is_official:
         score = max(0.0, score - 8.0)
+    if query.year_hint is not None:
+        candidate_year = original_date or release_date
+        try:
+            year_delta = abs(int(str(candidate_year)[:4]) - int(query.year_hint))
+        except (TypeError, ValueError, OverflowError):
+            year_delta = None
+        if year_delta == 0:
+            score = min(100.0, score + 3.0)
+            reasons.append("year_hint_match")
+        elif year_delta is not None and year_delta > 2:
+            score = max(0.0, score - 2.0)
+            reasons.append("year_hint_mismatch")
     album_score: float | None = None
     if query.album and album:
         album_score = text_similarity(query.album, album, title=True)
@@ -446,7 +490,7 @@ def rank_discogs_candidates(
         item
         for item in ranked
         if item.provider_score >= leader.provider_score - 4.0
-        and not item.is_compilation
+        and (not item.is_compilation or item.version_type == "soundtrack")
         and item.is_official
     ]
     if coherent:
@@ -460,12 +504,46 @@ def rank_discogs_candidates(
             first.release_id != second.release_id
             and (first.album or "").casefold() != (second.album or "").casefold()
         )
-        if identities_differ and abs(first.provider_score - second.provider_score) < 3.0:
+        if (
+            identities_differ
+            and abs(first.provider_score - second.provider_score) < 3.0
+        ):
+            same_family = bool(
+                first.master_id
+                and second.master_id
+                and first.master_id == second.master_id
+                or first.release_family_id
+                and second.release_family_id
+                and first.release_family_id == second.release_family_id
+            )
+            field_scores = dict(first.field_scores)
+            if not same_family:
+                for name in (
+                    "album",
+                    "release_date",
+                    "original_release_date",
+                    "discogs_release_id",
+                    "discogs_master_id",
+                    "discogs_track_position",
+                    "provider_release_family_id",
+                ):
+                    field_scores[name] = 0.0
             ranked[0] = replace(
                 first,
-                album=None,
-                reasons=tuple(dict.fromkeys(first.reasons + ("release_ambiguous",))),
-                field_scores={**first.field_scores, "album": 0.0},
+                reasons=tuple(
+                    dict.fromkeys(
+                        first.reasons
+                        + (
+                            "release_ambiguous",
+                            (
+                                "release_ambiguity_same_family"
+                                if same_family
+                                else "release_ambiguity_different_work"
+                            ),
+                        )
+                    )
+                ),
+                field_scores=field_scores,
             )
     return ranked
 
@@ -583,11 +661,20 @@ class DiscogsProvider:
             raise DiscogsProviderError("discogs_token_required")
         if len(self._token) > 512 or "\r" in self._token or "\n" in self._token:
             raise DiscogsProviderError("discogs_token_invalid")
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.session = session
+        if self.session is not None:
+            self.session.trust_env = False
         self.resolver = resolver
         self.rate_limiter = rate_limiter
         self.cache = cache or _MemoryResponseCache()
+
+    def _network_session(self) -> requests.Session:
+        if not runtime_policy_for().allows_provider_construction(token_backed=True):
+            raise DiscogsProviderError("provider_work_deferred")
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        return self.session
 
     @staticmethod
     def _cache_key(path: str, params: Mapping[str, Any] | None) -> tuple[Any, ...]:
@@ -648,6 +735,9 @@ class DiscogsProvider:
             return cached
 
         self._check_cancelled(cancel_event, stale_check)
+        # Check policy before endpoint validation performs DNS resolution.
+        # Cached results above remain usable without constructing a transport.
+        session = self._network_session()
         try:
             endpoint = validate_public_url(
                 f"{DISCOGS_API_ROOT}{path}",
@@ -661,7 +751,7 @@ class DiscogsProvider:
             self._check_cancelled(cancel_event, stale_check)
             self.rate_limiter.wait(cancel_event)
             try:
-                response = self.session.get(
+                response = session.get(
                     endpoint,
                     params=bounded_params or None,
                     headers={

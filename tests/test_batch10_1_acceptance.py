@@ -342,7 +342,7 @@ def test_musicbrainz_applies_when_discogs_temporarily_fails(tmp_path: Path):
     db.close()
 
 
-def test_service_field_locks_and_provider_disagreement_are_reviewed_independently(
+def test_service_field_locks_and_provider_disagreement_use_best_available_independently(
     tmp_path: Path,
 ):
     db = MusicVaultDB(tmp_path / "library.sqlite3", backup_dir=tmp_path / "backups")
@@ -376,9 +376,13 @@ def test_service_field_locks_and_provider_disagreement_are_reviewed_independentl
         musicbrainz_provider_factory=lambda: musicbrainz,
     )
     conflict = conflict_service.process_automatic_queue()
-    assert conflict.review == 1
-    assert db.get_track(conflict_id)["title"] == "Random Upload Title"
-    assert item_row(db, conflict_id)["provider_agreement"] == "conflict"
+    assert conflict.review == 0
+    assert conflict.applied_with_gaps == 1
+    assert db.get_track(conflict_id)["title"] == "Canonical Signal"
+    row = item_row(db, conflict_id)
+    assert row["state"] == "applied_with_gaps"
+    assert row["provider_agreement"] == "discogs_only"
+    assert row["review_reason"] == "secondary_metadata_gaps"
     db.close()
 
 
@@ -405,7 +409,8 @@ def test_youtube_exclusive_live_uses_parsed_identity_not_uploader_or_upload_date
 
     result = service.process_automatic_queue()
 
-    assert result.review == 1
+    assert result.review == 0
+    assert result.source_fallback == 1
     track = db.get_track(track_id)
     assert track["title"] == "Midnight Signal"
     assert track["artist"] == "Aurora Unit"
@@ -413,7 +418,7 @@ def test_youtube_exclusive_live_uses_parsed_identity_not_uploader_or_upload_date
     assert track["release_date"] is None
     assert track["year"] is None
     assert track["source_upload_date"] == "2024-06-12"
-    assert item_row(db, track_id)["review_reason"] == "version_conflict"
+    assert item_row(db, track_id)["state"] == "source_fallback"
     db.close()
 
 
@@ -628,7 +633,8 @@ def test_tag_write_failure_rolls_back_fields_ids_release_context_and_credits(
 
     result = service.process_automatic_queue()
 
-    assert result.review == 1
+    assert result.review == 0
+    assert result.failed == 1
     track = db.get_track(track_id)
     assert track["title"] == "Random Upload Title"
     assert track["discogs_release_id"] is None
@@ -645,8 +651,9 @@ def test_tag_write_failure_rolls_back_fields_ids_release_context_and_credits(
     ).fetchall()
     assert [row[0] for row in credits] == ["Random Archive"]
     row = item_row(db, track_id)
+    assert row["state"] == "failed"
     assert row["file_write_result"] == "restored"
-    assert row["review_reason"] == "file_write_failed"
+    assert row["review_reason"] == "file_write_rollback_failure"
     db.close()
 
 

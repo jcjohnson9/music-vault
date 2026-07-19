@@ -511,7 +511,16 @@ class MetadataService:
                 provider_reference, confidence, observed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(observation_key) DO UPDATE SET
-                confidence=COALESCE(excluded.confidence, track_metadata_observations.confidence),
+                confidence=CASE
+                    WHEN track_metadata_observations.confidence IS NULL
+                        THEN excluded.confidence
+                    WHEN excluded.confidence IS NULL
+                        THEN track_metadata_observations.confidence
+                    ELSE MAX(
+                        track_metadata_observations.confidence,
+                        excluded.confidence
+                    )
+                END,
                 observed_at=excluded.observed_at
             """,
             (
@@ -711,6 +720,21 @@ class MetadataService:
                 new_states["artist"],
                 changed_at,
             )
+        if set(new_states) & {
+            "artist",
+            "album",
+            "album_artist",
+            "release_date",
+            "original_release_date",
+        }:
+            has_album_schema = self.conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                "AND name IN ('canonical_albums','track_album_memberships')"
+            ).fetchone()[0]
+            if int(has_album_schema) == 2:
+                from .canonical_albums import upsert_track_canonical_album
+
+                upsert_track_canonical_album(self.conn, int(track_id))
         return identifier
 
     def record_source_observations(
@@ -802,7 +826,7 @@ class MetadataService:
                     or effective_value is None
                 ):
                     continue
-                if old.is_locked:
+                if old.is_locked or old.is_manual:
                     continue
                 incoming_priority = PROVENANCE_PRIORITY.get(provenance, 0)
                 if old.value is not None:
@@ -1180,6 +1204,7 @@ class MetadataService:
         recording_id: str | None,
         release_id: str | None,
         confidence: float | None,
+        release_group_id: str | None = None,
         artwork_path: str | None = None,
         commit: bool = True,
     ) -> MetadataChangeResult:
@@ -1245,6 +1270,29 @@ class MetadataService:
                     """,
                     (_clean_optional(recording_id), _clean_optional(release_id), int(track_id)),
                 )
+                normalized_release_group_id = _clean_optional(release_group_id)
+                if normalized_release_group_id is not None:
+                    self.conn.execute(
+                        """
+                        INSERT INTO track_release_context (
+                            track_id,musicbrainz_release_group_id,release_title,
+                            provider_reference,confidence,updated_at
+                        ) VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                        ON CONFLICT(track_id) DO UPDATE SET
+                            musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            int(track_id),
+                            normalized_release_group_id,
+                            selected.get("album"),
+                            _clean_optional(release_id),
+                            confidence,
+                        ),
+                    )
+                    from .canonical_albums import upsert_track_canonical_album
+
+                    upsert_track_canonical_album(self.conn, int(track_id))
         after = self.snapshot(track_id)
         return MetadataChangeResult(
             int(track_id), group_id, frozenset(pending), before, after
@@ -1258,6 +1306,7 @@ class MetadataService:
         recording_id: str | None,
         release_id: str | None,
         confidence: float | None,
+        release_group_id: str | None = None,
         artwork_path: str | None = None,
         commit: bool = True,
     ) -> MetadataChangeResult:
@@ -1339,6 +1388,29 @@ class MetadataService:
                     """,
                     (_clean_optional(recording_id), _clean_optional(release_id), int(track_id)),
                 )
+                normalized_release_group_id = _clean_optional(release_group_id)
+                if normalized_release_group_id is not None:
+                    self.conn.execute(
+                        """
+                        INSERT INTO track_release_context (
+                            track_id,musicbrainz_release_group_id,release_title,
+                            provider_reference,confidence,updated_at
+                        ) VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                        ON CONFLICT(track_id) DO UPDATE SET
+                            musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            int(track_id),
+                            normalized_release_group_id,
+                            selected.get("album"),
+                            _clean_optional(release_id),
+                            confidence,
+                        ),
+                    )
+                    from .canonical_albums import upsert_track_canonical_album
+
+                    upsert_track_canonical_album(self.conn, int(track_id))
         after = self.snapshot(track_id)
         return MetadataChangeResult(
             int(track_id), group_id, frozenset(pending), before, after

@@ -9,7 +9,17 @@ import time
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QThread, Signal, QSize, QTimer, QRectF
+from PySide6.QtCore import (
+    Qt,
+    QUrl,
+    QThread,
+    Signal,
+    QSize,
+    QTimer,
+    QRectF,
+    QEvent,
+    QObject,
+)
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -29,7 +39,10 @@ from PySide6.QtMultimedia import (
     QMediaPlayer,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
+    QAbstractSlider,
+    QAbstractSpinBox,
     QMainWindow,
     QWidget,
     QFileDialog,
@@ -45,6 +58,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QLineEdit,
+    QPlainTextEdit,
     QFrame,
     QGroupBox,
     QCheckBox,
@@ -64,6 +78,17 @@ from PySide6.QtWidgets import (
 )
 
 from music_vault.version import DISPLAY_VERSION, RELEASE_CHANNEL
+from music_vault.core.acceptance_network import (
+    install_acceptance_network_guard,
+    record_provider_factory_invocation,
+    record_provider_task_dispatch,
+)
+
+# Install before importing provider modules so any resolver callables captured
+# as default arguments are also the acceptance-only blocked implementations.
+# The installer is inert during every ordinary Music Vault launch.
+_BOOTSTRAP_ACCEPTANCE_NETWORK_GUARD = install_acceptance_network_guard()
+
 from music_vault.core.db import MusicVaultDB
 from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
 from music_vault.core.ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
@@ -87,6 +112,7 @@ from music_vault.core.library_browser import (
     query_artist_track_sections,
 )
 from music_vault.core.playback_errors import playback_error_message
+from music_vault.core.runtime_policy import RuntimePolicy
 from music_vault.core.playback_state import (
     DEFAULT_VOLUME_PERCENT,
     build_track_row_map,
@@ -217,6 +243,22 @@ def _config_supports_completion_inference(path: Path) -> bool:
         return False
 
 
+class _PolicyGuardedDiscogsTokenStore:
+    """Read-only provider view that obeys this process's runtime policy."""
+
+    def __init__(self, delegate: DiscogsTokenStore, policy: RuntimePolicy) -> None:
+        self._delegate = delegate
+        self._policy = policy
+
+    def read(self) -> str:
+        if not self._policy.provider_construction_allowed:
+            return ""
+        return self._delegate.read()
+
+    def configured(self) -> bool:
+        return bool(self.read())
+
+
 class YouTubeSyncWorker(QThread):
     progress = Signal(str)
     finished_ok = Signal(object)
@@ -253,6 +295,73 @@ class YouTubeSyncWorker(QThread):
             self.finished_ok.emit(result)
         except Exception as exc:
             self.finished_ok.emit(SyncResult.failed_result(exc))
+
+
+def should_handle_global_play_pause(
+    focus_widget: QWidget | None,
+    *,
+    active_modal_widget: QWidget | None = None,
+    party_mode_active: bool = False,
+) -> bool:
+    """Return whether application-wide Space may control playback.
+
+    The global shortcut is deliberately conservative.  Text editors and
+    controls that have their own meaningful Space interaction keep the key,
+    while ordinary page containers may route it to the existing player.
+    """
+
+    if party_mode_active or active_modal_widget is not None:
+        return False
+
+    widget = focus_widget
+    while widget is not None:
+        if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            return False
+        if isinstance(widget, QComboBox):
+            return False
+        if isinstance(widget, QAbstractSpinBox):
+            return False
+        if isinstance(widget, (QAbstractButton, QAbstractSlider)):
+            return False
+        if (
+            isinstance(widget, QAbstractItemView)
+            and widget.state() == QAbstractItemView.EditingState
+        ):
+            return False
+        parent = widget.parentWidget()
+        if parent is widget:
+            break
+        widget = parent
+
+    return True
+
+
+class _GlobalPlayPauseEventFilter(QObject):
+    """Route unmodified Space presses without intercepting focused controls."""
+
+    def __init__(self, callback, party_mode_active, parent: QObject | None = None):
+        super().__init__(parent)
+        self._callback = callback
+        self._party_mode_active = party_mode_active
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            event.type() != QEvent.Type.KeyPress
+            or event.key() != Qt.Key.Key_Space
+            or event.modifiers() != Qt.KeyboardModifier.NoModifier
+            or event.isAutoRepeat()
+        ):
+            return super().eventFilter(watched, event)
+        if not should_handle_global_play_pause(
+            QApplication.focusWidget(),
+            active_modal_widget=QApplication.activeModalWidget(),
+            party_mode_active=bool(self._party_mode_active()),
+        ):
+            # Returning False is essential: checkboxes, buttons, sliders, and
+            # editors must receive their own Space key event normally.
+            return super().eventFilter(watched, event)
+        self._callback()
+        return True
 
 
 class MusicVaultWindow(QMainWindow):
@@ -295,6 +404,9 @@ class MusicVaultWindow(QMainWindow):
             youtube_download_root=self.config.get("download_folder"),
             legacy_failure_file=youtube_failed_ids_path(),
         )
+        self.runtime_policy = RuntimePolicy.from_environment(
+            migration_performed=self.db.migration_performed
+        )
         self.playlist_membership_service = PlaylistMembershipService(self.db)
         self.sync_source_service = SyncSourceService(
             self.db,
@@ -311,12 +423,24 @@ class MusicVaultWindow(QMainWindow):
         self.metadata_intelligence_service = MetadataIntelligenceService(
             self.db,
             lambda: self.config,
-            token_store=self.discogs_token_store,
+            token_store=_PolicyGuardedDiscogsTokenStore(
+                self.discogs_token_store,
+                self.runtime_policy,
+            ),
+            discogs_provider_factory=self._create_discogs_metadata_provider,
+            musicbrainz_provider_factory=self._create_musicbrainz_metadata_provider,
+            runtime_policy=self.runtime_policy,
         )
         self.artist_image_cache = ArtistImageCache()
+        if self.runtime_policy.background_provider_work_allowed:
+            self._rekey_consolidated_artist_portraits()
         self.artist_image_service = ArtistImageService(
-            create_artist_image_provider(),
+            None,
             self.artist_image_cache,
+            provider_factory=partial(
+                create_artist_image_provider,
+                runtime_policy=self.runtime_policy,
+            ),
             parent=self,
         )
         self._pending_artist_image_keys: set[str] = set()
@@ -396,13 +520,74 @@ class MusicVaultWindow(QMainWindow):
         self.party_mode_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.party_mode_shortcut.activated.connect(self.toggle_party_mode)
 
+        self.global_play_pause_event_filter = _GlobalPlayPauseEventFilter(
+            self.on_global_play_pause_shortcut,
+            lambda: bool(getattr(self, "party_mode_active", False)),
+            self,
+        )
+        QApplication.instance().installEventFilter(
+            self.global_play_pause_event_filter
+        )
+
         self.build_ui()
         self.update_playback_mode_buttons()
         self.load_library()
         self.load_playlists()
         self.refresh_settings_status()
         self.on_multi_source_status_transition({})
-        QTimer.singleShot(0, self.wake_metadata_intelligence)
+        if self.runtime_policy.background_provider_work_allowed:
+            QTimer.singleShot(0, self.wake_metadata_intelligence)
+
+    def _current_runtime_policy(self) -> RuntimePolicy:
+        policy = getattr(self, "runtime_policy", None)
+        if isinstance(policy, RuntimePolicy):
+            return policy
+        database = getattr(self, "db", None)
+        return RuntimePolicy.from_environment(
+            migration_performed=bool(
+                getattr(database, "migration_performed", False)
+            )
+        )
+
+    def _provider_work_allowed(self) -> bool:
+        return MusicVaultWindow._current_runtime_policy(
+            self
+        ).background_provider_work_allowed
+
+    def _show_provider_deferred(self) -> None:
+        reason = self._current_runtime_policy().defer_reason
+        messages = {
+            "migration_startup": (
+                "Provider work deferred until the next launch after database migration."
+            ),
+            "acceptance_no_network": "Provider work is disabled for this acceptance launch.",
+            "acceptance_no_secrets": "Provider work is disabled for this acceptance launch.",
+        }
+        status_bar = self.statusBar() if hasattr(self, "statusBar") else None
+        if status_bar is not None:
+            status_bar.showMessage(messages.get(reason, "Provider work is unavailable."), 8000)
+
+    def _runtime_lyrics_settings(self, values: dict) -> dict:
+        settings = dict(values)
+        if not self._provider_work_allowed():
+            settings["lyrics_online_lookup_enabled"] = False
+        return settings
+
+    def _create_discogs_metadata_provider(self, token: str):
+        record_provider_factory_invocation()
+        if not self._current_runtime_policy().provider_construction_allowed:
+            raise RuntimeError("Optional provider work is deferred for this launch.")
+        from music_vault.metadata.providers.discogs import DiscogsProvider
+
+        return DiscogsProvider(token=token)
+
+    def _create_musicbrainz_metadata_provider(self):
+        record_provider_factory_invocation()
+        if not self._provider_work_allowed():
+            raise RuntimeError("Optional provider work is deferred for this launch.")
+        from music_vault.metadata.musicbrainz_enricher import MusicBrainzProvider
+
+        return MusicBrainzProvider()
 
 
     def config_file_path(self) -> Path:
@@ -550,7 +735,7 @@ class MusicVaultWindow(QMainWindow):
         return youtube_api_key_path()
 
     def read_saved_api_key(self) -> str:
-        if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+        if not MusicVaultWindow._current_runtime_policy(self).secrets_allowed:
             return ""
         path = self.api_key_path()
 
@@ -598,6 +783,7 @@ class MusicVaultWindow(QMainWindow):
                 "lyrics_synchronized": bool(
                     getattr(self, "party_lyrics_synchronized", False)
                 ),
+                **MusicVaultWindow._current_runtime_policy(self).status_fields(),
             }
 
             if self.app_sync_status is not None:
@@ -714,7 +900,7 @@ class MusicVaultWindow(QMainWindow):
         self.party_audio_reactivity_available = False
         self.party_lyrics_available = False
         self.party_lyrics_synchronized = False
-        window.apply_settings(self.config)
+        window.apply_settings(self._runtime_lyrics_settings(self.config))
         self._ensure_party_audio_thread()
         self.party_mode_active = True
 
@@ -1057,6 +1243,7 @@ class MusicVaultWindow(QMainWindow):
         self.artist_section_selector = QComboBox()
         self.artist_section_selector.setObjectName("ArtistSectionSelector")
         self.artist_section_selector.setAccessibleName("Artist track section")
+        self.artist_section_selector.setMinimumWidth(190)
         self.artist_section_selector.currentIndexChanged.connect(
             self.on_artist_section_changed
         )
@@ -1295,12 +1482,17 @@ class MusicVaultWindow(QMainWindow):
         page_layout.addWidget(self.sync_scroll)
 
         self.sync_center_controller.refresh(preserve_detail=False)
+        if not self._provider_work_allowed():
+            self.sync_center.sync_all_button.setEnabled(False)
+            self.sync_center.sync_selected_button.setEnabled(False)
 
         return page
 
     def create_multi_source_orchestrator(self, progress, transition):
         """Create a worker-thread-owned database/service/orchestrator graph."""
 
+        if not self._provider_work_allowed():
+            raise RuntimeError("Synchronization is disabled for this launch.")
         worker_db = MusicVaultDB(
             self.db.db_path,
             backup_dir=self.db.backup_dir,
@@ -1744,8 +1936,10 @@ class MusicVaultWindow(QMainWindow):
         artist_images_title = QLabel("Artist Photos")
         artist_images_title.setObjectName("CardTitle")
         artist_images_description = QLabel(
-            "Optional public metadata lookup for visible artists. Cached photos "
-            "remain local and no provider API key is required."
+            "Optional private lookup for canonical artists. Existing valid cache "
+            "wins, followed by MusicBrainz-linked Wikimedia, full-size Discogs "
+            "when your personal token is configured, then strict Wikimedia "
+            "fallback. Cached photos remain local."
         )
         artist_images_description.setObjectName("MutedLabel")
         artist_images_description.setWordWrap(True)
@@ -1764,6 +1958,14 @@ class MusicVaultWindow(QMainWindow):
         )
 
         artist_images_row = QHBoxLayout()
+        self.refresh_missing_artist_images_btn = self.make_action_button(
+            "Refresh Missing Artist Photos",
+            "refresh",
+            self.refresh_missing_artist_photos,
+        )
+        self.refresh_missing_artist_images_btn.setEnabled(
+            self._provider_work_allowed()
+        )
         clear_artist_images_btn = self.make_action_button(
             "Clear Artist Photos",
             "remove",
@@ -1775,6 +1977,7 @@ class MusicVaultWindow(QMainWindow):
             "folder",
             self.open_artist_image_cache_folder,
         )
+        artist_images_row.addWidget(self.refresh_missing_artist_images_btn)
         artist_images_row.addWidget(clear_artist_images_btn)
         artist_images_row.addWidget(open_artist_images_btn)
         artist_images_row.addStretch(1)
@@ -1979,6 +2182,11 @@ class MusicVaultWindow(QMainWindow):
             "play", "Play or pause", size=24, variant="play", parent=bar
         )
         self.play_btn.setObjectName("PlayButton")
+        self.play_btn.setToolTip("Play or pause (Space)")
+        self.play_btn.setAccessibleDescription(
+            "Play or pause the current track. Keyboard shortcut: Space."
+        )
+        self.play_btn.setProperty("accessibleShortcut", "Space")
         self.play_btn.setIcon(
             ui_icon(
                 "play",
@@ -2539,7 +2747,13 @@ class MusicVaultWindow(QMainWindow):
         return f"{count} track" if int(count) == 1 else f"{count} tracks"
 
     def _album_media_item(self, summary: AlbumSummary) -> MediaItem:
-        details = [summary.album_artist]
+        details = []
+        if summary.edition_count > 1:
+            # Canonical grouping is the card's most useful new evidence. Keep
+            # it ahead of lower-priority year/track details so compact cards do
+            # not elide the edition count.
+            details.append(f"{summary.edition_count} editions")
+        details.append(summary.album_artist)
         if summary.canonical_year:
             details.append(summary.canonical_year)
         details.append(self._track_count_text(summary.track_count))
@@ -2561,6 +2775,11 @@ class MusicVaultWindow(QMainWindow):
             details.append(f"{summary.featured_track_count} featured")
         if summary.collaboration_track_count:
             details.append(f"{summary.collaboration_track_count} collaboration")
+        if summary.group_appearance_track_count:
+            details.append(
+                f"{summary.group_appearance_track_count} group appearance"
+                + ("s" if summary.group_appearance_track_count != 1 else "")
+            )
         return MediaItem(
             key=summary.browser_key,
             kind=MediaKind.ARTIST,
@@ -2676,6 +2895,7 @@ class MusicVaultWindow(QMainWindow):
                             ui_icon("refresh", 18),
                             "Refresh Artist Photo",
                         )
+                        refresh_action.setEnabled(self._provider_work_allowed())
                         refresh_action.triggered.connect(
                             lambda: self.refresh_artist_photo(browser_key)
                         )
@@ -2726,7 +2946,17 @@ class MusicVaultWindow(QMainWindow):
 
         if kind != "artists":
             return
-        network_enabled = self.config.get("artist_image_fetch_enabled") is True
+        network_enabled = bool(
+            self.config.get("artist_image_fetch_enabled") is True
+            and self._provider_work_allowed()
+        )
+        normalized_artist_counts: dict[str, int] = {}
+        if not self._provider_work_allowed():
+            for candidate in self._browser_summary_maps["artists"].values():
+                normalized = candidate.key.normalized_name
+                normalized_artist_counts[normalized] = (
+                    normalized_artist_counts.get(normalized, 0) + 1
+                )
         for browser_key in browser_keys:
             item = self.artist_browser_model.item_for_key(browser_key)
             summary = self._browser_summary_maps["artists"].get(browser_key)
@@ -2738,6 +2968,31 @@ class MusicVaultWindow(QMainWindow):
                 or browser_key in self._pending_artist_image_keys
             ):
                 continue
+            identity = self.artist_image_identity(summary)
+            cached = self.artist_image_cache.lookup(
+                identity,
+                repair=self._provider_work_allowed(),
+            )
+            if (
+                cached is None
+                and not self._provider_work_allowed()
+                and (identity.discogs_artist_id or identity.musicbrainz_artist_id)
+                and normalized_artist_counts.get(summary.key.normalized_name) == 1
+            ):
+                # A migration-startup process cannot rewrite legacy name-keyed
+                # cache entries. It may still display one when the canonical
+                # browser proves that normalized identity is unambiguous.
+                cached = self.artist_image_cache.lookup(
+                    ArtistIdentity.from_display_name(summary.display_name),
+                    repair=False,
+                )
+            if cached is not None and cached.status is ArtistImageStatus.RESOLVED:
+                self._artist_image_result(browser_key, cached)
+                continue
+            if not network_enabled:
+                # A quiescent launch may display valid cache entries, but a
+                # miss must not queue work or mutate negative-cache state.
+                continue
             self._pending_artist_image_keys.add(browser_key)
             if network_enabled:
                 self.artist_browser_model.replace_item(
@@ -2745,10 +3000,93 @@ class MusicVaultWindow(QMainWindow):
                     image_state=MediaImageState.LOADING,
                 )
             self.artist_image_service.request(
-                item.title,
+                identity,
                 lambda result, key=browser_key: self._artist_image_result(key, result),
                 network_enabled=network_enabled,
             )
+
+    @staticmethod
+    def artist_image_identity(summary: ArtistSummary) -> ArtistIdentity:
+        return ArtistIdentity.from_display_name(
+            summary.image_identity_name or summary.display_name,
+            discogs_artist_id=summary.discogs_artist_id,
+            musicbrainz_artist_id=summary.musicbrainz_artist_id,
+            canonical_artist_id=summary.canonical_artist_id,
+            historical_aliases=summary.historical_aliases,
+            allow_normalized_name_cache=summary.allow_normalized_name_cache,
+            allow_historical_alias_cache=summary.allow_historical_alias_cache,
+        )
+
+    def _rekey_consolidated_artist_portraits(self) -> int:
+        """Move unambiguous legacy portrait entries to canonical identities."""
+
+        try:
+            rows = self.db.conn.execute(
+                """
+                WITH unambiguous_aliases AS (
+                    SELECT normalized_alias
+                    FROM artist_aliases
+                    WHERE alias_kind IN (
+                        'display_variant',
+                        'corrected_version_suffix',
+                        'legacy_credit_string'
+                    )
+                    GROUP BY normalized_alias
+                    HAVING COUNT(DISTINCT artist_id)=1
+                )
+                SELECT alias.alias_name, artist.id AS artist_id, artist.display_name,
+                       artist.discogs_artist_id, artist.musicbrainz_artist_id
+                FROM artist_aliases alias
+                JOIN unambiguous_aliases safe
+                  ON safe.normalized_alias=alias.normalized_alias
+                JOIN artists artist ON artist.id=alias.artist_id
+                WHERE alias.alias_kind IN (
+                    'display_variant',
+                    'corrected_version_suffix',
+                    'legacy_credit_string'
+                )
+                ORDER BY alias.id
+                """
+            ).fetchall()
+        except Exception:
+            # Portrait migration is cache-only polish and must never prevent
+            # application startup or database migration.
+            return 0
+
+        moved = 0
+        for row in rows:
+            new_identity = ArtistIdentity.from_display_name(
+                row["display_name"],
+                discogs_artist_id=row["discogs_artist_id"],
+                musicbrainz_artist_id=row["musicbrainz_artist_id"],
+                canonical_artist_id=row["artist_id"],
+                historical_aliases=(row["alias_name"],),
+                allow_historical_alias_cache=True,
+            )
+            old_identities = []
+            if row["discogs_artist_id"]:
+                old_identities.append(
+                    ArtistIdentity.from_display_name(
+                        row["alias_name"],
+                        discogs_artist_id=row["discogs_artist_id"],
+                    )
+                )
+            if row["musicbrainz_artist_id"]:
+                old_identities.append(
+                    ArtistIdentity.from_display_name(
+                        row["alias_name"],
+                        musicbrainz_artist_id=row["musicbrainz_artist_id"],
+                    )
+                )
+            old_identities.append(
+                ArtistIdentity.from_display_name(row["alias_name"])
+            )
+            preserved = any(
+                self.artist_image_cache.rekey(identity, new_identity)
+                for identity in old_identities
+            )
+            moved += int(preserved)
+        return moved
 
     def _artist_image_result(
         self,
@@ -2797,6 +3135,9 @@ class MusicVaultWindow(QMainWindow):
         )
 
     def refresh_artist_photo(self, browser_key: str) -> None:
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
         if self.config.get("artist_image_fetch_enabled") is not True:
             return
         summary = self._browser_summary_maps["artists"].get(browser_key)
@@ -2814,10 +3155,63 @@ class MusicVaultWindow(QMainWindow):
             image_state=MediaImageState.LOADING,
         )
         self.artist_image_service.request(
-            item.title,
+            self.artist_image_identity(summary),
             lambda result, key=browser_key: self._artist_image_result(key, result),
             force=True,
             network_enabled=True,
+        )
+
+    def refresh_missing_artist_photos(self) -> None:
+        """Queue canonical artists without a valid portrait after explicit opt-in."""
+
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
+        if self.config.get("artist_image_fetch_enabled") is not True:
+            self.confirm_enable_artist_photos()
+        if self.config.get("artist_image_fetch_enabled") is not True:
+            return
+
+        try:
+            summaries = load_artist_summaries(
+                Path(getattr(self.db, "db_path", database_path()))
+            )
+        except Exception:
+            self.statusBar().showMessage(
+                "Artist-photo refresh could not load the canonical artist list.",
+                8000,
+            )
+            return
+
+        queued = 0
+        for summary in summaries:
+            identity = self.artist_image_identity(summary)
+            cached = self.artist_image_cache.lookup(identity)
+            if cached is not None and cached.status is ArtistImageStatus.RESOLVED:
+                continue
+            browser_key = summary.browser_key
+            if browser_key in self._pending_artist_image_keys:
+                continue
+            self._pending_artist_image_keys.add(browser_key)
+            queued += int(
+                self.artist_image_service.request(
+                    identity,
+                    lambda result, key=browser_key: self._artist_image_result(
+                        key, result
+                    ),
+                    force=True,
+                    network_enabled=True,
+                )
+            )
+
+        self.statusBar().showMessage(
+            (
+                f"Queued {queued} missing canonical artist photo"
+                + ("s" if queued != 1 else "")
+                if queued
+                else "No missing canonical artist photos needed refresh."
+            ),
+            8000,
         )
 
     def clear_cached_artist_photo(self, browser_key: str) -> None:
@@ -2828,7 +3222,7 @@ class MusicVaultWindow(QMainWindow):
         if item.artwork_path:
             self.thumbnail_cache.invalidate_source(item.artwork_path)
         self.artist_image_service.clear_cache(
-            ArtistIdentity.from_display_name(summary.display_name)
+            self.artist_image_identity(summary)
         )
         self._pending_artist_image_keys.clear()
         self._reset_abandoned_artist_image_states()
@@ -2905,11 +3299,15 @@ class MusicVaultWindow(QMainWindow):
                 selector.addItem("Featured On", "featured_on")
             if sections.collaborations:
                 selector.addItem("Collaborations", "collaborations")
+            if sections.group_appearances:
+                selector.addItem("Group Appearances", "group_appearances")
             default_index = 0
             if not sections.tracks and sections.featured_on:
                 default_index = selector.findData("featured_on")
             elif not sections.tracks and sections.collaborations:
                 default_index = selector.findData("collaborations")
+            elif not sections.tracks and sections.group_appearances:
+                default_index = selector.findData("group_appearances")
             selector.setCurrentIndex(max(0, default_index))
         finally:
             selector.blockSignals(previous)
@@ -3175,6 +3573,9 @@ class MusicVaultWindow(QMainWindow):
 
 
     def sync_youtube_playlist(self) -> None:
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
         controller = getattr(self, "sync_center_controller", None)
         if controller is not None and controller._batch_running():
             QMessageBox.information(
@@ -3584,6 +3985,26 @@ class MusicVaultWindow(QMainWindow):
             self.play_selected()
         else:
             self.player.play()
+
+    def toggle_loaded_playback_from_global_shortcut(self) -> bool:
+        """Toggle the existing player only when it already has a source."""
+
+        source = self.player.source()
+        if source is None or source.isEmpty():
+            return False
+        self.toggle_play()
+        return True
+
+    def on_global_play_pause_shortcut(self) -> bool:
+        """Handle guarded application-wide Space without stealing control input."""
+
+        if not should_handle_global_play_pause(
+            QApplication.focusWidget(),
+            active_modal_widget=QApplication.activeModalWidget(),
+            party_mode_active=bool(getattr(self, "party_mode_active", False)),
+        ):
+            return False
+        return self.toggle_loaded_playback_from_global_shortcut()
 
 
 
@@ -4404,14 +4825,22 @@ class MusicVaultWindow(QMainWindow):
         QTimer.singleShot(15000, setup_bar.hide)
 
     def confirm_enable_artist_photos(self) -> None:
+        if not self._provider_work_allowed():
+            if hasattr(self, "settings_artist_images_enabled"):
+                self.settings_artist_images_enabled.setChecked(
+                    self.config.get("artist_image_fetch_enabled") is True
+                )
+            self._show_provider_deferred()
+            return
         if self.config.get("artist_image_fetch_enabled") is True:
             return
         answer = QMessageBox.question(
             self,
             "Enable Artist Photos?",
             "When enabled, Music Vault sends visible artist names to public "
-            "MusicBrainz and Wikimedia/Wikipedia services and caches image "
-            "results locally. No API key is used. Continue?",
+            "MusicBrainz and Wikimedia/Wikipedia services and, when your personal "
+            "Discogs token is configured, to Discogs. Results are validated and "
+            "cached locally. Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4430,6 +4859,12 @@ class MusicVaultWindow(QMainWindow):
             self.load_visible_browser_images(self.browser_view.visible_item_keys())
 
     def on_artist_image_setting_clicked(self, checked: bool) -> None:
+        if not self._provider_work_allowed():
+            self.settings_artist_images_enabled.setChecked(
+                self.config.get("artist_image_fetch_enabled") is True
+            )
+            self._show_provider_deferred()
+            return
         if checked:
             self.confirm_enable_artist_photos()
             return
@@ -4505,6 +4940,12 @@ class MusicVaultWindow(QMainWindow):
             return
         try:
             stats = self.artist_image_cache.statistics()
+            policy = self._current_runtime_policy()
+            deferred_line = (
+                f"\nProvider Work: Deferred ({policy.defer_reason})"
+                if policy.startup_provider_work_deferred
+                else ""
+            )
             self.artist_images_status.setText(
                 "Artist Photo Fetching: "
                 + (
@@ -4515,6 +4956,7 @@ class MusicVaultWindow(QMainWindow):
                 + f"\nCached Results: {stats['entry_count']}"
                 + f"\nCached Images: {stats['file_count']} "
                 + f"({self._format_cache_bytes(stats['total_bytes'])})"
+                + deferred_line
                 + f"\nCache Folder: {artist_images_dir()}"
             )
         except Exception:
@@ -4523,6 +4965,17 @@ class MusicVaultWindow(QMainWindow):
             )
 
     def on_lyrics_online_setting_clicked(self, checked: bool) -> None:
+        if checked and not self._provider_work_allowed():
+            if hasattr(self, "settings_lyrics_online"):
+                self.settings_lyrics_online.setChecked(
+                    bool(
+                        normalize_lyrics_settings(self.config)[
+                            "lyrics_online_lookup_enabled"
+                        ]
+                    )
+                )
+            self._show_provider_deferred()
+            return
         enabled = bool(checked)
         consent_version = int(
             normalize_lyrics_settings(self.config)["lyrics_lookup_consent_version"]
@@ -4615,6 +5068,9 @@ class MusicVaultWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl(DISCOGS_TOKEN_SETUP_URL))
 
     def save_discogs_token(self) -> None:
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
         try:
             self.discogs_token_store.save(self.settings_discogs_token.text())
         except (OSError, ValueError) as exc:
@@ -4630,6 +5086,9 @@ class MusicVaultWindow(QMainWindow):
         )
 
     def remove_discogs_token(self) -> None:
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
         try:
             removed = self.discogs_token_store.remove()
         except OSError:
@@ -4650,6 +5109,9 @@ class MusicVaultWindow(QMainWindow):
         )
 
     def test_discogs_connection(self) -> None:
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
         token = self.discogs_token_store.read()
         if not token:
             QMessageBox.information(
@@ -4668,19 +5130,24 @@ class MusicVaultWindow(QMainWindow):
         def request(cancel_event):
             from music_vault.metadata.providers.discogs import DiscogsProvider
 
+            record_provider_factory_invocation()
             provider = DiscogsProvider(token=token)
             return provider.test_connection(cancel_event=cancel_event)
 
+        record_provider_task_dispatch()
         self.metadata_intelligence_tasks.submit("discogs_connection", request)
 
     def wake_metadata_intelligence(self) -> None:
-        if os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1":
+        if not MusicVaultWindow._current_runtime_policy(
+            self
+        ).background_provider_work_allowed:
             return
         settings = normalize_metadata_intelligence_settings(self.config)
         if not settings["metadata_intelligence_enabled"]:
             return
         if self.metadata_intelligence_tasks.pending_count:
             return
+        record_provider_task_dispatch()
         self.metadata_intelligence_tasks.submit(
             "metadata_automatic_imports",
             lambda cancel: self.metadata_intelligence_service.process_automatic_queue(
@@ -4746,6 +5213,9 @@ class MusicVaultWindow(QMainWindow):
         self.config["metadata_discogs_consent_version"] = DISCOGS_CONSENT_VERSION
 
     def start_existing_library_intelligence(self) -> None:
+        if not self._provider_work_allowed():
+            self._show_provider_deferred()
+            return
         settings = normalize_metadata_intelligence_settings(self.config)
         if not settings["metadata_intelligence_enabled"]:
             QMessageBox.information(
@@ -4777,6 +5247,7 @@ class MusicVaultWindow(QMainWindow):
         def analyze(cancel_event):
             return service.analyze_existing_library(cancel_event=cancel_event)
 
+        record_provider_task_dispatch()
         self.metadata_intelligence_tasks.submit("metadata_existing_library", analyze)
         self.refresh_metadata_intelligence_status()
 
@@ -4794,6 +5265,11 @@ class MusicVaultWindow(QMainWindow):
         dialog.exec()
 
     def resume_metadata_intelligence_job(self, job_id: str, job_kind: str) -> None:
+        if not MusicVaultWindow._current_runtime_policy(
+            self
+        ).background_provider_work_allowed:
+            self._show_provider_deferred()
+            return
         if self.metadata_intelligence_tasks.pending_count:
             return
         persisted_id = str(job_id)
@@ -4812,6 +5288,7 @@ class MusicVaultWindow(QMainWindow):
             )
         else:
             return
+        record_provider_task_dispatch()
         self.metadata_intelligence_tasks.submit(task_kind, work)
 
     def on_metadata_review_applied(self, track_id: int) -> None:
@@ -4830,6 +5307,12 @@ class MusicVaultWindow(QMainWindow):
 
     def save_settings_from_ui(self) -> None:
         data_dir().mkdir(parents=True, exist_ok=True)
+
+        runtime_policy = self._current_runtime_policy()
+        provider_settings_deferred = runtime_policy.startup_provider_work_deferred
+        persisted_intelligence_settings = normalize_metadata_intelligence_settings(
+            self.config
+        )
 
         api_key = self.settings_api_key.text().strip()
 
@@ -4855,10 +5338,11 @@ class MusicVaultWindow(QMainWindow):
             self.config.pop("ffmpeg_location", None)
         if ffmpeg_location != previous_ffmpeg_location:
             self.invalidate_ffmpeg_discovery()
-        self.config["artist_image_fetch_enabled"] = bool(
-            self.settings_artist_images_enabled.isChecked()
-            and self.config.get("artist_image_fetch_enabled") is True
-        )
+        if not provider_settings_deferred:
+            self.config["artist_image_fetch_enabled"] = bool(
+                self.settings_artist_images_enabled.isChecked()
+                and self.config.get("artist_image_fetch_enabled") is True
+            )
         party_settings = normalize_party_mode_settings(
             {
                 "party_mode_config_version": self.config.get(
@@ -4914,13 +5398,23 @@ class MusicVaultWindow(QMainWindow):
         ):
             intelligence_enabled = False
             self.settings_metadata_intelligence.setChecked(False)
-        discogs_enabled = bool(
-            intelligence_enabled
-            and self.settings_metadata_discogs.isChecked()
-            and self.discogs_token_store.configured()
-            and int(self.config.get("metadata_discogs_consent_version") or 0)
-            >= DISCOGS_CONSENT_VERSION
-        )
+        if provider_settings_deferred:
+            # A quiescent migration/acceptance launch cannot inspect provider
+            # readiness safely. Preserve the user's existing opt-ins instead
+            # of interpreting unavailable credentials or transports as an
+            # intentional request to disable them.
+            discogs_enabled = persisted_intelligence_settings[
+                "metadata_discogs_enabled"
+            ]
+        else:
+            discogs_enabled = bool(
+                intelligence_enabled
+                and self.settings_metadata_discogs.isChecked()
+                and runtime_policy.secrets_allowed
+                and self.discogs_token_store.configured()
+                and int(self.config.get("metadata_discogs_consent_version") or 0)
+                >= DISCOGS_CONSENT_VERSION
+            )
         writeback_enabled = bool(
             intelligence_enabled and self.settings_metadata_writeback.isChecked()
         )
@@ -4944,8 +5438,15 @@ class MusicVaultWindow(QMainWindow):
                     intelligence_enabled and self.settings_metadata_musicbrainz.isChecked()
                 ),
                 "metadata_writeback_enabled": writeback_enabled,
-                "metadata_fill_missing_artwork_enabled": bool(
-                    discogs_enabled and self.settings_metadata_artwork.isChecked()
+                "metadata_fill_missing_artwork_enabled": (
+                    persisted_intelligence_settings[
+                        "metadata_fill_missing_artwork_enabled"
+                    ]
+                    if provider_settings_deferred
+                    else bool(
+                        discogs_enabled
+                        and self.settings_metadata_artwork.isChecked()
+                    )
                 ),
                 "metadata_scan_existing_after_setup": bool(
                     intelligence_enabled
@@ -4962,7 +5463,9 @@ class MusicVaultWindow(QMainWindow):
 
         if self.party_mode_window is not None:
             self.party_mode_window.apply_settings(
-                {**party_settings, **lyrics_settings}
+                self._runtime_lyrics_settings(
+                    {**party_settings, **lyrics_settings}
+                )
             )
 
         if hasattr(self, "youtube_output"):
@@ -4972,10 +5475,11 @@ class MusicVaultWindow(QMainWindow):
         self.write_app_status()
 
         QMessageBox.information(self, "Settings saved", "Music Vault settings were saved.")
-        if intelligence_settings["metadata_scan_existing_after_setup"]:
-            QTimer.singleShot(0, self.start_existing_library_intelligence)
-        else:
-            QTimer.singleShot(0, self.wake_metadata_intelligence)
+        if self._provider_work_allowed():
+            if intelligence_settings["metadata_scan_existing_after_setup"]:
+                QTimer.singleShot(0, self.start_existing_library_intelligence)
+            else:
+                QTimer.singleShot(0, self.wake_metadata_intelligence)
 
     def open_data_folder(self) -> None:
         folder = data_dir()
@@ -5029,12 +5533,20 @@ class MusicVaultWindow(QMainWindow):
     def refresh_metadata_intelligence_status(self) -> None:
         if not hasattr(self, "discogs_provider_status"):
             return
-        token_ready = self.discogs_token_store.configured()
+        policy = self._current_runtime_policy()
         settings = normalize_metadata_intelligence_settings(self.config)
-        self.discogs_provider_status.setText(
-            "Discogs: Token configured" if token_ready else "Discogs: Personal token missing"
-        )
-        total = analyzed = applied = review = 0
+        if policy.startup_provider_work_deferred:
+            self.discogs_provider_status.setText(
+                "Providers: Deferred until an allowed launch"
+            )
+        else:
+            token_ready = self.discogs_token_store.stored()
+            self.discogs_provider_status.setText(
+                "Discogs: Token configured"
+                if token_ready
+                else "Discogs: Personal token missing"
+            )
+        total = analyzed = accepted = pending = 0
         job_status = "not started"
         try:
             columns = {
@@ -5048,13 +5560,19 @@ class MusicVaultWindow(QMainWindow):
                 f"""
                 SELECT COUNT(*),
                        SUM(CASE WHEN {state_column} NOT IN ('created', 'queued', 'pending') THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN {state_column} IN ('applied', 'complete') THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN {state_column} IN ('needs_review', 'review', 'ambiguous') THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN {state_column} IN (
+                           'applied', 'complete', 'applied_with_gaps', 'source_fallback'
+                       ) THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN {state_column} IN (
+                           'created', 'queued', 'pending', 'analyzing', 'ready', 'review'
+                       ) THEN 1 ELSE 0 END)
                 FROM metadata_intelligence_items
                 """
             ).fetchone()
             if counts is not None:
-                total, analyzed, applied, review = (int(value or 0) for value in counts)
+                total, analyzed, accepted, pending = (
+                    int(value or 0) for value in counts
+                )
             job = self.db.conn.execute(
                 "SELECT status FROM metadata_intelligence_jobs "
                 "ORDER BY created_at DESC, id DESC LIMIT 1"
@@ -5066,8 +5584,8 @@ class MusicVaultWindow(QMainWindow):
         self.metadata_intelligence_status.setText(
             f"Automatic Intelligence: {'Enabled' if settings['metadata_intelligence_enabled'] else 'Disabled'}\n"
             f"Current Job: {job_status.title()}\n"
-            f"Total: {total}  •  Analyzed: {analyzed}  •  Applied: {applied}  •  "
-            f"Review Queue Count: {review}"
+            f"Total: {total}  •  Analyzed: {analyzed}  •  "
+            f"Accepted Outcomes: {accepted}  •  Pending: {pending}"
         )
 
 
@@ -5187,6 +5705,10 @@ class MusicVaultWindow(QMainWindow):
                 )
             finally:
                 self.settings_artist_images_enabled.blockSignals(previous)
+        if hasattr(self, "refresh_missing_artist_images_btn"):
+            self.refresh_missing_artist_images_btn.setEnabled(
+                self._provider_work_allowed()
+            )
         intelligence_settings = normalize_metadata_intelligence_settings(self.config)
         intelligence_checks = (
             ("settings_metadata_intelligence", "metadata_intelligence_enabled"),
@@ -5434,16 +5956,23 @@ def prepare_first_run(_app: QApplication) -> tuple[bool, OnboardingResult | None
 
 
 def main() -> None:
-    app = QApplication(sys.argv)
-    proceed, onboarding_result = prepare_first_run(app)
-    if not proceed:
-        return
-    window = MusicVaultWindow()
-    if onboarding_result is not None:
-        window.apply_onboarding_result(onboarding_result)
-    window.show()
-    schedule_ui_review(window, app)
-    sys.exit(app.exec())
+    acceptance_network = (
+        _BOOTSTRAP_ACCEPTANCE_NETWORK_GUARD or install_acceptance_network_guard()
+    )
+    try:
+        app = QApplication(sys.argv)
+        proceed, onboarding_result = prepare_first_run(app)
+        if not proceed:
+            return
+        window = MusicVaultWindow()
+        if onboarding_result is not None:
+            window.apply_onboarding_result(onboarding_result)
+        window.show()
+        schedule_ui_review(window, app)
+        sys.exit(app.exec())
+    finally:
+        if acceptance_network is not None:
+            acceptance_network.finalize()
 
 
 if __name__ == "__main__":

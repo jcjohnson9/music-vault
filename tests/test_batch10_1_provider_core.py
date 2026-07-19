@@ -341,18 +341,18 @@ def test_provider_query_album_hint_affects_search_and_scoring():
     assert session.calls[0][1]["params"]["release_title"] == "Synthetic Sunrise"
 
 
-def test_discogs_master_original_year_prevents_late_reissue_year():
+def test_discogs_master_original_year_preserves_late_reissue_edition_date():
     candidate = parse_discogs_release(
         release_payload(released="2022-04-01"),
         ProviderQuery("Signal Fire", artist="Example Duo"),
         master_payload={"year": 1984},
     )
     assert candidate is not None
-    assert candidate.release_date == "1984"
+    assert candidate.release_date == "2022-04-01"
     assert candidate.original_release_date == "1984"
 
 
-def test_compilation_not_blindly_preferred_and_ambiguous_album_is_withheld():
+def test_compilation_not_blindly_preferred_but_keeps_catalogue_album():
     normal = parse_discogs_release(
         release_payload(release_id=101, release_title="Original Context"),
         ProviderQuery("Signal Fire", artist="Example Duo"),
@@ -367,12 +367,148 @@ def test_compilation_not_blindly_preferred_and_ambiguous_album_is_withheld():
     )
     assert normal and compilation
     assert rank_discogs_candidates([compilation, normal])[0].release_id == "101"
-    assert compilation.album is None
+    assert compilation.album == "Synthetic Collection"
 
     other = replace(normal, release_id="103", album="Other Context", provider_order=2)
     ambiguous = rank_discogs_candidates([normal, other])[0]
-    assert ambiguous.album is None
+    assert ambiguous.album == "Original Context"
     assert "release_ambiguous" in ambiguous.reasons
+
+
+def test_various_artists_compilation_soundtrack_keeps_album_and_query_performer():
+    payload = release_payload(
+        release_title="Synthetic Game Original Soundtrack",
+        artist="Various Artists",
+        formats=[{"name": "CD", "descriptions": ["Compilation"]}],
+    )
+    payload["tracklist"][0].pop("artists")
+
+    candidate = parse_discogs_release(
+        payload,
+        ProviderQuery("Signal Fire", artist="Synthetic Composer"),
+    )
+
+    assert candidate is not None
+    assert candidate.album == "Synthetic Game Original Soundtrack"
+    assert candidate.album_artist == "Various Artists"
+    assert candidate.artist == "Synthetic Composer"
+    assert candidate.artist_credits == ()
+    assert candidate.version_type == "soundtrack"
+    assert candidate.field_scores["album"] >= 60
+
+
+def test_track_level_various_artists_credit_is_excluded_from_candidate_credits():
+    payload = release_payload()
+    payload["tracklist"][0]["artists"] = [
+        {"id": 999, "name": "Various Artists", "join": ""}
+    ]
+
+    candidate = parse_discogs_release(
+        payload,
+        ProviderQuery("Signal Fire", artist="Example Duo"),
+    )
+
+    assert candidate is not None
+    assert candidate.artist == "Example Duo"
+    assert [credit.name for credit in candidate.artist_credits] == ["Example Duo"]
+    assert all(
+        credit.name.casefold() != "various artists"
+        for credit in candidate.artist_credits
+    )
+
+
+def test_soundtrack_query_context_keeps_markerless_provider_release_coherent():
+    payload = release_payload(
+        release_title="Synthetic Film Music",
+        artist="Various Artists",
+        formats=[{"name": "CD", "descriptions": ["Compilation"]}],
+    )
+    payload["tracklist"][0].pop("artists")
+
+    candidate = parse_discogs_release(
+        payload,
+        ProviderQuery(
+            "Signal Fire",
+            artist="Synthetic Composer",
+            version_type="soundtrack",
+        ),
+    )
+
+    assert candidate is not None
+    assert candidate.album == "Synthetic Film Music"
+    assert candidate.album_artist == "Various Artists"
+    assert candidate.artist == "Synthetic Composer"
+    assert candidate.version_type == "soundtrack"
+    assert "version_conflict" not in candidate.reasons
+    assert candidate.field_scores["album"] >= 60
+
+
+def test_coherent_various_artists_soundtrack_ranks_over_ordinary_release():
+    ordinary = provider_candidate(
+        release_id="102",
+        master_id="202",
+        album="Later Ordinary Collection",
+        release_date="1992",
+        original_release_date="1992",
+        provider_score=99.0,
+    )
+    soundtrack = provider_candidate(
+        release_id="101",
+        master_id="201",
+        album="Synthetic Film Music",
+        album_artist="Various Artists",
+        release_date="1984",
+        original_release_date="1984",
+        version_type="soundtrack",
+        is_compilation=True,
+        provider_score=96.0,
+        provider_order=1,
+    )
+
+    assert rank_discogs_candidates([ordinary, soundtrack])[0].release_id == "101"
+
+
+def test_release_ambiguity_withholds_different_work_identity_but_keeps_pressing_family():
+    identity_scores = {
+        "album": 96.0,
+        "release_date": 96.0,
+        "original_release_date": 96.0,
+        "discogs_release_id": 96.0,
+        "discogs_master_id": 96.0,
+        "discogs_track_position": 96.0,
+        "provider_release_family_id": 96.0,
+    }
+    leader = provider_candidate(field_scores=identity_scores)
+    different_work = provider_candidate(
+        release_id="102",
+        master_id="202",
+        album="Different Work",
+        provider_score=95.0,
+        provider_order=1,
+        field_scores=identity_scores,
+    )
+
+    ambiguous = rank_discogs_candidates([leader, different_work])[0]
+
+    assert "release_ambiguity_different_work" in ambiguous.reasons
+    assert all(
+        ambiguous.field_scores[field_name] == 0.0
+        for field_name in (
+            "album",
+            "release_date",
+            "original_release_date",
+            "discogs_release_id",
+            "discogs_master_id",
+            "discogs_track_position",
+            "provider_release_family_id",
+        )
+    )
+
+    same_master_pressing = replace(different_work, master_id=leader.master_id)
+    same_family = rank_discogs_candidates([leader, same_master_pressing])[0]
+
+    assert "release_ambiguity_same_family" in same_family.reasons
+    assert same_family.field_scores == identity_scores
 
 
 def test_normalized_candidate_persists_ids_not_raw_response():
@@ -546,15 +682,16 @@ def test_ensemble_discogs_authority_agreement_disagreement_and_mb_fallback():
         discogs_candidates=[provider_candidate(provider_score=94)],
         musicbrainz_candidates=[mb_conflict],
     )
-    assert conflict.field("artist").action is FieldAction.REVIEW
-    assert conflict.field("artist").conflict
+    assert conflict.field("artist").action is FieldAction.APPLY
+    assert conflict.field("artist").source == "discogs"
+    assert not conflict.field("artist").conflict
 
     mb_strong = SimpleNamespace(title="Signal Fire", artist="Secondary Artist", provider_score=96)
     weak_discogs = provider_candidate(artist="Weak Artist", provider_score=75)
     fallback = build_metadata_ensemble(
         current={}, discogs_candidates=[weak_discogs], musicbrainz_candidates=[mb_strong]
     )
-    assert fallback.field("artist").source == "musicbrainz"
+    assert fallback.field("artist").source == "discogs"
 
     mb_only = build_metadata_ensemble(current={}, musicbrainz_candidates=[mb_strong])
     assert mb_only.field("artist").source == "musicbrainz"
@@ -571,12 +708,13 @@ def test_ensemble_embedded_parsed_exclusive_and_uploader_are_ordered_fallbacks()
         current={}, parsed_title=parsed, youtube_exclusive=True, uploader="Random Channel"
     )
     assert exclusive.field("artist").source == "youtube_title_parsed"
-    assert exclusive.field("artist").safe_to_apply
+    assert exclusive.field("artist").action is FieldAction.APPLY
+    assert not exclusive.field("artist").safe_to_apply
     assert "youtube_exclusive_fallback" in exclusive.reasons
 
     uploader = build_metadata_ensemble(current={}, uploader="Random Channel")
     assert uploader.field("artist").source == "youtube_uploader_fallback"
-    assert uploader.field("artist").action is FieldAction.REVIEW
+    assert uploader.field("artist").action is FieldAction.KEEP
 
 
 def test_ensemble_version_conflict_and_unofficial_live_withhold_release_context():
@@ -589,8 +727,10 @@ def test_ensemble_version_conflict_and_unofficial_live_withhold_release_context(
     )
     assert result.field("release_date").value is None
     assert result.field("album").value is None
-    assert result.field("original_release_date").value == "1984"
-    assert result.field("title").action is FieldAction.REVIEW
+    assert result.field("original_release_date").value is None
+    assert result.field("title").action is FieldAction.APPLY
+    assert result.field("version_type").value == "live"
+    assert result.field("version_type").source == "youtube_title_parsed"
     assert "version_identity_conflict" in result.reasons
 
 

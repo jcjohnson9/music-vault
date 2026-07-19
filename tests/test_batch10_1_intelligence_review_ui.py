@@ -137,7 +137,6 @@ def test_review_filters_cover_states_and_every_ambiguity_reason(
     expected_counts = {
         None: 10,
         "applied": 1,
-        "needs_review": 7,
         "provider_disagreement": 1,
         "version_conflict": 1,
         "album_ambiguity": 1,
@@ -162,12 +161,7 @@ def test_review_filters_cover_states_and_every_ambiguity_reason(
         }:
             assert dialog.table.item(0, 11).text() == filter_value
 
-    dialog.filter_combo.setCurrentIndex(
-        dialog.filter_combo.findData("needs_review")
-    )
-    assert {
-        dialog.table.item(row, 0).text() for row in range(dialog.table.rowCount())
-    } == {"Review", "Ready"}
+    assert dialog.filter_combo.findData("needs_review") == -1
 
 
 def test_normalized_proposal_renders_provider_facts_without_raw_json(

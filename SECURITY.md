@@ -42,6 +42,32 @@ remote removals. Failed or partial enumeration preserves the last known-good
 snapshot. Remote removal, source archive/detachment, and destination changes
 cannot delete media or rewrite metadata, artwork, lyrics, or histories.
 
+## Migration-startup and acceptance quiescence
+
+Database startup records, in process-local memory, whether that database
+instance initialized a new library or actually upgraded an existing schema.
+An old migration backup does not imply that a later launch migrated. When an
+upgrade did occur, Music Vault defers optional metadata-intelligence,
+artist-photo, online-lyrics, synchronization-provider, and other external work
+for the remainder of that process. The next ordinary non-migration launch can
+resume enabled provider behavior; no provider setting or queued job is changed
+merely because work was deferred.
+
+The centralized runtime policy also interprets the acceptance-only
+`MUSIC_VAULT_ACCEPTANCE_NO_SECRETS=1` and
+`MUSIC_VAULT_ACCEPTANCE_NO_NETWORK=1` controls. No-secret mode returns an
+unavailable readiness state before opening the YouTube API-key or Discogs-token
+file. No-network mode rejects optional provider construction before creating a
+transport session. Provider activation is lazy, so ordinary application
+construction alone does not read the Discogs token or create an external
+client. Existing valid cached portraits may still render read-only; a blocked
+cache miss does not create a negative-cache entry.
+
+App Status exposes only `provider_work_deferred` and the stable aggregate
+reason `migration_startup`, `acceptance_no_network`, or
+`acceptance_no_secrets`. It does not expose a credential path or value,
+provider query, artist/album identity, source URL, or item-level result.
+
 ## Portable release integrity
 
 Obtain the portable ZIP from the project's GitHub Release and compare its
@@ -164,6 +190,20 @@ automatically and are rejected by Git/history and release publication checks.
 Textual catalogue metadata is treated separately from restricted image
 content. See [Discogs Metadata](docs/DISCOGS_METADATA.md).
 
+Schema-v7 canonical album/artist rows, aliases, verified relationships,
+edition memberships, review proposals/reasons, and consolidation diagnostics
+are equally private. Publication and history gates reject databases, reports,
+provider images, screenshots, and item-level evidence. App Status may expose
+aggregate album/artist/conflict/outcome counts only; it must not expose names,
+titles, provider IDs, paths, URLs, or proposals.
+
+Migration and consolidation run without constructing provider clients. They
+must preserve tracks, media paths, source/playlist membership, `cover_path`,
+locks, observations, and history; they never rewrite media tags. Representative
+album covers are browser-only. Conflicting same-name artists remain separate,
+and punctuation, labels, uploaders, or `Various Artists` context cannot by
+themselves create or merge performer identities.
+
 ## Optional artist-image requests
 
 Artist-photo lookup is disabled by default and requires explicit user opt-in.
@@ -171,6 +211,12 @@ It uses no provider API key and never copies or transmits the YouTube API key.
 When enabled, artist names may be sent to public MusicBrainz services and a
 high-confidence match may lead to Wikidata, English Wikipedia, Wikimedia
 Commons, or Wikimedia image requests.
+
+For a missing canonical portrait, an explicitly enabled Discogs provider may
+first supply one high-confidence artist image. An invalid or unavailable image
+falls through to the existing strict Wikimedia chain. Provider images remain
+private third-party runtime content; album artwork is never substituted as a
+portrait, and no request occurs while portrait fetching is disabled.
 
 Artist-image networking runs outside the GUI thread with bounded concurrency,
 timeouts, MusicBrainz rate limiting, and request coalescing. Only HTTPS URLs on

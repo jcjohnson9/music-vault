@@ -17,6 +17,7 @@ from PySide6.QtTest import QTest
 
 from music_vault.core import paths
 from music_vault.core.db import MusicVaultDB
+from music_vault.core.runtime_policy import RuntimePolicy
 from music_vault.ui import icons
 from music_vault.ui.components import (
     ElidedLabel,
@@ -1006,7 +1007,11 @@ def test_artist_context_actions_are_consent_cache_and_source_gated(
     class FakeAction:
         def __init__(self, text):
             self.text = text
+            self.enabled = True
             self.triggered = SimpleNamespace(connect=lambda _callback: None)
+
+        def setEnabled(self, enabled):
+            self.enabled = bool(enabled)
 
     class FakeMenu:
         def __init__(self, _parent=None):
@@ -1071,6 +1076,81 @@ def test_accepted_artist_photo_consent_persists_without_credentials(
     assert window.settings_artist_images_enabled.isChecked()
     assert not any("api_key" in key.casefold() for key in saved)
     assert not (fixture.root / "data" / "youtube_api_key.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "runtime_policy",
+    (
+        RuntimePolicy(migration_performed=True),
+        RuntimePolicy(acceptance_no_secrets=True),
+        RuntimePolicy(acceptance_no_network=True),
+    ),
+    ids=("migration", "no-secrets", "no-network"),
+)
+def test_deferred_settings_save_preserves_provider_opt_ins(
+    isolated_ui_window,
+    monkeypatch,
+    runtime_policy,
+):
+    fixture = isolated_ui_window
+    window = fixture.window
+    window.runtime_policy = runtime_policy
+    window.config.update(
+        {
+            "artist_image_fetch_enabled": True,
+            "metadata_intelligence_enabled": True,
+            "metadata_intelligence_consent_version": 1,
+            "metadata_discogs_enabled": True,
+            "metadata_discogs_consent_version": 1,
+            "metadata_fill_missing_artwork_enabled": True,
+        }
+    )
+    window.settings_metadata_intelligence.setChecked(True)
+    window.settings_metadata_discogs.setChecked(False)
+    window.settings_metadata_artwork.setChecked(False)
+    window.settings_artist_images_enabled.setChecked(False)
+    window.settings_quality.setCurrentText("256")
+
+    deferred_messages = []
+    monkeypatch.setattr(
+        window,
+        "_show_provider_deferred",
+        lambda: deferred_messages.append(True),
+    )
+    monkeypatch.setattr(
+        window.discogs_token_store,
+        "configured",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("deferred Settings save inspected the Discogs token")
+        ),
+    )
+    monkeypatch.setattr(window, "refresh_settings_status", lambda: None)
+    monkeypatch.setattr(window, "write_app_status", lambda: None)
+    monkeypatch.setattr(
+        fixture.app_module.QMessageBox,
+        "information",
+        lambda *_args, **_kwargs: fixture.app_module.QMessageBox.Ok,
+    )
+
+    window.on_artist_image_setting_clicked(False)
+    assert window.config["artist_image_fetch_enabled"] is True
+    assert window.settings_artist_images_enabled.isChecked() is True
+    assert deferred_messages == [True]
+
+    # Simulate an unavailable/disabled rendering of provider controls. Saving
+    # unrelated settings must not convert that process-local state into opt-out.
+    window.settings_artist_images_enabled.setChecked(False)
+    window.save_settings_from_ui()
+
+    saved = json.loads(
+        (fixture.root / "data" / "music_vault_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved["metadata_discogs_enabled"] is True
+    assert saved["metadata_fill_missing_artwork_enabled"] is True
+    assert saved["artist_image_fetch_enabled"] is True
+    assert saved["audio_quality"] == "256"
 
 
 def test_window_preserves_now_playing_selection_modes_queue_and_volume(

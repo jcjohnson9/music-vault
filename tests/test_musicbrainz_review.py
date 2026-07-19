@@ -74,6 +74,7 @@ def test_candidate_parser_keeps_all_release_identity_and_stable_score_order():
                     "releases": [
                         {
                             "id": "release-a",
+                            "release-group": {"id": "release-group-a"},
                             "title": "Release A",
                             "date": "2001-02-03",
                             "country": "US",
@@ -104,6 +105,7 @@ def test_candidate_parser_keeps_all_release_identity_and_stable_score_order():
     assert release.duration_seconds == pytest.approx(245.678)
     assert release.album_artist == "Release Artist feat. Guest Artist"
     assert release.release_id == "release-a"
+    assert release.release_group_id == "release-group-a"
     assert release.release_date == "2001-02-03" and release.year == "2001"
     assert release.country == "US" and release.release_status == "Official"
     assert release.artwork_available is True

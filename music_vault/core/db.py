@@ -28,9 +28,14 @@ from music_vault.metadata.intelligence_schema import (
     create_metadata_intelligence_schema,
     seed_existing_metadata_field_extensions,
 )
+from music_vault.metadata.canonical_albums import (
+    create_canonical_media_schema,
+    seed_existing_canonical_albums,
+    upsert_track_canonical_album,
+)
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -57,6 +62,15 @@ class MusicVaultDB:
             if youtube_download_root is not None
             else None
         )
+        # These facts describe only this database object's startup.  They are
+        # deliberately process-local: an old backup on disk must never make a
+        # later, already-current launch look like it just performed a
+        # migration.
+        self.migration_performed = False
+        self.migrated_from_version: int | None = None
+        self.migrated_to_version: int | None = None
+        self.migration_backup_path: Path | None = None
+        self.initialized_new_database = False
         self.last_migration_backup: Path | None = None
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +132,7 @@ class MusicVaultDB:
         self._verify_backup(candidate, expected_counts=expected_counts)
 
         self.last_migration_backup = candidate
+        self.migration_backup_path = candidate
         return candidate
 
     @staticmethod
@@ -310,15 +325,26 @@ class MusicVaultDB:
     def _verify_existing_table_counts_preserved(
         self,
         baseline: dict[str, int],
+        *,
+        allowed_reductions: dict[str, int] | None = None,
     ) -> None:
-        """Reject a migration that loses rows from any pre-existing table."""
+        """Reject unexplained row loss from any pre-existing table.
+
+        Schema 7 may intentionally remove an unreferenced duplicate artist
+        after its credits, aliases, provider identity, and relationships have
+        been preserved on the canonical row.  Callers must bound that one
+        intentional reduction from the consolidation report; every other
+        pre-existing table remains strictly count-preserving.
+        """
 
         current = self._aggregate_counts(self.conn)
+        reductions = allowed_reductions or {}
         missing_tables = sorted(set(baseline) - set(current))
         reduced = sorted(
             table
             for table, count in baseline.items()
-            if table in current and current[table] < count
+            if table in current
+            and count - current[table] > max(0, int(reductions.get(table, 0)))
         )
         if missing_tables or reduced:
             details: list[str] = []
@@ -353,8 +379,11 @@ class MusicVaultDB:
                 create_metadata_intelligence_schema(self.conn)
                 seed_existing_metadata_field_extensions(self.conn)
                 seed_existing_artist_credits(self.conn)
+                create_canonical_media_schema(self.conn)
+                seed_existing_canonical_albums(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
                 self._verify_database_integrity()
+            self.initialized_new_database = True
             return
 
         if version < CURRENT_SCHEMA_VERSION:
@@ -362,6 +391,11 @@ class MusicVaultDB:
             if self._has_user_data():
                 self._create_pre_migration_backup(CURRENT_SCHEMA_VERSION)
 
+            # Own one explicit transaction from the first schema mutation
+            # through the Batch 10.5 repair marker and final integrity gate.
+            # This prevents an empty/near-empty legacy database from letting
+            # a nested repair context commit before migration verification.
+            self.conn.execute("BEGIN IMMEDIATE")
             with self.conn:
                 self._create_base_tables()
                 self._add_track_source_columns()
@@ -380,9 +414,34 @@ class MusicVaultDB:
                 create_metadata_intelligence_schema(self.conn)
                 seed_existing_metadata_field_extensions(self.conn)
                 seed_existing_artist_credits(self.conn)
+                create_canonical_media_schema(self.conn)
+                # Future pre-v7 databases receive the corrected Batch 10.5
+                # stored-evidence pass in this migration transaction.  The
+                # orchestrator constructs no provider client and never reads
+                # or writes media, tags, secrets, or portrait files.  Current
+                # schema-7 startup deliberately does not invoke this repair.
+                from music_vault.metadata.acceptance_repair import (
+                    apply_metadata_acceptance_repair,
+                )
+
+                consolidation = apply_metadata_acceptance_repair(self)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
-                self._verify_existing_table_counts_preserved(baseline_counts)
+                allowed_artist_reductions = max(
+                    0, int(consolidation.deleted_artist_count)
+                )
+                self._verify_existing_table_counts_preserved(
+                    baseline_counts,
+                    allowed_reductions={
+                        "artists": allowed_artist_reductions,
+                        "track_artist_credits": max(
+                            0, int(consolidation.deleted_credit_count)
+                        ),
+                    },
+                )
                 self._verify_database_integrity()
+            self.migration_performed = True
+            self.migrated_from_version = version
+            self.migrated_to_version = CURRENT_SCHEMA_VERSION
             return
 
         # Additive structures remain idempotent at the current schema so a
@@ -395,6 +454,8 @@ class MusicVaultDB:
                 create_metadata_intelligence_schema(self.conn)
                 seed_existing_metadata_field_extensions(self.conn)
                 seed_existing_artist_credits(self.conn)
+                create_canonical_media_schema(self.conn)
+                seed_existing_canonical_albums(self.conn)
                 self._verify_database_integrity()
 
     def upsert_track(
@@ -494,6 +555,7 @@ class MusicVaultDB:
                     "youtube", effective_external_id, track_id, commit=False
                 )
             seed_existing_artist_credits(self.conn, (track_id,))
+            upsert_track_canonical_album(self.conn, track_id)
             return track_id
 
         if commit:
@@ -566,6 +628,7 @@ class MusicVaultDB:
                     reason="legacy_metadata_update",
                     commit=False,
                 )
+            upsert_track_canonical_album(self.conn, int(track_id))
 
     @staticmethod
     def _track_select() -> str:

@@ -48,6 +48,8 @@ ITEM_STATES = (
     "review",
     "ready",
     "applied",
+    "applied_with_gaps",
+    "source_fallback",
     "no_match",
     "skipped",
     "failed",
@@ -177,6 +179,90 @@ def _remove_legacy_artist_name_uniqueness(
     )
 
 
+def _upgrade_intelligence_outcome_schema(
+    conn: sqlite3.Connection,
+    item_states: str,
+    agreements: str,
+) -> None:
+    """Install field-level success outcomes without losing queued job state."""
+
+    job_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(metadata_intelligence_jobs)")
+    }
+    for column in ("applied_with_gaps_items", "source_fallback_items"):
+        if column not in job_columns:
+            conn.execute(
+                f"ALTER TABLE metadata_intelligence_jobs ADD COLUMN {column} "
+                "INTEGER NOT NULL DEFAULT 0 CHECK ("
+                f"{column} >= 0)"
+            )
+
+    schema_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (INTELLIGENCE_ITEMS_TABLE,),
+    ).fetchone()
+    schema_sql = str(schema_row[0] or "") if schema_row is not None else ""
+    if "applied_with_gaps" in schema_sql and "source_fallback" in schema_sql:
+        return
+
+    replacement = "metadata_intelligence_items_schema7"
+    conn.execute(f"DROP TABLE IF EXISTS {replacement}")
+    conn.execute(
+        f"""
+        CREATE TABLE {replacement} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            track_id INTEGER NOT NULL,
+            state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ({item_states})),
+            reason TEXT NOT NULL DEFAULT 'unspecified',
+            priority INTEGER NOT NULL DEFAULT 0,
+            parsed_hints TEXT NOT NULL DEFAULT '{{}}',
+            discogs_release_id TEXT,
+            discogs_master_id TEXT,
+            musicbrainz_recording_id TEXT,
+            musicbrainz_release_id TEXT,
+            field_proposal TEXT NOT NULL DEFAULT '{{}}',
+            field_confidence TEXT NOT NULL DEFAULT '{{}}',
+            provider_agreement TEXT NOT NULL DEFAULT 'unknown'
+                CHECK (provider_agreement IN ({agreements})),
+            review_reason TEXT,
+            applied_history_group TEXT,
+            file_write_result TEXT,
+            artwork_result TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE (job_id, track_id),
+            FOREIGN KEY (job_id) REFERENCES metadata_intelligence_jobs(id) ON DELETE CASCADE,
+            FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+        )
+        """
+    )
+    columns = (
+        "id, job_id, track_id, state, reason, priority, parsed_hints, "
+        "discogs_release_id, discogs_master_id, musicbrainz_recording_id, "
+        "musicbrainz_release_id, field_proposal, field_confidence, "
+        "provider_agreement, review_reason, applied_history_group, "
+        "file_write_result, artwork_result, attempt_count, last_error, "
+        "created_at, started_at, completed_at, updated_at"
+    )
+    before = int(
+        conn.execute(f"SELECT COUNT(*) FROM {INTELLIGENCE_ITEMS_TABLE}").fetchone()[0]
+    )
+    conn.execute(
+        f"INSERT INTO {replacement} ({columns}) "
+        f"SELECT {columns} FROM {INTELLIGENCE_ITEMS_TABLE}"
+    )
+    copied = int(conn.execute(f"SELECT COUNT(*) FROM {replacement}").fetchone()[0])
+    if copied != before:
+        raise RuntimeError("Could not preserve metadata-intelligence items for schema v7.")
+    conn.execute(f"DROP TABLE {INTELLIGENCE_ITEMS_TABLE}")
+    conn.execute(f"ALTER TABLE {replacement} RENAME TO {INTELLIGENCE_ITEMS_TABLE}")
+
+
 def create_metadata_intelligence_schema(conn: sqlite3.Connection) -> None:
     entity_types = ", ".join(f"'{value}'" for value in ARTIST_ENTITY_TYPES)
     credit_roles = ", ".join(f"'{value}'" for value in ARTIST_CREDIT_ROLES)
@@ -231,6 +317,8 @@ def create_metadata_intelligence_schema(conn: sqlite3.Connection) -> None:
             track_id INTEGER PRIMARY KEY,
             discogs_release_id TEXT,
             discogs_master_id TEXT,
+            musicbrainz_release_group_id TEXT,
+            provider_release_family_id TEXT,
             release_title TEXT,
             release_country TEXT,
             release_format TEXT,
@@ -245,6 +333,22 @@ def create_metadata_intelligence_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Schema 7 was exercised in prerelease builds before the provider-family
+    # identity fields were wired into accepted metadata.  Keep the upgrade
+    # additive so those databases acquire the durable fields without a new
+    # schema number or a table rebuild.
+    release_context_columns = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({TRACK_RELEASE_CONTEXT_TABLE})")
+    }
+    for column in (
+        "musicbrainz_release_group_id",
+        "provider_release_family_id",
+    ):
+        if column not in release_context_columns:
+            conn.execute(
+                f"ALTER TABLE {TRACK_RELEASE_CONTEXT_TABLE} ADD COLUMN {column} TEXT"
+            )
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {INTELLIGENCE_JOBS_TABLE} (
@@ -256,6 +360,10 @@ def create_metadata_intelligence_schema(conn: sqlite3.Connection) -> None:
             analyzed_items INTEGER NOT NULL DEFAULT 0 CHECK (analyzed_items >= 0),
             review_items INTEGER NOT NULL DEFAULT 0 CHECK (review_items >= 0),
             applied_items INTEGER NOT NULL DEFAULT 0 CHECK (applied_items >= 0),
+            applied_with_gaps_items INTEGER NOT NULL DEFAULT 0
+                CHECK (applied_with_gaps_items >= 0),
+            source_fallback_items INTEGER NOT NULL DEFAULT 0
+                CHECK (source_fallback_items >= 0),
             no_match_items INTEGER NOT NULL DEFAULT 0 CHECK (no_match_items >= 0),
             failed_items INTEGER NOT NULL DEFAULT 0 CHECK (failed_items >= 0),
             skipped_items INTEGER NOT NULL DEFAULT 0 CHECK (skipped_items >= 0),
@@ -303,6 +411,8 @@ def create_metadata_intelligence_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
+    _upgrade_intelligence_outcome_schema(conn, item_states, agreements)
+
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_artists_normalized_name ON artists(normalized_name, id)",
         "CREATE INDEX IF NOT EXISTS idx_artists_sort_name ON artists(sort_name, id)",
@@ -312,6 +422,8 @@ def create_metadata_intelligence_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_artist_credits_track_order ON track_artist_credits(track_id, credit_order)",
         "CREATE INDEX IF NOT EXISTS idx_release_context_discogs_release ON track_release_context(discogs_release_id, track_id)",
         "CREATE INDEX IF NOT EXISTS idx_release_context_discogs_master ON track_release_context(discogs_master_id, track_id)",
+        "CREATE INDEX IF NOT EXISTS idx_release_context_mb_release_group ON track_release_context(musicbrainz_release_group_id, track_id)",
+        "CREATE INDEX IF NOT EXISTS idx_release_context_provider_family ON track_release_context(provider_release_family_id, track_id)",
         "CREATE INDEX IF NOT EXISTS idx_tracks_discogs_release_id ON tracks(discogs_release_id)",
         "CREATE INDEX IF NOT EXISTS idx_tracks_discogs_master_id ON tracks(discogs_master_id)",
         "CREATE INDEX IF NOT EXISTS idx_tracks_recording_group_key ON tracks(recording_group_key)",
@@ -359,6 +471,8 @@ def required_intelligence_indexes() -> Iterable[str]:
         "idx_artist_credits_track_order",
         "idx_release_context_discogs_release",
         "idx_release_context_discogs_master",
+        "idx_release_context_mb_release_group",
+        "idx_release_context_provider_family",
         "idx_tracks_discogs_release_id",
         "idx_tracks_discogs_master_id",
         "idx_tracks_recording_group_key",
@@ -389,6 +503,8 @@ class IntelligenceJobSummary:
     analyzed_items: int
     review_items: int
     applied_items: int
+    applied_with_gaps_items: int
+    source_fallback_items: int
     no_match_items: int
     failed_items: int
     skipped_items: int
@@ -754,7 +870,8 @@ class MetadataIntelligenceJobStore:
             f"""
             UPDATE {INTELLIGENCE_JOBS_TABLE}
             SET status=?, total_items=?, analyzed_items=?, review_items=?,
-                applied_items=?, no_match_items=?, failed_items=?, skipped_items=?,
+                applied_items=?, applied_with_gaps_items=?, source_fallback_items=?,
+                no_match_items=?, failed_items=?, skipped_items=?,
                 completed_at=?, updated_at=?
             WHERE id=?
             """,
@@ -764,6 +881,8 @@ class MetadataIntelligenceJobStore:
                 analyzed,
                 counts.get("review", 0) + counts.get("ready", 0),
                 counts.get("applied", 0),
+                counts.get("applied_with_gaps", 0),
+                counts.get("source_fallback", 0),
                 counts.get("no_match", 0),
                 counts.get("failed", 0),
                 counts.get("skipped", 0),
@@ -901,6 +1020,8 @@ class MetadataIntelligenceJobStore:
             analyzed_items=int(row["analyzed_items"]),
             review_items=int(row["review_items"]),
             applied_items=int(row["applied_items"]),
+            applied_with_gaps_items=int(row["applied_with_gaps_items"]),
+            source_fallback_items=int(row["source_fallback_items"]),
             no_match_items=int(row["no_match_items"]),
             failed_items=int(row["failed_items"]),
             skipped_items=int(row["skipped_items"]),

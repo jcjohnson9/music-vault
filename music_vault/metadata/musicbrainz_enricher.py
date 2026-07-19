@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import requests
 
+from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.metadata.artist_images import validate_public_url
 from music_vault.metadata.schema import normalize_release_date
 from music_vault.version import user_agent
@@ -33,6 +34,7 @@ class MetadataCandidate:
     recording_id: str | None
     release_id: str | None
     score: int
+    release_group_id: str | None = None
     duration_seconds: float | None = None
     album_artist: str | None = None
     country: str | None = None
@@ -121,10 +123,19 @@ class MusicBrainzProvider:
         resolver: Callable[..., Sequence[Any]] = socket.getaddrinfo,
         rate_limiter: _RateLimiter = _RATE_LIMITER,
     ) -> None:
-        self.session = session or requests.Session()
-        self.session.trust_env = False
+        self.session = session
+        if self.session is not None:
+            self.session.trust_env = False
         self.resolver = resolver
         self.rate_limiter = rate_limiter
+
+    def _network_session(self) -> requests.Session:
+        if not runtime_policy_for().allows_provider_construction(token_backed=False):
+            raise MetadataProviderError("provider_work_deferred")
+        if self.session is None:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        return self.session
 
     @staticmethod
     def _query(title: str, artist: str | None) -> str:
@@ -144,6 +155,9 @@ class MusicBrainzProvider:
     ) -> Mapping[str, Any]:
         if cancel_event is not None and cancel_event.is_set():
             raise MetadataProviderError("search_cancelled")
+        # Enforce migration/acceptance quiescence before rate limiting or URL
+        # validation can reach the resolver.
+        session = self._network_session()
         self.rate_limiter.wait(cancel_event)
         endpoint = validate_public_url(
             MUSICBRAINZ_ENDPOINT,
@@ -151,7 +165,7 @@ class MusicBrainzProvider:
             resolver=self.resolver,
         )
         try:
-            response = self.session.get(
+            response = session.get(
                 endpoint,
                 params={"query": self._query(title, artist), "fmt": "json", "limit": 10},
                 headers={
@@ -234,6 +248,12 @@ class MusicBrainzProvider:
                 releases = [None]
             for release in releases:
                 release_map = release if isinstance(release, Mapping) else {}
+                release_group = release_map.get("release-group")
+                release_group_id = (
+                    _clean(release_group.get("id"))
+                    if isinstance(release_group, Mapping)
+                    else None
+                )
                 cover_info = release_map.get("cover-art-archive")
                 artwork_available = None
                 if isinstance(cover_info, Mapping):
@@ -247,6 +267,7 @@ class MusicBrainzProvider:
                         recording_id=recording_id,
                         release_id=_clean(release_map.get("id")),
                         score=score,
+                        release_group_id=release_group_id,
                         duration_seconds=duration_seconds,
                         album_artist=_artist_credit(release_map, artist_credit),
                         country=_clean(release_map.get("country")),

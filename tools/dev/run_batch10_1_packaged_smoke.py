@@ -17,11 +17,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from music_vault.core.db import MusicVaultDB  # noqa: E402
+from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB  # noqa: E402
 from music_vault.core.app_status import write_app_status  # noqa: E402
 from music_vault.metadata.intelligence import MetadataIntelligenceService  # noqa: E402
 from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore  # noqa: E402
-from tools.dev.profile_metadata_intelligence import _seed_overlapping_sources  # noqa: E402
+from tools.dev.profile_metadata_intelligence import (  # noqa: E402
+    MAX_PROVIDER_QUERIES_PER_TRACK,
+    _seed_overlapping_sources,
+)
 from tools.dev.synthetic_metadata_providers import (  # noqa: E402
     SYNTHETIC_SCENARIOS,
     SyntheticDiscogsProvider,
@@ -193,14 +196,15 @@ def _packaged_review_evidence(path: Path | None) -> dict[str, Any]:
     metadata_validated = complete and all(behaviors.get(name) is True for name in required)
     required_intelligence = {
         "packaged_process",
-        "schema_6",
+        "schema_current",
         "exact_random_uploader_corrected",
         "label_excluded_from_artist_credits",
         "group_and_featured_credits_structured",
         "studio_live_tracks_remain_separate",
-        "unofficial_live_year_blank_original_date_separate",
-        "provider_conflict_requires_review",
-        "youtube_exclusive_fallback_reviewed",
+        "unofficial_live_dates_withheld",
+        "provider_conflict_terminal_best_available",
+        "ordinary_review_count_zero",
+        "youtube_exclusive_source_fallback",
         "source_memberships_preserved",
         "network_guard_active",
         "no_secret_files",
@@ -281,7 +285,7 @@ def verify(
     ]
     review = _packaged_review_evidence(review_manifest)
     checks = {
-        "schema_is_6": schema == 6,
+        "schema_is_current": schema == CURRENT_SCHEMA_VERSION,
         "integrity_ok": integrity.casefold() == "ok",
         "synthetic_tracks_preserved": tracks == int(manifest["track_count"]),
         "source_memberships_preserved": (
@@ -289,6 +293,12 @@ def verify(
             and memberships == int(manifest["source_membership_count"])
         ),
         "intelligence_job_persisted": jobs >= 1 and items == int(manifest["job_item_count"]),
+        "provider_query_counts_bounded": (
+            tracks <= int(manifest["discogs_query_count"])
+            <= tracks * MAX_PROVIDER_QUERIES_PER_TRACK
+            and tracks <= int(manifest["musicbrainz_query_count"])
+            <= tracks * MAX_PROVIDER_QUERIES_PER_TRACK
+        ),
         "production_provider_work_disabled": all(
             config.get(name) is False
             for name in (

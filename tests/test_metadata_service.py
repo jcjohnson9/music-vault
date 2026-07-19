@@ -129,7 +129,10 @@ def test_clear_unlock_and_reset_are_distinct(tmp_path):
     service.record_source_observations(
         track_id, provider="embedded", values={"album": "New Automatic"}
     )
-    assert service.snapshot(track_id).value("album") == "New Automatic"
+    unlocked_state = service.snapshot(track_id).fields["album"]
+    assert unlocked_state.value is None
+    assert unlocked_state.is_manual
+    assert not unlocked_state.is_locked
 
     service.apply_manual_patch(track_id, {"album": "Another Manual"})
     reset = service.reset_fields(track_id, ["album"])
@@ -281,6 +284,8 @@ def test_duplicate_observation_preserves_effective_reference_and_confidence(tmp_
         track_id,
         provider="musicbrainz",
         values={"title": "Source Title"},
+        provider_reference="recording-id",
+        confidence=60,
     )
 
     state = result.after.fields["title"]
@@ -294,6 +299,11 @@ def test_duplicate_observation_preserves_effective_reference_and_confidence(tmp_
     assert db.conn.execute(
         "SELECT COUNT(*) FROM track_metadata_observations"
     ).fetchone()[0] == observation_count
+    assert db.conn.execute(
+        "SELECT confidence FROM track_metadata_observations "
+        "WHERE track_id=? AND provider='musicbrainz' AND field_name='title'",
+        (track_id,),
+    ).fetchone()[0] == 95
     db.close()
 
 

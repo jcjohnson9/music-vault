@@ -25,22 +25,47 @@ from PySide6.QtWidgets import (
 )
 
 from music_vault.core.safety import sanitize_error_text
+from music_vault.metadata.review_policy import classify_stored_review_evidence
 from music_vault.metadata.schema import EDITABLE_METADATA_FIELDS
 
 
 REVIEW_FILTERS = (
-    ("All Items", None),
-    ("High-Confidence Applied", "applied"),
-    ("Needs Review", "needs_review"),
+    ("All Outcomes", None),
+    ("Applied", "applied"),
+    ("Applied with Gaps", "applied_with_gaps"),
+    ("Accepted Source Fallback", "source_fallback"),
+    ("Failed", "failed"),
+    ("No Match", "no_match"),
+    ("Skipped", "skipped"),
     ("Provider Disagreement", "provider_disagreement"),
     ("Version Conflict", "version_conflict"),
     ("Album Ambiguity", "album_ambiguity"),
     ("Date Ambiguity", "date_ambiguity"),
     ("Artist Ambiguity", "artist_ambiguity"),
     ("YouTube Exclusive", "youtube_exclusive"),
-    ("No Match", "no_match"),
-    ("Failed", "failed"),
 )
+
+_STATE_LABELS = {
+    "applied": "Applied",
+    "applied_with_gaps": "Applied with Gaps",
+    "source_fallback": "Accepted Source Fallback",
+    "review": "Legacy Pending",
+    "ready": "Legacy Pending",
+    "failed": "Failed",
+    "no_match": "No Match",
+    "skipped": "Skipped",
+}
+
+_GAP_LABELS = {
+    "album": "Album unavailable",
+    "album_artist": "Album artist unavailable",
+    "release_date": "Release year unavailable",
+    "original_release_date": "Original release unavailable",
+    "artwork": "Artwork unavailable",
+    "exact_edition": "Exact edition unresolved",
+    "label": "Label unavailable",
+    "catalog_number": "Catalogue number unavailable",
+}
 
 _DISCOGS_HOME_URL = "https://www.discogs.com/"
 _DISCOGS_PAGE_HOSTS = frozenset({"discogs.com", "www.discogs.com"})
@@ -137,9 +162,10 @@ class MetadataIntelligenceDialog(QDialog):
         title = QLabel("Metadata Intelligence")
         title.setObjectName("PageTitle")
         description = QLabel(
-            "Review provider agreement, version/date ambiguity, YouTube-exclusive "
-            "fallbacks, and high-confidence field-level changes. Personal provider "
-            "credentials are never shown here."
+            "Inspect automatic best-available outcomes, provider provenance, "
+            "version/date gaps, and source fallbacks. Rare mistakes can still be "
+            "corrected in the metadata editor. Personal provider credentials are "
+            "never shown here."
         )
         description.setObjectName("MutedLabel")
         description.setWordWrap(True)
@@ -152,8 +178,18 @@ class MetadataIntelligenceDialog(QDialog):
         self.filter_combo.setObjectName("MetadataIntelligenceFilter")
         for label, value in REVIEW_FILTERS:
             self.filter_combo.addItem(label, value)
+        default_index = self.filter_combo.findData(None)
+        if default_index >= 0:
+            self.filter_combo.setCurrentIndex(default_index)
         self.filter_combo.currentIndexChanged.connect(self.refresh)
         controls.addWidget(self.filter_combo)
+        self.show_incomplete_checkbox = QCheckBox("Include incomplete outcomes")
+        self.show_incomplete_checkbox.setObjectName("MetadataShowIncomplete")
+        self.show_incomplete_checkbox.setToolTip(
+            "Include Applied with Gaps when an audit filter is selected."
+        )
+        self.show_incomplete_checkbox.toggled.connect(self.refresh)
+        controls.addWidget(self.show_incomplete_checkbox)
         controls.addStretch(1)
         for text, callback, object_name in (
             ("Pause", self.pause_job, "GhostButton"),
@@ -187,7 +223,7 @@ class MetadataIntelligenceDialog(QDialog):
                 "Release Choices",
                 "Artwork",
                 "Proposed Fields",
-                "Review Reason",
+                "Decision Detail",
             ]
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -196,7 +232,7 @@ class MetadataIntelligenceDialog(QDialog):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in enumerate(
-            (110, 190, 190, 165, 190, 190, 175, 115, 170, 190, 175, 175)
+            (180, 190, 190, 165, 190, 190, 175, 115, 170, 190, 175, 175)
         ):
             self.table.setColumnWidth(column, width)
         self.table.setHorizontalScrollMode(
@@ -206,13 +242,13 @@ class MetadataIntelligenceDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._populate_field_choices)
         layout.addWidget(self.table, 1)
 
-        field_group = QGroupBox("Apply Selected Review Fields")
+        field_group = QGroupBox("Optional Manual Correction")
         field_group.setObjectName("MetadataReviewFieldGroup")
         field_group_layout = QVBoxLayout(field_group)
         field_group_layout.setContentsMargins(10, 8, 10, 8)
         field_group_layout.setSpacing(6)
         self.field_choice_hint = QLabel(
-            "Select a review row to choose individual proposed fields. "
+            "Select a legacy pending row to choose individual proposed fields. "
             "Confirmed values are locked and retain metadata history."
         )
         self.field_choice_hint.setObjectName("MutedLabel")
@@ -284,11 +320,21 @@ class MetadataIntelligenceDialog(QDialog):
         values: list[object] = [job_id]
         selected = self.filter_combo.currentData()
         if selected:
-            if selected in {"applied", "no_match", "failed"}:
+            if selected in {
+                "applied",
+                "applied_with_gaps",
+                "source_fallback",
+                "no_match",
+                "failed",
+                "skipped",
+            }:
                 clauses.append(f"{state_column}=?")
                 values.append(selected)
             elif selected == "needs_review":
-                clauses.append(f"{state_column} IN ('review','ready')")
+                states = "'review','ready'"
+                if self.show_incomplete_checkbox.isChecked():
+                    states += ",'applied_with_gaps'"
+                clauses.append(f"{state_column} IN ({states})")
             elif "review_reason" in columns:
                 clauses.append("review_reason=?")
                 values.append(selected)
@@ -353,8 +399,27 @@ class MetadataIntelligenceDialog(QDialog):
         job_id = self._row_value(job, "id")
         items = self._items(job_id)
         status = _plain(self._row_value(job, "status"), "created")
+        state_counts = {
+            str(row["state"]): int(row["count"])
+            for row in self.db.conn.execute(
+                "SELECT state,COUNT(*) AS count FROM metadata_intelligence_items "
+                "WHERE job_id=? GROUP BY state",
+                (job_id,),
+            ).fetchall()
+        }
+        pending = (
+            state_counts.get("queued", 0)
+            + state_counts.get("analyzing", 0)
+            + state_counts.get("review", 0)
+            + state_counts.get("ready", 0)
+        )
         self.summary.setText(
-            f"Job: {status.replace('_', ' ').title()}  •  Visible Items: {len(items)}"
+            f"Job: {status.replace('_', ' ').title()}  •  "
+            f"Pending: {pending}  •  Applied: {state_counts.get('applied', 0)}  •  "
+            f"Applied with Gaps: {state_counts.get('applied_with_gaps', 0)}  •  "
+            f"Source Fallback: {state_counts.get('source_fallback', 0)}  •  "
+            f"Failed: {state_counts.get('failed', 0)}  •  "
+            f"No Match: {state_counts.get('no_match', 0)}  •  Visible: {len(items)}"
         )
         self.table.setRowCount(len(items))
         state_columns = self._columns("metadata_intelligence_items")
@@ -384,8 +449,28 @@ class MetadataIntelligenceDialog(QDialog):
                 if artwork.get("candidate_available")
                 else "no candidate"
             )
+            state = str(self._row_value(item, state_name) or "")
+            review_detail = _plain(self._row_value(item, "review_reason"))
+            if state in {"applied_with_gaps", "source_fallback"}:
+                decision = classify_stored_review_evidence(
+                    parsed_hints=self._row_value(item, "parsed_hints"),
+                    field_proposal=self._row_value(
+                        item, "field_proposal", "proposed_patch"
+                    ),
+                    field_confidence=self._row_value(item, "field_confidence"),
+                    provider_agreement=self._row_value(item, "provider_agreement"),
+                    review_reason=self._row_value(item, "review_reason"),
+                )
+                gap_labels = [
+                    _GAP_LABELS.get(gap, gap.replace("_", " ").title())
+                    for gap in decision.secondary_gaps
+                ]
+                if gap_labels:
+                    review_detail = " • ".join(gap_labels)
+                elif state == "source_fallback":
+                    review_detail = "Strong source-title fallback"
             values = (
-                _plain(self._row_value(item, state_name)).replace("_", " ").title(),
+                _STATE_LABELS.get(state, state.replace("_", " ").title()),
                 self._summary_text(current),
                 _plain(hints.get("raw_title") or hints.get("title")),
                 _plain(hints.get("uploader")),
@@ -396,7 +481,7 @@ class MetadataIntelligenceDialog(QDialog):
                 _plain(discogs.get("album") or proposal.get("album")),
                 f"Current: {current_art} • Discogs: {candidate_art} • {_plain(artwork.get('result'), 'pending')}",
                 ", ".join(name.replace("_", " ").title() for name in proposed_fields) or "—",
-                _plain(self._row_value(item, "review_reason")),
+                review_detail,
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)

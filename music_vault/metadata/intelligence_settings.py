@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Mapping
 
 from music_vault.core.paths import discogs_token_path
+from music_vault.core.runtime_policy import runtime_policy_for
 
 
 METADATA_INTELLIGENCE_CONSENT_VERSION = 1
@@ -80,7 +80,7 @@ class DiscogsTokenStore:
 
     @staticmethod
     def _secrets_disabled() -> bool:
-        return os.environ.get("MUSIC_VAULT_ACCEPTANCE_NO_SECRETS", "").strip() == "1"
+        return not runtime_policy_for().secrets_allowed
 
     def read(self) -> str:
         if self._secrets_disabled():
@@ -92,6 +92,21 @@ class DiscogsTokenStore:
 
     def configured(self) -> bool:
         return bool(self.read())
+
+    def stored(self) -> bool:
+        """Return whether a token file is stored without reading its contents.
+
+        Startup/status surfaces only need a non-secret readiness hint.  Actual
+        provider work continues to call :meth:`read`, where the token value is
+        needed and the runtime policy is enforced again.
+        """
+
+        if self._secrets_disabled():
+            return False
+        try:
+            return self.path.is_file() and self.path.stat().st_size > 0
+        except OSError:
+            return False
 
     def save(self, token: object) -> None:
         value = str(token or "").strip()

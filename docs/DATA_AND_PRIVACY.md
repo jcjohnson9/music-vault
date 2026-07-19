@@ -57,6 +57,36 @@ Status. It never exports the Discogs token, provider query/result, track or
 release/artist ID, title, artist, uploader, candidate, review reason, image URL,
 local cover path, or raw provider error.
 
+Batch 10.4 adds only `provider_work_deferred` and one stable aggregate reason:
+`migration_startup`, `acceptance_no_network`, or `acceptance_no_secrets`.
+Those fields contain no credential path or value, provider query, artist or
+album name, source URL, or item-level provider result.
+
+## Migration-startup and acceptance privacy
+
+Music Vault distinguishes a database initialized during the current process
+from an existing database actually upgraded during that process. The state is
+memory-only; it is not user data, is not inferred from older backups, and is
+not persisted to config. When an upgrade occurred, optional provider work is
+deferred until the next ordinary launch. Persisted jobs and provider settings
+remain unchanged, while local library browsing, playback, and valid cached
+portraits remain available.
+
+Acceptance no-secret mode prevents content reads of the YouTube API-key and
+Discogs-token files. Acceptance no-network mode blocks optional provider
+construction before transport creation. The controls are process-local and do
+not permanently disable a feature. Existing portrait cache hits may be read,
+but blocked misses are not queued and do not add negative-cache records or
+rewrite the cache index.
+
+Batch 10.4 acceptance evidence is aggregate-only. It may contain schema/table
+counts, logical digests, file counts/bytes, credential file size/timestamp
+metadata, safe status booleans, and a zero-attempt network report. It must not
+contain credential contents, track/artist/album names, provider queries or
+URLs, source identities, media paths, or personal screenshots. Fresh migration
+acceptance backups remain private runtime data under `data/backups/` and are
+never committed or bundled.
+
 Synchronization supports public and unlisted playlists and performs anonymous
 media extraction. It does not silently read Firefox, Chrome, Edge, or other
 browser cookie profiles.
@@ -121,6 +151,35 @@ provider-page attribution. It never automatically replaces valid artwork and
 is never embedded into an audio file automatically. The image, provider cache,
 and attribution metadata are private runtime data, ignored by Git, and rejected
 from release packages. See [Discogs Metadata](DISCOGS_METADATA.md).
+
+## Canonical albums, artists, and review evidence
+
+Schema version 7 stores canonical album cards and per-track edition membership,
+artist aliases, verified relationships, and field-level intelligence outcomes
+inside the same private SQLite library. These records can reveal album/artist
+identity, personal corrections, provider references, and review history. They
+are runtime data and never enter commits, screenshots, public reports, release
+packages, or item-level App Status.
+
+Canonical grouping changes browser identity only. It does not rewrite a
+track's album text, date, media path, or `cover_path`; copy, delete, move, tag,
+and artwork-replacement operations are not part of migration. Artist
+consolidation retains aliases, relationships, credit roles/order/provenance,
+portrait provenance, locks, and history. Conflicting provider identities stay
+separate.
+
+Stored-evidence review reclassification reads normalized private job fields
+locally and does not need a provider request. Aggregate counts may enter App
+Status, but titles, artist/album names, proposals, provider IDs, source/image
+URLs, and review reasons do not. **Applied with Gaps** and **Accepted Source
+Fallback** are metadata outcomes, not permission to invent missing release
+data.
+
+Canonical portrait fallback remains opt-in. A missing portrait may try a
+high-confidence Discogs artist image and then the existing strict Wikimedia
+chain; resulting images and attribution stay under private
+`data/artist_images/`. Album artwork is never used as an artist portrait, and
+valid cached portraits are not replaced merely because identities consolidate.
 
 These categories can contain credentials, private library information,
 personal playlist information, local paths, and copyrighted media. They are

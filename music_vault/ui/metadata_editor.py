@@ -1164,6 +1164,7 @@ class MetadataEditorDialog(QDialog):
             recording_id=candidate.recording_id,
             release_id=candidate.release_id,
             confidence=float(candidate.score),
+            release_group_id=candidate.release_group_id,
             artwork_path=artwork_path,
         )
         if result.changed:

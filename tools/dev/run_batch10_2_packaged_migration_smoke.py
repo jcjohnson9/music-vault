@@ -46,7 +46,7 @@ MANIFEST_FORMAT_VERSION = 1
 
 REQUIRED_VERIFIER_CHECKS = frozenset(
     {
-        "schema_is_6",
+        "schema_is_current",
         "all_preexisting_table_rows_and_values_preserved",
         "all_baseline_field_state_rows_preserved_byte_identically",
         "exactly_three_safe_v6_field_rows_added_per_track",
@@ -405,7 +405,7 @@ def verify(
         "all_required_verifier_checks_passed": required_verifier_checks_pass,
         "schema_migrated_5_to_6": (
             int(manifest["baseline"]["database"]["schema_version"]) == 5
-            and verifier_checks.get("schema_is_6") is True
+            and verifier_checks.get("schema_is_current") is True
         ),
         "identity_mapping_and_timestamps_preserved": (
             current_identity_guard == baseline_identity_guard
