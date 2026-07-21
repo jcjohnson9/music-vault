@@ -11,7 +11,8 @@ archives, failed-item records, media, cover art, artist images, metadata reports
 backups, logs, lyrics, lyric-provider results, Discogs tokens/results/images,
 metadata-intelligence jobs, saved source definitions, source
 URLs/labels/titles, source-item memberships, run history, destination mappings,
-or private playlist information from this directory.
+quality-profile overrides, per-track media-quality observations, or private
+playlist information from this directory.
 
 Music Vault may create timestamped SQLite migration backups under `backups/`
 and a neutral external App Status document named `music_vault_status.json`.
@@ -45,8 +46,9 @@ candidate artwork uses a provider-specific directory under `covers/`. These
 files and schema-migration backups must never be committed or included in a public
 build. Clear, reset, and undo do not automatically delete older cover files.
 
-The current v1.1.0 development line advances new and migrated local databases
-to schema version 7. Schema version 5 adds saved synchronization sources, durable
+Batch 11 on the v1.1.0 development line advances new and migrated local
+databases to schema version 8. Schema version 5 adds saved
+synchronization sources, durable
 playlist-item occurrences, source runs, global video-to-track identities,
 identity-conflict diagnostics, and manual/source playlist origins. These tables
 may reveal private source and library organization and belong only in the local
@@ -71,6 +73,14 @@ art is selected from existing member-track art without propagation. Safe artist
 consolidation preserves credits, roles, aliases, provider IDs, relationships,
 portrait provenance, locks, observations, and history. Conflicting identities
 remain separate.
+
+Schema version 8 adds one private `track_media_quality` row per canonical track.
+It stores only known acquisition, source, stored-file, transformation,
+inspection, provenance, and timestamp facts. Legacy migration may recognize an
+existing YouTube MP3 conservatively, but leaves its original source codec and
+bitrate unknown. Migration does not open media for writing, move files,
+rewrite tags, replace artwork, or start a quality-upgrade job. Existing files
+remain the representation reused by overlapping sources.
 
 Stored review evidence may be reclassified locally as `Applied with Gaps`,
 `Accepted Source Fallback`, or critical `Needs Review` without a provider

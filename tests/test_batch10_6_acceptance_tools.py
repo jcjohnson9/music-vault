@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import requests
 
+from music_vault.core import db as db_module
 from music_vault.core.db import MusicVaultDB
 from music_vault.metadata.artist_credits import ArtistCreditService
 from music_vault.metadata.ensemble import recording_group_key
@@ -31,6 +33,23 @@ WRONG_TITLE = "The Cosmic Assembly"
 WRONG_ARTIST = "Anthem of the Republic"
 CORRECT_TITLE = "Anthem of the Republic"
 CORRECT_ARTIST = "The Cosmic Assembly"
+
+
+@contextmanager
+def _schema7_database_runtime():
+    """Build genuine historical schema-7 fixtures for the Batch 10.6 gate."""
+    original_version = db_module.CURRENT_SCHEMA_VERSION
+    original_create = db_module.create_media_quality_schema
+    original_seed = db_module.seed_existing_track_media_quality
+    db_module.CURRENT_SCHEMA_VERSION = 7
+    db_module.create_media_quality_schema = lambda _connection: None
+    db_module.seed_existing_track_media_quality = lambda _connection, *_track_ids: None
+    try:
+        yield
+    finally:
+        db_module.CURRENT_SCHEMA_VERSION = original_version
+        db_module.create_media_quality_schema = original_create
+        db_module.seed_existing_track_media_quality = original_seed
 
 
 def _add_target(
@@ -118,26 +137,29 @@ def _runtime(
     cache = data / "artist_images"
     cache.mkdir(parents=True)
     database = data / "music_vault.sqlite3"
-    db = MusicVaultDB(database, backup_dir=data / "backups")
-    db.conn.execute(
-        "INSERT OR REPLACE INTO app_meta(key,value) VALUES(?,?)",
-        ("batch10_5_metadata_acceptance_repair_v1", "1"),
-    )
-    target_ids = tuple(_add_target(db, root, index=index + 1) for index in range(targets))
-    extra = root / "synthetic media" / "unrelated.synthetic-audio"
-    extra.parent.mkdir(parents=True, exist_ok=True)
-    extra.write_bytes(b"unrelated-fictional-audio")
-    unrelated_id = db.upsert_track(
-        extra,
-        title="Unrelated Fictional Song",
-        artist="Unrelated Fictional Artist",
-        album="Unrelated Fictional Album",
-    )
-    playlist_id = db.create_playlist("Synthetic Preservation Playlist")
-    db.add_track_to_playlist(playlist_id, unrelated_id)
-    if target_ids:
-        db.add_track_to_playlist(playlist_id, target_ids[0])
-    db.close()
+    with _schema7_database_runtime():
+        db = MusicVaultDB(database, backup_dir=data / "backups")
+        db.conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key,value) VALUES(?,?)",
+            ("batch10_5_metadata_acceptance_repair_v1", "1"),
+        )
+        target_ids = tuple(
+            _add_target(db, root, index=index + 1) for index in range(targets)
+        )
+        extra = root / "synthetic media" / "unrelated.synthetic-audio"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        extra.write_bytes(b"unrelated-fictional-audio")
+        unrelated_id = db.upsert_track(
+            extra,
+            title="Unrelated Fictional Song",
+            artist="Unrelated Fictional Artist",
+            album="Unrelated Fictional Album",
+        )
+        playlist_id = db.create_playlist("Synthetic Preservation Playlist")
+        db.add_track_to_playlist(playlist_id, unrelated_id)
+        if target_ids:
+            db.add_track_to_playlist(playlist_id, target_ids[0])
+        db.close()
     (cache / "index.json").write_text(
         json.dumps({"schema_version": 1, "entries": {}, "aliases": {}}),
         encoding="utf-8",

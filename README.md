@@ -44,6 +44,13 @@ MusicBrainz search, and stores the selected orientation and safe decision
 reasons without provider responses or credentials. Unresolved offline items
 remain honest source fallbacks and eligible for a later bounded lookup.
 
+Batch 11 introduces an honest future-download quality profile system on the
+v1.1.0 development line. **Best Original** is the recommended default and keeps
+the selected supported source codec without lossy re-encoding; **MP3 320
+Compatibility** remains available for device/software compatibility and is
+explicitly described as a lossy transcode, not a fidelity improvement. Batch 11
+is complete on the v1.1.0 development line and is not part of public v1.0.0.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
@@ -62,7 +69,7 @@ an authorized public or unlisted playlist, and separately installed
 `ffmpeg.exe` plus `ffprobe.exe`. FFmpeg command-line tools are not bundled or
 downloaded automatically.
 
-## Core V1 capabilities
+## Core capabilities
 
 - Local SQLite library, custom playlists, album and artist browsers, search,
   cover art, and Qt Multimedia playback
@@ -73,8 +80,9 @@ downloaded automatically.
   cross-source video deduplication, origin-aware managed local playlists,
   complete-snapshot reconciliation, structured failures, retry, and truthful
   per-source/aggregate completion states
-- Local settings for downloads, conversion quality, API readiness, FFmpeg
-  readiness, data location, and a non-admin desktop shortcut
+- Local settings for downloads, honest Best Original or MP3 320 Compatibility
+  profiles, API readiness, FFmpeg readiness, data location, and a non-admin
+  desktop shortcut
 - Trusted Metadata editing with provenance, protected manual/confirmed values,
   grouped history, undo, structured artist credits, explicit MusicBrainz
   candidate review, and validated artwork
@@ -126,6 +134,15 @@ canonical library track and one valid media file. Failed/partial enumeration
 never infers removals, and source removal safely preserves the local playlist,
 library, media, metadata, artwork, lyrics, and history. See
 [Multiple Source Playlists](docs/MULTIPLE_SOURCE_PLAYLISTS.md).
+
+Best Original applies only to future missing-track acquisitions. It typically
+retains Opus as `.opus`, AAC as `.m4a`, and Vorbis as `.ogg`; a necessary
+container remux keeps the audio codec unchanged. Each saved source may inherit
+the global profile or select either explicit profile. Overlapping sources still
+reuse one canonical track and the first successfully acquired media file, even
+when a later source requests another profile. Existing media is not
+automatically redownloaded, converted, retagged, or quality-upgraded. See
+[Audio Quality Profiles](docs/AUDIO_QUALITY.md).
 
 Discogs-first Metadata Intelligence is disabled until the user stores a
 personal token, accepts the provider/privacy notice, and enables it in
@@ -261,16 +278,17 @@ proposing a change.
 ## Product boundaries and roadmap
 
 Music Vault is a standalone application. Neutral Prime interoperability is only
-a possible external future option. Android, Best Original quality, an
-installer/updater, an editable queue panel, and personal radio are not V1
-requirements. Batch 9 Party Mode, Batch 9.1 motion/lyrics refinement, Batch 10
+a possible external future option. Android, an installer/updater, an editable
+queue panel, and personal radio are not V1 requirements. Batch 9 Party Mode,
+Batch 9.1 motion/lyrics refinement, Batch 10
 Multiple Source Playlists, Batch 10.1 Discogs-first metadata intelligence,
 Batch 10.2 timestamp preservation, Batch 10.3 canonical media browsing, Batch
 10.4 migration-startup quiescence, and Batch 10.5 metadata acceptance and
 artist-identity correction, plus Batch 10.6 dual-orientation metadata
-acceptance, are complete on the v1.1.0 development line; Batch 11
-Highest-Practical-Quality / Best Original is next. See the
-[roadmap](docs/ROADMAP.md).
+acceptance and Batch 11 Best Original audio quality, are complete on the v1.1.0
+development line. Batch 12 — Selective Library and Playlist Mobile Export is
+next. Remaining metadata-polish items are deferred and are not Batch 11
+blockers. See the [roadmap](docs/ROADMAP.md).
 
 ## Licensing
 

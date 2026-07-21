@@ -154,8 +154,8 @@ def _insert_source(connection, external_id: str, storage_key: str, destination=N
 
 def test_new_database_keeps_batch10_structures_at_latest_schema(tmp_path):
     db = MusicVaultDB(tmp_path / "new.sqlite3")
-    assert CURRENT_SCHEMA_VERSION == 7
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert CURRENT_SCHEMA_VERSION == 8
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     tables = {
         str(row[0])
         for row in db.conn.execute(
@@ -192,7 +192,7 @@ def test_v4_to_latest_migration_is_backed_up_preserving_and_idempotent(tmp_path)
     backups = tmp_path / "backups"
     db = MusicVaultDB(path, backup_dir=backups)
 
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     assert db.last_migration_backup and db.last_migration_backup.is_file()
     with sqlite3.connect(db.last_migration_backup) as backup:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 4

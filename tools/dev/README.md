@@ -4,15 +4,24 @@ Run these helpers from PowerShell at the repository root. Each wrapper resolves
 the root and uses `.venv\Scripts\python.exe`; generated output and private
 runtime data are not source artifacts.
 
+Batch 11 quality behavior and boundaries are documented in
+[`docs/AUDIO_QUALITY.md`](../../docs/AUDIO_QUALITY.md). Its ordinary-batch
+quality gates use disposable generated audio, fake downloader/provider facts,
+no browser cookies, no secrets, no public network, and no personal media. A
+controlled live schema-7-to-8 migration is a separate explicitly authorized
+gate and must run with no-secret/no-network controls. Do not rerun that migration
+after the live database reaches schema 8.
+
 | Command | Purpose |
 | --- | --- |
 | `.\tools\dev\verify.ps1` | Parse/import active source and validate required project resources. |
 | `.\tools\dev\run_source.ps1` | Run the checked-out development source. |
 | `.\tools\dev\build_exe.ps1` | Rebuild the official one-folder development EXE. |
+| `.\tools\dev\run_batch11_quality_e2e.ps1` | Run the isolated packaged Batch 11 quality scenario; add `-RunLiveMigration -AcknowledgeLiveLibrary batch11-live-schema7-to-8` only for the explicitly authorized controlled live gate. |
 | `.\tools\dev\capture_ui_review.ps1` | Run the explicitly gated synthetic application review matrix. |
 | `.\tools\dev\run_batch10_1_review.ps1 --offscreen` | Capture the bounded ten-state Discogs metadata-intelligence review with in-memory synthetic data and networking blocked. |
 | `.\tools\dev\run_batch10_3_review.ps1` | Capture ten sanitized states from the production album/artist browser, detail pages, and metadata-review dialog over a disposable synthetic database; networking is blocked and captures are deleted by default. |
-| `.\tools\dev\profile_media_browsers.ps1` | Profile schema-v7 canonical browsers and review reclassification at 300/1,000/5,000 synthetic tracks. |
+| `.\tools\dev\profile_media_browsers.ps1` | Profile current-schema canonical browsers and review reclassification at 300/1,000/5,000 synthetic tracks. |
 | `.\tools\dev\run_batch10_4_packaged_quiescence_smoke.ps1` | Exercise packaged schema-6-to-7 migration quiescence and a second current-schema launch with synthetic providers in disposable TEMP roots. |
 | `.\tools\dev\audit_batch10_4_artist_cache.ps1` | Validate the accepted private artist-image cache read-only and emit aggregate counts only. |
 | `.\tools\dev\run_batch10_4_controlled_live_startup.ps1 -AcknowledgeLiveLibrary batch10.4-live-schema7-quiescence` | Run the explicitly authorized, one-launch live schema-v7 quiescence gate with no-secret/no-network controls and preservation verification. |

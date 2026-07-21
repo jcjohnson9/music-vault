@@ -9,11 +9,13 @@ import socket
 import sqlite3
 import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from music_vault.core import app_status
+from music_vault.core import db as db_module
 from music_vault.core import paths as runtime_paths
 from music_vault.core import acceptance_network
 from music_vault.core.app_status import write_app_status
@@ -25,6 +27,24 @@ from tools.dev import verify_batch10_3_live_migration as live_gate
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def _schema7_database_runtime():
+    """Run historical Batch 10.3 fixtures without additive schema-8 state."""
+
+    original_version = db_module.CURRENT_SCHEMA_VERSION
+    original_create = db_module.create_media_quality_schema
+    original_seed = db_module.seed_existing_track_media_quality
+    db_module.CURRENT_SCHEMA_VERSION = 7
+    db_module.create_media_quality_schema = lambda _connection: None
+    db_module.seed_existing_track_media_quality = lambda _connection, *_track_ids: None
+    try:
+        yield
+    finally:
+        db_module.CURRENT_SCHEMA_VERSION = original_version
+        db_module.create_media_quality_schema = original_create
+        db_module.seed_existing_track_media_quality = original_seed
 
 
 @pytest.fixture(autouse=True)
@@ -58,13 +78,14 @@ def _migrate_source_mode(root: Path, database: Path) -> None:
     os.environ["MUSIC_VAULT_PROJECT_ROOT"] = str(root)
     runtime_paths._resolved_project_root.cache_clear()
     try:
-        db = MusicVaultDB(
-            database,
-            backup_dir=root / "data" / "backups",
-            legacy_failure_file=root / "data" / "youtube_failed_ids.txt",
-        )
-        write_app_status(db, {"onboarding_completed": True})
-        db.close()
+        with _schema7_database_runtime():
+            db = MusicVaultDB(
+                database,
+                backup_dir=root / "data" / "backups",
+                legacy_failure_file=root / "data" / "youtube_failed_ids.txt",
+            )
+            write_app_status(db, {"onboarding_completed": True})
+            db.close()
     finally:
         if previous is None:
             os.environ.pop("MUSIC_VAULT_PROJECT_ROOT", None)
@@ -76,13 +97,14 @@ def _migrate_source_mode(root: Path, database: Path) -> None:
 def _dry_run(
     root: Path, data: Path, database: Path, baseline: dict[str, object]
 ) -> dict[str, object]:
-    return live_gate.clone_dry_run(
-        project_root=root,
-        data_dir=data,
-        database=database,
-        baseline=baseline,
-        temporary_parent=root.parent,
-    )
+    with _schema7_database_runtime():
+        return live_gate.clone_dry_run(
+            project_root=root,
+            data_dir=data,
+            database=database,
+            baseline=baseline,
+            temporary_parent=root.parent,
+        )
 
 
 def _network_report(
@@ -262,7 +284,8 @@ def test_source_migration_proof_isolated_idempotent_and_aggregate_only(
 ) -> None:
     parent = tmp_path / "outside-repository"
     parent.mkdir()
-    result = source_proof.run_source_migration_proof(temporary_parent=parent)
+    with _schema7_database_runtime():
+        result = source_proof.run_source_migration_proof(temporary_parent=parent)
 
     assert result["ok"] is True
     assert all(result["checks"].values())
@@ -290,13 +313,14 @@ def test_baseline_backup_and_clone_dry_run_leave_schema6_source_unchanged(
         backup_path=backup,
         baseline=baseline,
     )
-    dry_run = live_gate.clone_dry_run(
-        project_root=root,
-        data_dir=data,
-        database=database,
-        baseline=baseline,
-        temporary_parent=tmp_path,
-    )
+    with _schema7_database_runtime():
+        dry_run = live_gate.clone_dry_run(
+            project_root=root,
+            data_dir=data,
+            database=database,
+            baseline=baseline,
+            temporary_parent=tmp_path,
+        )
 
     assert evidence["verified"] is True
     assert evidence["path_emitted"] is False
@@ -830,7 +854,8 @@ def test_packaged_prepare_and_source_mode_verify_are_isolated_and_fail_closed(
     executable.write_bytes(b"synthetic executable marker")
     runtime = _packaged_runtime()
     try:
-        manifest = packaged.prepare(runtime, project)
+        with _schema7_database_runtime():
+            manifest = packaged.prepare(runtime, project)
         assert manifest["baseline"]["database"]["health"]["schema_version"] == 6
         assert (
             manifest["baseline"]["database"]["protected_tables"]["app_meta"]["count"]

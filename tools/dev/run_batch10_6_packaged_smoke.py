@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.dev import batch10_3_acceptance as acceptance  # noqa: E402
 from tools.dev import run_batch10_5_packaged_smoke as base  # noqa: E402
+from music_vault.core.db import CURRENT_SCHEMA_VERSION  # noqa: E402
 
 
 RUNTIME_PREFIX = "MusicVault_Batch10_6_PackagedSmoke_"
@@ -140,7 +141,10 @@ def prepare(runtime: Path, project_root: Path) -> dict[str, Any]:
     _seed_orientation_target(runtime)
     database = runtime / DATABASE_RELATIVE_PATH
     counts = base._database_counts(database)
-    if counts["schema_version"] != 7 or counts["review_count"] != 0:
+    if (
+        counts["schema_version"] != CURRENT_SCHEMA_VERSION
+        or counts["review_count"] != 0
+    ):
         raise SmokeFailure("synthetic_fixture_state_invalid")
 
     old_plan = runtime / base.REVIEW_PLAN_NAME
@@ -177,7 +181,7 @@ def prepare(runtime: Path, project_root: Path) -> dict[str, Any]:
                 "synthetic_injected_providers": True,
                 "discogs_query_limit": 2,
                 "musicbrainz_query_limit": 1,
-                "synthetic_schema_7": True,
+                "synthetic_current_schema": True,
             },
             "seed": {"orientation_target_count": 1, "automatic_queued_count": 1},
             "raw_library_values_emitted": False,
@@ -204,7 +208,7 @@ def _review_evidence(path: Path) -> dict[str, Any]:
         or captures[0].get("scene") != "batch10_6_smoke"
         or not isinstance(behaviors, dict)
         or behaviors.get("packaged_process") is not True
-        or int(behaviors.get("schema_version", -1)) != 7
+        or int(behaviors.get("schema_version", -1)) != CURRENT_SCHEMA_VERSION
         or int(behaviors.get("processed_count", -1)) != 1
         or int(behaviors.get("discogs_query_count", -1)) != 2
         or int(behaviors.get("musicbrainz_query_count", -1)) > 1
@@ -255,7 +259,9 @@ def verify(
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SmokeFailure("app_status_unavailable") from exc
     checks = {
-        "schema_7_preserved": counts["schema_version"] == 7,
+        "current_schema_preserved": (
+            counts["schema_version"] == CURRENT_SCHEMA_VERSION
+        ),
         "track_count_preserved": counts["track_count"] == baseline["track_count"],
         "playlist_count_preserved": counts["playlist_count"] == baseline["playlist_count"],
         "membership_count_preserved": counts["membership_count"] == baseline["membership_count"],

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy, QTest
 
 from music_vault.core import paths
 from music_vault.core.playback_state import (
@@ -121,6 +121,7 @@ def test_volume_movement_updates_audio_immediately_and_debounces_final_write(
         original_save()
 
     window.save_config = counted_save
+    timeout_spy = QSignalSpy(window.volume_save_timer.timeout)
     window.volume_slider.setValue(10)
     window.volume_slider.setValue(20)
     window.volume_slider.setValue(30)
@@ -129,7 +130,7 @@ def test_volume_movement_updates_audio_immediately_and_debounces_final_write(
     assert writes == []
     assert window.volume_save_timer.isActive()
 
-    QTest.qWait(650)
+    assert timeout_spy.wait(2_000)
     assert writes == [30]
     assert json.loads(config_path.read_text(encoding="utf-8"))["volume_percent"] == 30
 

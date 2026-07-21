@@ -93,6 +93,15 @@ from music_vault.core.db import MusicVaultDB
 from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
 from music_vault.core.ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
 from music_vault.core.app_status import write_app_status as export_app_status
+from music_vault.core.audio_quality import profile_description
+from music_vault.core.audio_quality_config import (
+    BEST_ORIGINAL_PROFILE,
+    DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS,
+    DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+    MP3_320_COMPATIBILITY_PROFILE,
+    migrate_audio_quality_config,
+    normalize_download_quality_profile,
+)
 from music_vault.core.importer import (
     ImportSourceContext,
     import_file,
@@ -232,6 +241,10 @@ DISCOGS_NOTICE = (
     "This application uses Discogs’ API but is not affiliated with, sponsored or "
     "endorsed by Discogs. “Discogs” is a trademark of Zink Media, LLC."
 )
+DOWNLOAD_PROFILE_OPTIONS = (
+    ("Best Original — Recommended", BEST_ORIGINAL_PROFILE),
+    ("MP3 320 Compatibility", MP3_320_COMPATIBILITY_PROFILE),
+)
 
 
 def _config_supports_completion_inference(path: Path) -> bool:
@@ -270,6 +283,10 @@ class YouTubeSyncWorker(QThread):
         audio_quality: str = "320",
         existing_video_ids: frozenset[str] = frozenset(),
         ffmpeg_location: str | None = None,
+        download_quality_profile: str = DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+        compatibility_mp3_bitrate_kbps: int = (
+            DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+        ),
     ) -> None:
         super().__init__()
         self.playlist_url = playlist_url
@@ -277,6 +294,12 @@ class YouTubeSyncWorker(QThread):
         self.audio_quality = audio_quality
         self.existing_video_ids = existing_video_ids
         self.ffmpeg_location = ffmpeg_location
+        self.download_quality_profile = normalize_download_quality_profile(
+            download_quality_profile
+        )
+        self.compatibility_mp3_bitrate_kbps = (
+            DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+        )
 
     def run(self) -> None:
         try:
@@ -289,6 +312,10 @@ class YouTubeSyncWorker(QThread):
                 audio_quality=self.audio_quality,
                 existing_video_ids=self.existing_video_ids,
                 ffmpeg_location=self.ffmpeg_location,
+                download_quality_profile=self.download_quality_profile,
+                compatibility_mp3_bitrate_kbps=(
+                    self.compatibility_mp3_bitrate_kbps
+                ),
             )
             syncer = AuthorizedYouTubePlaylistSyncer(config, progress=self.progress.emit)
             result = syncer.sync()
@@ -618,6 +645,10 @@ class MusicVaultWindow(QMainWindow):
         return {
             "download_folder": str(default_downloads_dir()),
             "audio_quality": "320",
+            "download_quality_profile": DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+            "compatibility_mp3_bitrate_kbps": (
+                DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+            ),
             "volume_percent": DEFAULT_VOLUME_PERCENT,
             "artist_image_fetch_enabled": False,
             "onboarding_completed": False,
@@ -641,6 +672,12 @@ class MusicVaultWindow(QMainWindow):
         except Exception:
             pass
 
+        audio_source = saved if isinstance(saved, dict) else config
+        migrated_audio, needs_audio_migration = migrate_audio_quality_config(
+            audio_source
+        )
+        config.update(migrated_audio)
+
         config["volume_percent"] = normalize_volume_percent(
             config.get("volume_percent"),
             DEFAULT_VOLUME_PERCENT,
@@ -660,7 +697,7 @@ class MusicVaultWindow(QMainWindow):
         config.update(normalize_party_mode_settings(party_source))
         config.update(normalize_lyrics_settings(config))
         config.update(normalize_metadata_intelligence_settings(config))
-        if needs_party_migration:
+        if needs_party_migration or needs_audio_migration:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = path.with_name(f"{path.name}.tmp")
@@ -1418,8 +1455,13 @@ class MusicVaultWindow(QMainWindow):
 
     def update_sync_quality_label(self) -> None:
         if hasattr(self, "sync_quality_label"):
-            quality = str(self.config.get("audio_quality", "320"))
-            self.sync_quality_label.setText(f"Saved quality: {quality} kbps")
+            profile = normalize_download_quality_profile(
+                self.config.get("download_quality_profile")
+            )
+            label = next(
+                label for label, value in DOWNLOAD_PROFILE_OPTIONS if value == profile
+            )
+            self.sync_quality_label.setText(f"Saved profile: {label}")
 
 
     def build_sync_page(self) -> QWidget:
@@ -1505,6 +1547,12 @@ class MusicVaultWindow(QMainWindow):
             self.config.get("download_folder", str(default_downloads_dir())),
             archive_file=youtube_download_archive_path(),
             audio_quality=str(self.config.get("audio_quality", "320")),
+            download_quality_profile=normalize_download_quality_profile(
+                self.config.get("download_quality_profile")
+            ),
+            compatibility_mp3_bitrate_kbps=(
+                DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+            ),
             ffmpeg_location=(
                 str(self.config.get("ffmpeg_location") or "").strip() or None
             ),
@@ -1558,10 +1606,44 @@ class MusicVaultWindow(QMainWindow):
             f"imported {int(getattr(result, 'total_imported', 0) or 0)}, "
             f"failed items {int(getattr(result, 'total_failed_items', 0) or 0)}."
         )
+        reused_profiles = getattr(result, "reused_quality_profile_counts", {})
+        reused_codecs = getattr(result, "reused_stored_codec_counts", {})
+        if isinstance(reused_profiles, dict) and any(reused_profiles.values()):
+            profile_labels = {
+                "best_original": "Best Original",
+                "mp3_320_compatibility": "MP3 320 Compatibility",
+                "legacy_youtube_mp3": "Legacy YouTube MP3",
+                "local_import": "Local Original",
+                "unknown": "Unknown",
+            }
+            profile_summary = ", ".join(
+                f"{profile_labels.get(profile, 'Unknown')} {int(count)}"
+                for profile, count in sorted(reused_profiles.items())
+                if int(count) > 0
+            )
+            codec_summary = ", ".join(
+                f"{str(codec).upper()} {int(count)}"
+                for codec, count in sorted(
+                    reused_codecs.items()
+                    if isinstance(reused_codecs, dict)
+                    else ()
+                )
+                if int(count) > 0
+            )
+            summary += f" Reused existing representations: {profile_summary}."
+            if codec_summary:
+                summary += f" Stored codecs reused: {codec_summary}."
         if status == "complete":
             QMessageBox.information(self, "Source synchronization complete", summary)
         else:
             QMessageBox.warning(self, "Source synchronization result", summary)
+
+    def update_settings_quality_description(self, _index: int = -1) -> None:
+        combo = getattr(self, "settings_download_quality_profile", None)
+        label = getattr(self, "settings_quality_description", None)
+        if combo is None or label is None:
+            return
+        label.setText(profile_description(combo.currentData()))
 
     def build_settings_page(self) -> QWidget:
         page = QWidget()
@@ -1649,9 +1731,38 @@ class MusicVaultWindow(QMainWindow):
         folder_row.addWidget(choose_folder_btn)
         folder_row.addWidget(open_downloads_btn)
 
-        quality_label = QLabel("Audio Quality")
+        quality_label = QLabel("Future Download Profile")
         quality_label.setObjectName("MutedLabel")
 
+        self.settings_download_quality_profile = QComboBox()
+        self.settings_download_quality_profile.setObjectName("QualityProfileCombo")
+        self.settings_download_quality_profile.setAccessibleName(
+            "Future download quality profile"
+        )
+        for profile_label, profile_value in DOWNLOAD_PROFILE_OPTIONS:
+            self.settings_download_quality_profile.addItem(
+                profile_label,
+                profile_value,
+            )
+        selected_profile = normalize_download_quality_profile(
+            self.config.get("download_quality_profile")
+        )
+        profile_index = self.settings_download_quality_profile.findData(
+            selected_profile
+        )
+        self.settings_download_quality_profile.setCurrentIndex(max(0, profile_index))
+
+        self.settings_quality_description = QLabel(
+            profile_description(selected_profile)
+        )
+        self.settings_quality_description.setObjectName("StatusLine")
+        self.settings_quality_description.setWordWrap(True)
+        self.settings_download_quality_profile.currentIndexChanged.connect(
+            self.update_settings_quality_description
+        )
+
+        # One-release compatibility control for older callers and persisted
+        # configurations. The visible profile control above is authoritative.
         self.settings_quality = QComboBox()
         self.settings_quality.setObjectName("QualityCombo")
         self.settings_quality.setAccessibleName("Download audio quality")
@@ -1663,6 +1774,7 @@ class MusicVaultWindow(QMainWindow):
             self.settings_quality.setCurrentText(quality)
         else:
             self.settings_quality.setCurrentText("320")
+        self.settings_quality.hide()
 
         ffmpeg_location_label = QLabel("FFmpeg Location")
         ffmpeg_location_label.setObjectName("MutedLabel")
@@ -2041,6 +2153,10 @@ class MusicVaultWindow(QMainWindow):
         self.config_status.setObjectName("StatusLine")
         self.config_status.setWordWrap(True)
 
+        self.quality_inventory_status = QLabel()
+        self.quality_inventory_status.setObjectName("StatusLine")
+        self.quality_inventory_status.setWordWrap(True)
+
         self.app_status_line = QLabel()
         self.app_status_line.setObjectName("StatusLine")
         self.app_status_line.setWordWrap(True)
@@ -2056,6 +2172,8 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(folder_label)
         settings_layout.addLayout(folder_row)
         settings_layout.addWidget(quality_label)
+        settings_layout.addWidget(self.settings_download_quality_profile)
+        settings_layout.addWidget(self.settings_quality_description)
         settings_layout.addWidget(self.settings_quality)
         settings_layout.addWidget(ffmpeg_location_label)
         settings_layout.addWidget(self.settings_ffmpeg_location)
@@ -2099,6 +2217,7 @@ class MusicVaultWindow(QMainWindow):
         settings_layout.addWidget(self.ffmpeg_status)
         settings_layout.addWidget(self.db_status)
         settings_layout.addWidget(self.config_status)
+        settings_layout.addWidget(self.quality_inventory_status)
         settings_layout.addWidget(self.app_status_line)
         settings_layout.addStretch(1)
 
@@ -3534,7 +3653,11 @@ class MusicVaultWindow(QMainWindow):
         if not folder:
             return
 
-        count = import_folder(self.db, folder)
+        count = import_folder(
+            self.db,
+            folder,
+            ffprobe_path=self.import_ffprobe_path(),
+        )
         if count:
             self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
             self.wake_metadata_intelligence()
@@ -3612,6 +3735,15 @@ class MusicVaultWindow(QMainWindow):
             self.config["audio_quality"] = self.settings_quality.currentText()
         else:
             self.config["audio_quality"] = str(self.config.get("audio_quality", "320"))
+        if hasattr(self, "settings_download_quality_profile"):
+            self.config["download_quality_profile"] = (
+                normalize_download_quality_profile(
+                    self.settings_download_quality_profile.currentData()
+                )
+            )
+        self.config["compatibility_mp3_bitrate_kbps"] = (
+            DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+        )
 
         self.save_config()
         self.update_sync_quality_label()
@@ -3631,7 +3763,15 @@ class MusicVaultWindow(QMainWindow):
 
         self.log_youtube("Starting Music Vault sync.")
         self.log_youtube("Download folder configured.")
-        self.log_youtube(f"Audio quality: {self.config['audio_quality']} kbps")
+        active_profile = normalize_download_quality_profile(
+            self.config.get("download_quality_profile")
+        )
+        profile_label = next(
+            label
+            for label, profile_value in DOWNLOAD_PROFILE_OPTIONS
+            if profile_value == active_profile
+        )
+        self.log_youtube(f"Future download profile: {profile_label}")
 
         self.sync_worker = YouTubeSyncWorker(
             playlist_url,
@@ -3639,6 +3779,8 @@ class MusicVaultWindow(QMainWindow):
             self.config["audio_quality"],
             frozenset(self.db.existing_youtube_video_ids()),
             str(self.config.get("ffmpeg_location") or "").strip() or None,
+            active_profile,
+            DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS,
         )
 
         self.sync_worker.progress.connect(self.log_youtube)
@@ -3650,29 +3792,8 @@ class MusicVaultWindow(QMainWindow):
         if not isinstance(result, SyncResult):
             result = SyncResult.failed_result("The sync worker returned an invalid result.")
 
-        imported_count = 0
-        for item in result.import_items:
-            try:
-                if import_file(
-                    self.db,
-                    item.path,
-                    ImportSourceContext(
-                        source_kind="youtube",
-                        source_video_id=item.video_id,
-                        source_upload_date=item.source_upload_date,
-                    ),
-                ):
-                    imported_count += 1
-                    result.successful_video_ids.add(item.video_id)
-            except Exception as exc:
-                result.add_failure(
-                    SyncFailure(
-                        item.video_id,
-                        Path(item.path).stem,
-                        sanitize_error_text(exc),
-                        "import",
-                    )
-                )
+        imported_count = self._import_legacy_youtube_items(result)
+        self._record_legacy_youtube_reused_quality_facts(result)
 
         result.finish_imports(imported_count)
         if imported_count:
@@ -3727,7 +3848,122 @@ class MusicVaultWindow(QMainWindow):
             self.log_youtube(f"- {failure.title or failure.video_id or 'Sync'}: {failure.reason}")
 
         sources = self.sync_source_service.list_active()
-        self.app_sync_status = {
+        self.app_sync_status = self._legacy_youtube_status_payload(
+            result,
+            sync_source_count=len(sources),
+            enabled_sync_source_count=sum(source.enabled for source in sources),
+        )
+        self.write_app_status()
+
+        summary = (
+            f"{values['status']}. Downloaded {result.downloaded_count}, "
+            f"imported {result.imported_count}, failed {result.failed_count}."
+        )
+        if result.status == "complete":
+            QMessageBox.information(self, "YouTube sync complete", summary)
+        else:
+            QMessageBox.warning(self, "YouTube sync result", summary)
+
+    def _import_legacy_youtube_items(self, result: SyncResult) -> int:
+        """Import legacy-worker results only from the configured download root."""
+
+        download_root = Path(
+            self.config.get("download_folder") or default_downloads_dir()
+        ).expanduser().resolve()
+        import_ffprobe_path = (
+            self.import_ffprobe_path()
+            if any(
+                Path(item.path).suffix.casefold() == ".webm"
+                for item in result.import_items
+            )
+            else None
+        )
+        imported_count = 0
+        for item in result.import_items:
+            try:
+                item_path = Path(item.path).expanduser().resolve()
+                if not item_path.is_relative_to(download_root):
+                    raise RuntimeError(
+                        "The downloaded source file is outside the configured download folder."
+                    )
+                if not item_path.is_file():
+                    raise RuntimeError("The downloaded source file is missing.")
+                imported = import_file(
+                    self.db,
+                    item_path,
+                    ImportSourceContext(
+                        source_kind="youtube",
+                        source_video_id=item.video_id,
+                        source_upload_date=item.source_upload_date,
+                        private_cover_path=item.private_cover_path,
+                        ffprobe_path=import_ffprobe_path,
+                    ),
+                )
+                if not imported:
+                    raise RuntimeError("The downloaded source file could not be imported.")
+                canonical_track_id = self.db.canonical_track_id(
+                    "youtube",
+                    item.video_id,
+                    require_existing_file=True,
+                )
+                if canonical_track_id is None:
+                    raise RuntimeError("The imported source track could not be located.")
+                canonical_track = self.db.get_track(canonical_track_id)
+                if canonical_track is None:
+                    raise RuntimeError("The imported source track could not be located.")
+                canonical_path = Path(str(canonical_track["path"])).resolve()
+                if canonical_path != item_path:
+                    raise RuntimeError(
+                        "The imported source track does not match the downloaded file."
+                    )
+                if item.quality_facts:
+                    self.db.upsert_track_media_quality(
+                        canonical_track_id,
+                        **dict(item.quality_facts),
+                    )
+                    result.record_quality_facts(item.quality_facts)
+                imported_count += 1
+                result.successful_video_ids.add(item.video_id)
+            except Exception as exc:
+                result.add_failure(
+                    SyncFailure(
+                        item.video_id,
+                        Path(item.path).stem,
+                        sanitize_error_text(exc),
+                        "import",
+                    )
+                )
+        return imported_count
+
+    def _record_legacy_youtube_reused_quality_facts(
+        self,
+        result: SyncResult,
+    ) -> None:
+        """Record reused representations without counting a new acquisition."""
+
+        import_video_ids = {item.video_id for item in result.import_items}
+        for video_id in sorted(result.successful_video_ids - import_video_ids):
+            canonical_track_id = self.db.canonical_track_id(
+                "youtube",
+                video_id,
+                require_existing_file=True,
+            )
+            if canonical_track_id is None:
+                continue
+            stored_facts = self.db.get_track_media_quality(canonical_track_id)
+            if stored_facts is not None:
+                result.record_reused_quality_facts(dict(stored_facts))
+
+    @staticmethod
+    def _legacy_youtube_status_payload(
+        result: SyncResult,
+        *,
+        sync_source_count: int,
+        enabled_sync_source_count: int,
+    ) -> dict[str, object]:
+        """Return the identity-free legacy summary with quality aggregates."""
+
+        return {
             "last_sync_at": result.finished_at,
             "last_sync_status": result.status,
             "last_sync_playlist_title": None,
@@ -3740,21 +3976,20 @@ class MusicVaultWindow(QMainWindow):
             "last_sync_existing_count": result.existing_count,
             "last_sync_failed_count": result.failed_count,
             "last_sync_failures": [],
-            "sync_source_count": len(sources),
-            "enabled_sync_source_count": sum(source.enabled for source in sources),
+            "sync_source_count": int(sync_source_count),
+            "enabled_sync_source_count": int(enabled_sync_source_count),
             "active_sync_batch": False,
             "active_sync_source_index": None,
+            "last_sync_source_preserved_count": result.source_preserved_count,
+            "last_sync_source_preserved_remux_count": (
+                result.source_preserved_remux_count
+            ),
+            "last_sync_mp3_compatibility_transcode_count": (
+                result.mp3_compatibility_transcode_count
+            ),
+            "last_sync_quality_failure_count": result.quality_failure_count,
+            "last_sync_total_stored_bytes": result.total_stored_bytes,
         }
-        self.write_app_status()
-
-        summary = (
-            f"{values['status']}. Downloaded {result.downloaded_count}, "
-            f"imported {result.imported_count}, failed {result.failed_count}."
-        )
-        if result.status == "complete":
-            QMessageBox.information(self, "YouTube sync complete", summary)
-        else:
-            QMessageBox.warning(self, "YouTube sync result", summary)
 
     def selected_track_id(self) -> int | None:
         row = self.library_table.currentRow()
@@ -4603,6 +4838,15 @@ class MusicVaultWindow(QMainWindow):
             self._last_ffmpeg_discovery = result
         return result
 
+    def import_ffprobe_path(self) -> Path | None:
+        """Return the centrally resolved probe used for guarded WebM imports."""
+
+        try:
+            result = self.discover_ffmpeg_readiness()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return result.ffprobe_path if result.ready else None
+
     def invalidate_ffmpeg_discovery(self) -> None:
         self._last_ffmpeg_discovery = None
 
@@ -4764,7 +5008,11 @@ class MusicVaultWindow(QMainWindow):
             try:
                 if not result.local_import_folder.is_dir():
                     raise FileNotFoundError("The selected import folder is unavailable.")
-                count = import_folder(self.db, str(result.local_import_folder))
+                count = import_folder(
+                    self.db,
+                    str(result.local_import_folder),
+                    ffprobe_path=self.import_ffprobe_path(),
+                )
                 imported_count = count
                 if count:
                     self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
@@ -4787,6 +5035,15 @@ class MusicVaultWindow(QMainWindow):
             self.settings_download_folder.setText(str(result.download_folder))
         if hasattr(self, "settings_quality"):
             self.settings_quality.setCurrentText(result.audio_quality)
+        if hasattr(self, "settings_download_quality_profile"):
+            profile_index = self.settings_download_quality_profile.findData(
+                normalize_download_quality_profile(
+                    self.config.get("download_quality_profile")
+                )
+            )
+            self.settings_download_quality_profile.setCurrentIndex(
+                max(0, profile_index)
+            )
         if hasattr(self, "settings_ffmpeg_location"):
             self.settings_ffmpeg_location.setText(result.ffmpeg_location or "")
         if hasattr(self, "youtube_output"):
@@ -5328,6 +5585,12 @@ class MusicVaultWindow(QMainWindow):
 
         self.config["download_folder"] = str(Path(download_folder).resolve())
         self.config["audio_quality"] = self.settings_quality.currentText()
+        self.config["download_quality_profile"] = normalize_download_quality_profile(
+            self.settings_download_quality_profile.currentData()
+        )
+        self.config["compatibility_mp3_bitrate_kbps"] = (
+            DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+        )
         previous_ffmpeg_location = str(
             self.config.get("ffmpeg_location") or ""
         ).strip()
@@ -5645,9 +5908,29 @@ class MusicVaultWindow(QMainWindow):
         config_lines = [
             f"Config: {self.config_file_path().resolve()}",
             f"Download Folder: {download_folder.resolve()}",
-            f"Audio Quality: {self.config.get('audio_quality', '320')} kbps",
+            "Future Downloads: "
+            + next(
+                label
+                for label, value in DOWNLOAD_PROFILE_OPTIONS
+                if value
+                == normalize_download_quality_profile(
+                    self.config.get("download_quality_profile")
+                )
+            ),
+            f"MP3 Compatibility Bitrate: {DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS} kbps",
             f"Unresolved Sync Failures: {failed_count}",
         ]
+
+        quality_summary = self.db.track_media_quality_summary()
+        if hasattr(self, "quality_inventory_status"):
+            self.quality_inventory_status.setText(
+                "Library Quality Inventory\n"
+                f"Best Original: {quality_summary.get('best_original', 0)}\n"
+                f"MP3 Compatibility: {quality_summary.get('mp3_320_compatibility', 0)}\n"
+                f"Legacy YouTube MP3: {quality_summary.get('legacy_youtube_mp3', 0)}\n"
+                f"Local Original: {quality_summary.get('local_import', 0)}\n"
+                f"Unknown: {quality_summary.get('unknown', 0)}"
+            )
 
         self.config_status.setText(chr(10).join(config_lines))
 
@@ -5688,6 +5971,21 @@ class MusicVaultWindow(QMainWindow):
 
             if quality in ["192", "256", "320"]:
                 self.settings_quality.setCurrentText(quality)
+
+        if hasattr(self, "settings_download_quality_profile"):
+            profile_index = self.settings_download_quality_profile.findData(
+                normalize_download_quality_profile(
+                    self.config.get("download_quality_profile")
+                )
+            )
+            previous = self.settings_download_quality_profile.blockSignals(True)
+            try:
+                self.settings_download_quality_profile.setCurrentIndex(
+                    max(0, profile_index)
+                )
+            finally:
+                self.settings_download_quality_profile.blockSignals(previous)
+            self.update_settings_quality_description()
 
         if hasattr(self, "settings_ffmpeg_location"):
             self.settings_ffmpeg_location.setText(

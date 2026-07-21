@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
+from .audio_quality_config import normalize_source_download_quality_profile
 from .safety import sanitize_error_text
 from .sync_result import SyncResult, utc_now
 
@@ -67,6 +68,7 @@ class SyncSource:
     created_at: str
     updated_at: str
     archived_at: str | None
+    download_quality_profile: str = "inherit"
 
     @property
     def display_label(self) -> str:
@@ -169,6 +171,9 @@ class SyncSourceService:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             archived_at=row["archived_at"],
+            download_quality_profile=normalize_source_download_quality_profile(
+                row["download_quality_profile"]
+            ),
         )
 
     def get(self, source_id: int, *, include_archived: bool = False) -> SyncSource:
@@ -248,6 +253,7 @@ class SyncSourceService:
         enabled: bool = True,
         destination_kind: str = DESTINATION_LIBRARY,
         destination_playlist_id: int | None = None,
+        download_quality_profile: str = "inherit",
     ) -> SyncSource:
         normalized = normalize_youtube_playlist_source(value)
         clean_label = str(label or "").strip() or None
@@ -262,6 +268,9 @@ class SyncSourceService:
             excluding_source_id=excluding,
         )
         timestamp = utc_now()
+        quality_profile = normalize_source_download_quality_profile(
+            download_quality_profile
+        )
         with self.conn:
             if existing is not None:
                 source_id = int(existing["id"])
@@ -272,7 +281,7 @@ class SyncSourceService:
                     UPDATE sync_sources
                     SET source_url=?, label=COALESCE(?, label), enabled=?,
                         sort_order=?, destination_kind=?, destination_playlist_id=?,
-                        archived_at=NULL, updated_at=?
+                        download_quality_profile=?, archived_at=NULL, updated_at=?
                     WHERE id=?
                     """,
                     (
@@ -282,6 +291,7 @@ class SyncSourceService:
                         self._next_sort_order(),
                         destination_kind,
                         destination_playlist_id,
+                        quality_profile,
                         timestamp,
                         source_id,
                     ),
@@ -295,10 +305,11 @@ class SyncSourceService:
                     INSERT INTO sync_sources (
                         source_kind, external_id, source_url, label, remote_title,
                         enabled, sort_order, destination_kind, destination_playlist_id,
-                        storage_key, last_visible_count, last_new_count,
+                        storage_key, download_quality_profile,
+                        last_visible_count, last_new_count,
                         last_downloaded_count, last_imported_count, last_existing_count,
                         last_failed_count, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)
                     """,
                     (
                         SOURCE_KIND_YOUTUBE_PLAYLIST,
@@ -310,6 +321,7 @@ class SyncSourceService:
                         destination_kind,
                         destination_playlist_id,
                         storage_key,
+                        quality_profile,
                         timestamp,
                         timestamp,
                     ),
@@ -331,6 +343,7 @@ class SyncSourceService:
         enabled: bool | object = _UNSET,
         destination_kind: str | object = _UNSET,
         destination_playlist_id: int | None | object = _UNSET,
+        download_quality_profile: str | object = _UNSET,
     ) -> SyncSource:
         source = self.get(source_id)
         new_kind = (
@@ -357,6 +370,13 @@ class SyncSourceService:
             "enabled": int(source.enabled if enabled is _UNSET else bool(enabled)),
             "destination_kind": new_kind,
             "destination_playlist_id": new_playlist_id,
+            "download_quality_profile": (
+                source.download_quality_profile
+                if download_quality_profile is _UNSET
+                else normalize_source_download_quality_profile(
+                    download_quality_profile
+                )
+            ),
             "updated_at": utc_now(),
         }
         with self.conn:
@@ -367,6 +387,7 @@ class SyncSourceService:
                 UPDATE sync_sources
                 SET label=:label, enabled=:enabled, destination_kind=:destination_kind,
                     destination_playlist_id=:destination_playlist_id,
+                    download_quality_profile=:download_quality_profile,
                     updated_at=:updated_at
                 WHERE id=:source_id AND archived_at IS NULL
                 """,

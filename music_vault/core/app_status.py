@@ -53,7 +53,19 @@ MULTI_SOURCE_SYNC_FIELDS = (
     "last_sync_batch_imported_count",
     "last_sync_batch_item_failure_count",
 )
-SYNC_FIELDS = LEGACY_SYNC_FIELDS + OPTIONAL_SYNC_FIELDS + MULTI_SOURCE_SYNC_FIELDS
+QUALITY_SYNC_FIELDS = (
+    "last_sync_source_preserved_count",
+    "last_sync_source_preserved_remux_count",
+    "last_sync_mp3_compatibility_transcode_count",
+    "last_sync_quality_failure_count",
+    "last_sync_total_stored_bytes",
+)
+SYNC_FIELDS = (
+    LEGACY_SYNC_FIELDS
+    + OPTIONAL_SYNC_FIELDS
+    + MULTI_SOURCE_SYNC_FIELDS
+    + QUALITY_SYNC_FIELDS
+)
 PLAYBACK_FIELDS = (
     "currently_playing",
     "current_title",
@@ -99,6 +111,41 @@ def _missing_track_count(db) -> int:
     except Exception:
         return 0
     return sum(1 for row in rows if not Path(row["path"]).is_file())
+
+
+def _media_quality_summary(db) -> dict[str, int]:
+    """Return aggregate-only library quality counts.
+
+    This deliberately exports no track IDs, media paths, provider format IDs,
+    or per-track observations. Older databases that do not yet have the
+    additive inventory safely report zero until their controlled migration.
+    """
+
+    counts = {
+        "best_original": 0,
+        "mp3_320_compatibility": 0,
+        "legacy_youtube_mp3": 0,
+        "local_import": 0,
+        "unknown": 0,
+    }
+    try:
+        rows = db.conn.execute(
+            "SELECT acquisition_profile, COUNT(*) FROM track_media_quality "
+            "GROUP BY acquisition_profile"
+        ).fetchall()
+        for row in rows:
+            profile = str(row[0] or "").strip().casefold()
+            if profile in counts:
+                counts[profile] = max(0, int(row[1] or 0))
+    except Exception:
+        pass
+    return {
+        "quality_best_original_count": counts["best_original"],
+        "quality_mp3_compatibility_count": counts["mp3_320_compatibility"],
+        "quality_legacy_youtube_mp3_count": counts["legacy_youtube_mp3"],
+        "quality_local_original_count": counts["local_import"],
+        "quality_unknown_count": counts["unknown"],
+    }
 
 
 def _api_ready() -> bool:
@@ -235,6 +282,13 @@ def _sanitize_sync_values(values: dict) -> dict:
     sanitized["last_sync_playlist_id"] = None
     sanitized["last_sync_error"] = None
     sanitized["last_sync_failures"] = []
+    for field in QUALITY_SYNC_FIELDS:
+        if field not in sanitized or sanitized[field] is None:
+            continue
+        try:
+            sanitized[field] = max(0, int(sanitized[field]))
+        except (TypeError, ValueError, OverflowError):
+            sanitized[field] = None
     return sanitized
 
 
@@ -272,6 +326,7 @@ def write_app_status(db, config, extra=None) -> Path:
                 db, "SELECT COUNT(DISTINCT NULLIF(TRIM(artist), '')) FROM tracks"
             ),
             "missing_track_count": _missing_track_count(db),
+            **_media_quality_summary(db),
         },
         "playback": {
             "currently_playing": None,

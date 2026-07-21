@@ -1,6 +1,22 @@
 # Music Vault batch delivery rules
 
 - A Music Vault batch is one complete delivery unit.
+- Every batch must declare exactly one workflow class:
+  - An **ordinary implementation batch** uses an immediate checkpoint commit,
+    focused tests, one complete unit-test pass, one official build, one
+    essential end-to-end acceptance pass, a concise implementation report,
+    merge after green branch CI, green main CI verification, and branch
+    cleanup. It does not automatically require milestone-scale visual
+    matrices, diagnostics, performance reports, architecture rewrites,
+    duplicate regressions, separate report sets, or a PR closeout report.
+  - A **milestone or release-candidate batch** may use the expanded assurance
+    workflow: broad visual/resolution matrices, diagnostic and performance
+    evidence, architecture updates, complete local and CI regression, PR
+    closeout, cleanup, and a comprehensive release report. Reports around 120
+    items are reserved for major milestones such as Full V1, V1.1, a public
+    beta, a major architectural migration, or a production release.
+- Choose assurance deliberately from the declared workflow class instead of
+  adding redundant gates automatically.
 - Every normal code-changing batch includes implementation, tests, source
   verification, publication safety scanning, Python compilation, an official
   EXE rebuild, safe packaged startup validation where appropriate,

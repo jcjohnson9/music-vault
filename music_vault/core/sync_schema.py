@@ -42,6 +42,10 @@ def create_sync_schema(conn: sqlite3.Connection) -> None:
             destination_playlist_id INTEGER,
             storage_key TEXT NOT NULL
                 CHECK (length(trim(storage_key)) BETWEEN 1 AND 96),
+            download_quality_profile TEXT NOT NULL DEFAULT 'inherit'
+                CHECK (download_quality_profile IN (
+                    'inherit', 'best_original', 'mp3_320_compatibility'
+                )),
             last_sync_at TEXT,
             last_sync_status TEXT
                 CHECK (
@@ -167,6 +171,16 @@ def create_sync_schema(conn: sqlite3.Connection) -> None:
             removed_count INTEGER NOT NULL DEFAULT 0 CHECK (removed_count >= 0),
             duplicate_occurrence_count INTEGER NOT NULL DEFAULT 0
                 CHECK (duplicate_occurrence_count >= 0),
+            source_preserved_count INTEGER NOT NULL DEFAULT 0
+                CHECK (source_preserved_count >= 0),
+            source_preserved_remux_count INTEGER NOT NULL DEFAULT 0
+                CHECK (source_preserved_remux_count >= 0),
+            mp3_compatibility_transcode_count INTEGER NOT NULL DEFAULT 0
+                CHECK (mp3_compatibility_transcode_count >= 0),
+            quality_failure_count INTEGER NOT NULL DEFAULT 0
+                CHECK (quality_failure_count >= 0),
+            total_stored_bytes INTEGER NOT NULL DEFAULT 0
+                CHECK (total_stored_bytes >= 0),
             first_error TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY (source_id) REFERENCES sync_sources(id) ON DELETE CASCADE
@@ -183,11 +197,40 @@ def create_sync_schema(conn: sqlite3.Connection) -> None:
     if "source_item_id" not in failure_columns:
         conn.execute("ALTER TABLE sync_failures ADD COLUMN source_item_id TEXT")
 
+    source_columns = _columns(conn, SYNC_SOURCES_TABLE)
+    if "download_quality_profile" not in source_columns:
+        conn.execute(
+            "ALTER TABLE sync_sources ADD COLUMN download_quality_profile TEXT "
+            "NOT NULL DEFAULT 'inherit' CHECK (download_quality_profile IN "
+            "('inherit', 'best_original', 'mp3_320_compatibility'))"
+        )
+
+    run_columns = _columns(conn, SYNC_SOURCE_RUNS_TABLE)
+    for column, definition in (
+        ("source_preserved_count", "INTEGER NOT NULL DEFAULT 0 CHECK (source_preserved_count >= 0)"),
+        (
+            "source_preserved_remux_count",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (source_preserved_remux_count >= 0)",
+        ),
+        (
+            "mp3_compatibility_transcode_count",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (mp3_compatibility_transcode_count >= 0)",
+        ),
+        ("quality_failure_count", "INTEGER NOT NULL DEFAULT 0 CHECK (quality_failure_count >= 0)"),
+        ("total_stored_bytes", "INTEGER NOT NULL DEFAULT 0 CHECK (total_stored_bytes >= 0)"),
+    ):
+        if column not in run_columns:
+            conn.execute(
+                f"ALTER TABLE {SYNC_SOURCE_RUNS_TABLE} ADD COLUMN {column} {definition}"
+            )
+
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_sync_sources_active_order "
         "ON sync_sources(archived_at, sort_order, id)",
         "CREATE INDEX IF NOT EXISTS idx_sync_sources_enabled_order "
         "ON sync_sources(enabled, archived_at, sort_order, id)",
+        "CREATE INDEX IF NOT EXISTS idx_sync_sources_quality_profile "
+        "ON sync_sources(download_quality_profile, archived_at, id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_sources_active_destination "
         "ON sync_sources(destination_playlist_id) "
         "WHERE archived_at IS NULL AND destination_kind='playlist'",
@@ -354,6 +397,7 @@ def required_sync_indexes() -> Iterable[str]:
     return (
         "idx_sync_sources_active_order",
         "idx_sync_sources_enabled_order",
+        "idx_sync_sources_quality_profile",
         "uq_sync_sources_active_destination",
         "idx_sync_source_items_source",
         "idx_sync_source_items_source_position",

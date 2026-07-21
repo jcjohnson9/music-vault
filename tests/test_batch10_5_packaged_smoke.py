@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from music_vault.core import paths as runtime_paths
+from music_vault.core.db import CURRENT_SCHEMA_VERSION
 from music_vault.ui import review as ui_review
 
 
@@ -27,7 +28,9 @@ def _tool():
     return module
 
 
-def test_packaged_smoke_prepare_is_schema7_synthetic_and_secret_free(tmp_path: Path):
+def test_packaged_smoke_prepare_is_current_schema_synthetic_and_secret_free(
+    tmp_path: Path,
+):
     tool = _tool()
     project = tmp_path / "synthetic-project"
     executable = project / "dist" / "MusicVault" / "MusicVault.exe"
@@ -40,7 +43,10 @@ def test_packaged_smoke_prepare_is_schema7_synthetic_and_secret_free(tmp_path: P
         manifest = tool.prepare(runtime, project)
 
         assert manifest["manifest_format_version"] == tool.MANIFEST_FORMAT_VERSION
-        assert manifest["database"]["counts"]["schema_version"] == 7
+        assert (
+            manifest["database"]["counts"]["schema_version"]
+            == CURRENT_SCHEMA_VERSION
+        )
         assert manifest["database"]["counts"]["review_count"] == 0
         assert manifest["seed"]["orientation_repair_count"] == 1
         assert manifest["seed"]["remaining_review_count"] == 0
@@ -90,7 +96,7 @@ def test_packaged_review_manifest_requires_every_batch10_5_behavior(tmp_path: Pa
     behaviors.update(
         {
             "packaged_process": True,
-            "schema_version": 7,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "network_attempt_count": 0,
             "artist_card_count": 4,
             "review_outcome_counts": {"applied": 1, "review": 0},
@@ -199,7 +205,10 @@ def test_packaged_batch10_5_hook_exercises_real_window_offline(
             window.show()
             qapp.processEvents()
             try:
-                assert ui_review.validate_review_runtime(plan)["schema_version"] == 7
+                assert (
+                    ui_review.validate_review_runtime(plan)["schema_version"]
+                    == CURRENT_SCHEMA_VERSION
+                )
                 evidence = ui_review.validate_batch10_5_review_behaviors(window, plan)
                 assert evidence["packaged_process"] is False
                 assert evidence["ordinary_review_eliminated"] is True

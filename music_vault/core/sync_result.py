@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Literal
@@ -106,6 +107,21 @@ class SyncImportItem:
     # Occurrence linkage is additive bookkeeping and deliberately excluded
     # from equality so the Batch 2 import-item contract remains compatible.
     source_item_ids: tuple[str, ...] = field(default_factory=tuple, compare=False)
+    # Batch 11 quality provenance is optional so older provider/test factories
+    # remain source-compatible. Values are aggregate-safe facts only; raw
+    # provider responses and private query details never cross this boundary.
+    quality_facts: Mapping[str, object] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    # A newly downloaded, local thumbnail may be carried to the importer for
+    # content-addressed private cover storage. It is never exported to status.
+    private_cover_path: str | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass
@@ -129,6 +145,13 @@ class SyncResult:
     snapshot: PlaylistSnapshot | None = None
     removed_occurrence_count: int = 0
     duplicate_occurrence_count: int = 0
+    source_preserved_count: int = 0
+    source_preserved_remux_count: int = 0
+    mp3_compatibility_transcode_count: int = 0
+    quality_failure_count: int = 0
+    total_stored_bytes: int = 0
+    reused_quality_profile_counts: dict[str, int] = field(default_factory=dict)
+    reused_stored_codec_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def failed_count(self) -> int:
@@ -140,9 +163,55 @@ class SyncResult:
 
     def add_failure(self, failure: SyncFailure) -> None:
         self.failures.append(failure)
+        if failure.error_category == "quality":
+            self.quality_failure_count += 1
         if failure.video_id:
             self.successful_video_ids.discard(failure.video_id)
         self.refresh_status()
+
+    def record_quality_facts(self, values: Mapping[str, object] | None) -> None:
+        if not isinstance(values, Mapping):
+            return
+        profile = str(values.get("acquisition_profile") or "").strip().casefold()
+        transformation = str(values.get("transformation_kind") or "").strip().casefold()
+        if transformation == "none":
+            self.source_preserved_count += 1
+        elif transformation == "source_preserved_remux":
+            self.source_preserved_remux_count += 1
+        if profile == "mp3_320_compatibility" and transformation == "lossy_transcode":
+            self.mp3_compatibility_transcode_count += 1
+        try:
+            stored_bytes = int(values.get("stored_filesize_bytes") or 0)
+        except (TypeError, ValueError, OverflowError):
+            stored_bytes = 0
+        self.total_stored_bytes += max(0, stored_bytes)
+
+    def record_reused_quality_facts(
+        self,
+        values: Mapping[str, object] | None,
+    ) -> None:
+        """Report an existing representation without counting a new acquisition."""
+
+        if not isinstance(values, Mapping):
+            return
+        profile = str(values.get("acquisition_profile") or "unknown").strip().casefold()
+        if profile not in {
+            "best_original",
+            "mp3_320_compatibility",
+            "legacy_youtube_mp3",
+            "local_import",
+            "unknown",
+        }:
+            profile = "unknown"
+        self.reused_quality_profile_counts[profile] = (
+            self.reused_quality_profile_counts.get(profile, 0) + 1
+        )
+        codec = str(values.get("stored_codec") or "unknown").strip().casefold()
+        if codec not in {"opus", "aac", "vorbis", "mp3", "flac", "alac"}:
+            codec = "unknown"
+        self.reused_stored_codec_counts[codec] = (
+            self.reused_stored_codec_counts.get(codec, 0) + 1
+        )
 
     def finish_imports(self, imported_count: int) -> None:
         self.imported_count = imported_count
@@ -193,6 +262,13 @@ class SyncResult:
             "last_sync_downloaded_count": self.downloaded_count,
             "last_sync_existing_count": self.existing_count,
             "last_sync_failed_count": self.failed_count,
+            "last_sync_source_preserved_count": self.source_preserved_count,
+            "last_sync_source_preserved_remux_count": self.source_preserved_remux_count,
+            "last_sync_mp3_compatibility_transcode_count": (
+                self.mp3_compatibility_transcode_count
+            ),
+            "last_sync_quality_failure_count": self.quality_failure_count,
+            "last_sync_total_stored_bytes": self.total_stored_bytes,
             "last_sync_failures": [failure.to_dict() for failure in self.failures[:25]],
         }
 
@@ -229,6 +305,13 @@ class MultiSourceSyncResult:
     total_failed_items: int = 0
     total_removed_occurrences: int = 0
     total_duplicate_occurrences: int = 0
+    total_source_preserved: int = 0
+    total_source_preserved_remux: int = 0
+    total_mp3_compatibility_transcodes: int = 0
+    total_quality_failures: int = 0
+    total_stored_bytes: int = 0
+    reused_quality_profile_counts: dict[str, int] = field(default_factory=dict)
+    reused_stored_codec_counts: dict[str, int] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_now)
     finished_at: str = field(default_factory=utc_now)
     batch_token: str | None = None
@@ -245,6 +328,18 @@ class MultiSourceSyncResult:
         stopped_after_current: bool = False,
     ) -> "MultiSourceSyncResult":
         materialized = list(outcomes)
+        reused_quality_profile_counts: dict[str, int] = {}
+        for result in materialized:
+            for profile, count in result.reused_quality_profile_counts.items():
+                reused_quality_profile_counts[profile] = (
+                    reused_quality_profile_counts.get(profile, 0) + max(0, int(count))
+                )
+        reused_stored_codec_counts: dict[str, int] = {}
+        for result in materialized:
+            for codec, count in result.reused_stored_codec_counts.items():
+                reused_stored_codec_counts[codec] = (
+                    reused_stored_codec_counts.get(codec, 0) + max(0, int(count))
+                )
         completed = sum(result.status == "complete" for result in materialized)
         issues = sum(result.status == "complete_with_issues" for result in materialized)
         failed = sum(result.status == "failed" for result in materialized)
@@ -274,6 +369,21 @@ class MultiSourceSyncResult:
             total_duplicate_occurrences=sum(
                 result.duplicate_occurrence_count for result in materialized
             ),
+            total_source_preserved=sum(
+                result.source_preserved_count for result in materialized
+            ),
+            total_source_preserved_remux=sum(
+                result.source_preserved_remux_count for result in materialized
+            ),
+            total_mp3_compatibility_transcodes=sum(
+                result.mp3_compatibility_transcode_count for result in materialized
+            ),
+            total_quality_failures=sum(
+                result.quality_failure_count for result in materialized
+            ),
+            total_stored_bytes=sum(result.total_stored_bytes for result in materialized),
+            reused_quality_profile_counts=reused_quality_profile_counts,
+            reused_stored_codec_counts=reused_stored_codec_counts,
             started_at=started_at,
             finished_at=utc_now(),
             batch_token=batch_token,

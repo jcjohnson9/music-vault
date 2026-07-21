@@ -42,6 +42,19 @@ the old source instead so occurrence identity and history remain truthful.
 Re-adding an archived external ID restores its existing definition rather than
 creating a duplicate.
 
+## Download quality override
+
+A saved source may use the global download profile or explicitly request Best
+Original or MP3 320 Compatibility. Saving or changing this override is local
+configuration work: it does not start synchronization, replace a file, or
+change source membership.
+
+The override applies only when a future item has no reusable canonical media.
+Best Original retains the selected supported source codec and remuxes only when
+needed for a practical audio-only file. MP3 320 is a lossy compatibility
+transcode and is never presented as a fidelity improvement. See
+[Audio Quality Profiles](AUDIO_QUALITY.md).
+
 ## Destinations
 
 ### Library Only
@@ -73,6 +86,11 @@ Each YouTube video ID maps to one canonical Music Vault track identity across
 all saved sources. A later source reuses a valid existing database/file mapping
 or a file discovered within the configured Music Vault download tree. It does
 not redownload a track just because the same video appears in another source.
+
+The first successful acquisition also determines that track's stored media
+representation. If a later source requests another quality profile, Music Vault
+reuses the existing file and reports its actual stored quality facts rather
+than creating a second representation.
 
 If pre-existing track rows already claim the same video, migration selects a
 canonical mapping deterministically—preferring a row whose file exists, then

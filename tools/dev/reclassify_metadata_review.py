@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from music_vault.core.db import MusicVaultDB  # noqa: E402
+from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB  # noqa: E402
 from music_vault.core.paths import database_path  # noqa: E402
 from music_vault.metadata.review_reclassification import (  # noqa: E402
     MetadataReviewReclassifier,
@@ -43,8 +43,10 @@ def main() -> int:
         version = int(readonly.execute("PRAGMA user_version").fetchone()[0])
     finally:
         readonly.close()
-    if args.apply and version != 7:
-        raise SystemExit("Apply mode requires an already migrated schema-v7 database.")
+    if args.apply and version != CURRENT_SCHEMA_VERSION:
+        raise SystemExit(
+            "Apply mode requires a database at the current application schema."
+        )
 
     if args.apply:
         database = MusicVaultDB(path)

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from music_vault.core import paths as runtime_paths
-from music_vault.core.db import MusicVaultDB
+from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB
 from music_vault.ui import review as ui_review
 from tools.dev import run_batch10_3_source_migration_proof as source_proof
 
@@ -97,9 +97,9 @@ def test_batch10_3_source_ui_smoke_uses_real_window_handlers_offline(
         evidence = ui_review.validate_batch10_3_review_behaviors(window, plan)
 
         assert runtime_checks["resolver_isolated"] is True
-        assert runtime_checks["schema_version"] == 7
+        assert runtime_checks["schema_version"] == CURRENT_SCHEMA_VERSION
         assert evidence["packaged_process"] is False
-        assert evidence["schema_version"] == 7
+        assert evidence["schema_version"] == CURRENT_SCHEMA_VERSION
         assert evidence["canonical_multi_edition_card_count"] >= 1
         assert evidence["soundtrack_card_count"] >= 1
         assert evidence["score_card_count"] >= 1

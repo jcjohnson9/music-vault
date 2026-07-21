@@ -122,12 +122,16 @@ def test_database_identity_prevents_duplicate_after_folder_change(tmp_path):
     assert config.archive_file.read_text(encoding="utf-8").count("abcdefghijk") == 1
 
 
-def test_existing_unimported_file_is_returned_for_targeted_import(tmp_path):
+def test_existing_unimported_file_is_returned_for_targeted_import(tmp_path, monkeypatch):
     config = _config(tmp_path)
     folder = config.output_dir / "Old"
     folder.mkdir(parents=True)
     media = folder / "Song [abcdefghijk].mp3"
     media.write_bytes(b"synthetic")
+    monkeypatch.setattr(
+        "music_vault.core.youtube_sync.is_verified_reusable_audio",
+        lambda path, **_kwargs: Path(path) == media,
+    )
     result = FakeSyncer(config, [_entry()]).sync()
     assert result.existing_count == 1
     assert result.import_items == [SyncImportItem(str(media.resolve()), "abcdefghijk")]

@@ -131,8 +131,8 @@ def _downgrade_metadata_checks_to_v5(path: Path) -> None:
 
 def test_new_database_initializes_schema_v6_models_and_constraints(tmp_path: Path):
     db = MusicVaultDB(tmp_path / "new.sqlite3")
-    assert CURRENT_SCHEMA_VERSION == 7
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert CURRENT_SCHEMA_VERSION == 8
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     columns = {row[1] for row in db.conn.execute("PRAGMA table_info(tracks)")}
     assert {
         "original_release_date",
@@ -205,7 +205,7 @@ def test_v5_migration_verified_backup_preserves_state_and_seeds_one_exact_credit
 
     backups = tmp_path / "backups"
     db = MusicVaultDB(path, backup_dir=backups)
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     assert db.last_migration_backup and db.last_migration_backup.is_file()
     with sqlite3.connect(db.last_migration_backup) as backup:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 5

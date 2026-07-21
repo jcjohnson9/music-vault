@@ -582,6 +582,35 @@ def _send_review_key(
     QApplication.processEvents()
 
 
+def _normalize_party_review_shortcut_focus(party: object, app: object) -> None:
+    """Give synthetic Party Mode shortcuts a stable, non-editor focus owner."""
+
+    from PySide6.QtWidgets import (
+        QAbstractSpinBox,
+        QApplication,
+        QComboBox,
+        QLineEdit,
+        QTextEdit,
+    )
+
+    # Changing the active QStackedLayout page can post a second focus update
+    # while the first event pass is running.  Drain that transition before
+    # moving focus away from the lyrics editor or the underlying main window.
+    app.processEvents()
+    app.processEvents()
+    focus = QApplication.focusWidget()
+    if focus is not None:
+        focus.clearFocus()
+    party.activateWindow()
+    party.help_button.setFocus(Qt.FocusReason.OtherFocusReason)
+    app.processEvents()
+    if isinstance(
+        QApplication.focusWidget(),
+        (QLineEdit, QTextEdit, QComboBox, QAbstractSpinBox),
+    ):
+        raise ReviewPlanError("Party Mode review shortcut focus remained in an editor.")
+
+
 def _party_playback_snapshot(window: object) -> dict[str, object]:
     return {
         "source": str(window.player.source().toLocalFile()),
@@ -623,7 +652,7 @@ def _status_field_names(value: object) -> set[str]:
     return set()
 
 
-def _validate_party_status(plan: ReviewPlan, *, expected_track_id: int) -> bool:
+def _validate_party_status(plan: ReviewPlan, *, expected_queue_count: int) -> bool:
     from music_vault.core.paths import app_status_path
 
     status_path = app_status_path().resolve()
@@ -645,10 +674,19 @@ def _validate_party_status(plan: ReviewPlan, *, expected_track_id: int) -> bool:
     ):
         raise ReviewPlanError("Party Mode App Status lyrics state is inaccurate.")
     playback = payload.get("playback")
-    if not isinstance(playback, dict) or not (
-        playback.get("currently_playing") == expected_track_id
-        and playback.get("queue_count") == 1
+    if not isinstance(playback, dict):
+        raise ReviewPlanError("Party Mode App Status playback state is inaccurate.")
+    if any(
+        playback.get(field) is not None
+        for field in (
+            "currently_playing",
+            "current_title",
+            "current_artist",
+            "current_album",
+        )
     ):
+        raise ReviewPlanError("Party Mode App Status exposed playback identity.")
+    if playback.get("queue_count") != int(expected_queue_count):
         raise ReviewPlanError("Party Mode App Status playback state is inaccurate.")
     if _PARTY_REVIEW_FORBIDDEN_STATUS_FIELDS.intersection(_status_field_names(payload)):
         raise ReviewPlanError("Party Mode App Status exposed audio-analysis data.")
@@ -905,6 +943,16 @@ def validate_party_review_behaviors(
     if not party._help_visible or not party.help_panel.isVisible():
         raise ReviewPlanError("Party Mode shortcut help did not open.")
     _send_review_key(party, Qt.Key.Key_Question, text="?")
+    _wait_for_review_state(
+        app,
+        lambda: (
+            not party._help_visible
+            and party.root_stack.currentWidget() is party.overlay
+        ),
+        timeout=1.0,
+        label="closed shortcut help",
+    )
+    _normalize_party_review_shortcut_focus(party, app)
     _send_review_key(party, Qt.Key.Key_H, text="h")
     if party.overlay_visible:
         raise ReviewPlanError("Party Mode overlay did not hide.")
@@ -1129,7 +1177,7 @@ def validate_party_review_behaviors(
             label="final audio-reactive state",
         )
     window.write_app_status()
-    status_safe = _validate_party_status(plan, expected_track_id=track_ids[1])
+    status_safe = _validate_party_status(plan, expected_queue_count=1)
     if _REVIEW_NETWORK_EVENTS:
         raise ReviewPlanError("Party Mode review attempted network access.")
 

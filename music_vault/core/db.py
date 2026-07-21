@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Optional
 
 from .paths import database_path
+from .media_quality_schema import (
+    create_media_quality_schema,
+    get_track_media_quality as get_track_media_quality_row,
+    seed_existing_track_media_quality,
+    track_media_quality_summary as aggregate_track_media_quality,
+    upsert_track_media_quality as upsert_track_media_quality_row,
+)
 from .playlist_membership import PlaylistMembershipService, PlaylistRemovalResult
 from .safety import extract_source_video_id, normalize_source_upload_date, sanitize_error_text
 from .sync_schema import (
@@ -35,7 +42,7 @@ from music_vault.metadata.canonical_albums import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -381,6 +388,8 @@ class MusicVaultDB:
                 seed_existing_artist_credits(self.conn)
                 create_canonical_media_schema(self.conn)
                 seed_existing_canonical_albums(self.conn)
+                create_media_quality_schema(self.conn)
+                seed_existing_track_media_quality(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
                 self._verify_database_integrity()
             self.initialized_new_database = True
@@ -420,22 +429,28 @@ class MusicVaultDB:
                 # orchestrator constructs no provider client and never reads
                 # or writes media, tags, secrets, or portrait files.  Current
                 # schema-7 startup deliberately does not invoke this repair.
-                from music_vault.metadata.acceptance_repair import (
-                    apply_metadata_acceptance_repair,
-                )
+                allowed_artist_reductions = 0
+                allowed_credit_reductions = 0
+                if version < 7:
+                    from music_vault.metadata.acceptance_repair import (
+                        apply_metadata_acceptance_repair,
+                    )
 
-                consolidation = apply_metadata_acceptance_repair(self)
+                    consolidation = apply_metadata_acceptance_repair(self)
+                    allowed_artist_reductions = max(
+                        0, int(consolidation.deleted_artist_count)
+                    )
+                    allowed_credit_reductions = max(
+                        0, int(consolidation.deleted_credit_count)
+                    )
+                create_media_quality_schema(self.conn)
+                seed_existing_track_media_quality(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
-                allowed_artist_reductions = max(
-                    0, int(consolidation.deleted_artist_count)
-                )
                 self._verify_existing_table_counts_preserved(
                     baseline_counts,
                     allowed_reductions={
                         "artists": allowed_artist_reductions,
-                        "track_artist_credits": max(
-                            0, int(consolidation.deleted_credit_count)
-                        ),
+                        "track_artist_credits": allowed_credit_reductions,
                     },
                 )
                 self._verify_database_integrity()
@@ -456,6 +471,8 @@ class MusicVaultDB:
                 seed_existing_artist_credits(self.conn)
                 create_canonical_media_schema(self.conn)
                 seed_existing_canonical_albums(self.conn)
+                create_media_quality_schema(self.conn)
+                seed_existing_track_media_quality(self.conn)
                 self._verify_database_integrity()
 
     def upsert_track(
@@ -556,6 +573,8 @@ class MusicVaultDB:
                 )
             seed_existing_artist_credits(self.conn, (track_id,))
             upsert_track_canonical_album(self.conn, track_id)
+            create_media_quality_schema(self.conn)
+            seed_existing_track_media_quality(self.conn, (track_id,))
             return track_id
 
         if commit:
@@ -666,6 +685,33 @@ class MusicVaultDB:
 
     def get_track(self, track_id: int) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
+
+    def get_track_media_quality(self, track_id: int) -> Optional[sqlite3.Row]:
+        return get_track_media_quality_row(self.conn, int(track_id))
+
+    def upsert_track_media_quality(
+        self,
+        track_id: int,
+        *,
+        commit: bool = True,
+        **quality_facts: object,
+    ) -> sqlite3.Row:
+        def persist() -> sqlite3.Row:
+            if self.get_track(int(track_id)) is None:
+                raise KeyError(f"Track {int(track_id)} does not exist.")
+            return upsert_track_media_quality_row(
+                self.conn,
+                int(track_id),
+                **quality_facts,
+            )
+
+        if commit:
+            with self.conn:
+                return persist()
+        return persist()
+
+    def track_media_quality_summary(self) -> dict[str, int]:
+        return aggregate_track_media_quality(self.conn)
 
     def canonical_track_id(
         self,

@@ -147,8 +147,8 @@ def test_edition_parser_does_not_strip_meaningful_work_identity():
 
 def test_schema_v7_tables_indexes_constraints_and_field_level_outcomes(tmp_path: Path):
     db = MusicVaultDB(tmp_path / "schema.sqlite3")
-    assert CURRENT_SCHEMA_VERSION == 7
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert CURRENT_SCHEMA_VERSION == 8
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     tables = {
         str(row[0])
         for row in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -370,7 +370,7 @@ def test_schema6_migration_accepts_only_reported_safe_artist_reductions(
     db.close()
 
     migrated = MusicVaultDB(path, backup_dir=tmp_path / "backups")
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     assert migrated.conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 2
     assert migrated.conn.execute("SELECT COUNT(*) FROM artists").fetchone()[0] == 1
     assert migrated.conn.execute(
