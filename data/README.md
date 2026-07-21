@@ -46,8 +46,8 @@ candidate artwork uses a provider-specific directory under `covers/`. These
 files and schema-migration backups must never be committed or included in a public
 build. Clear, reset, and undo do not automatically delete older cover files.
 
-The Batch 11 candidate on the v1.1.0 development line advances new and migrated
-local databases to schema version 8. Schema version 5 adds saved
+Batch 11 on the v1.1.0 development line advances new and migrated local
+databases to schema version 8. Schema version 5 adds saved
 synchronization sources, durable
 playlist-item occurrences, source runs, global video-to-track identities,
 identity-conflict diagnostics, and manual/source playlist origins. These tables

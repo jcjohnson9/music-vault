@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.dev import batch10_3_acceptance as acceptance  # noqa: E402
 from tools.dev import run_batch10_5_review as review  # noqa: E402
+from music_vault.core.db import CURRENT_SCHEMA_VERSION  # noqa: E402
 
 
 RUNTIME_PREFIX = "MusicVault_Batch10_5_PackagedSmoke_"
@@ -154,7 +155,10 @@ def prepare(runtime: Path, project_root: Path) -> dict[str, Any]:
                 (LEGACY_FAILURE_IMPORT_MARKER, "synthetic_no_legacy_failures"),
             )
     counts = _database_counts(database)
-    if counts["schema_version"] != 7 or counts["review_count"] != 0:
+    if (
+        counts["schema_version"] != CURRENT_SCHEMA_VERSION
+        or counts["review_count"] != 0
+    ):
         raise SmokeFailure("synthetic_fixture_state_invalid")
     for secret_name in ("youtube_api_key.txt", "discogs_token.txt"):
         if (runtime / "data" / secret_name).exists():
@@ -191,7 +195,7 @@ def prepare(runtime: Path, project_root: Path) -> dict[str, Any]:
             "no_secrets": True,
             "providers_disabled": True,
             "network_observation_required": True,
-            "synthetic_schema_7": True,
+            "synthetic_current_schema": True,
         },
         "raw_library_values_emitted": False,
     }
@@ -220,7 +224,7 @@ def _review_evidence(path: Path) -> dict[str, Any]:
         or captures[0].get("scene") != "batch10_5_smoke"
         or not isinstance(behaviors, dict)
         or behaviors.get("packaged_process") is not True
-        or int(behaviors.get("schema_version", -1)) != 7
+        or int(behaviors.get("schema_version", -1)) != CURRENT_SCHEMA_VERSION
         or int(behaviors.get("network_attempt_count", -1)) != 0
         or any(behaviors.get(name) is not True for name in REQUIRED_BEHAVIOR_FIELDS)
     ):
@@ -271,7 +275,9 @@ def verify(
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SmokeFailure("app_status_unavailable") from exc
     checks = {
-        "schema_7_preserved": counts["schema_version"] == 7,
+        "current_schema_preserved": (
+            counts["schema_version"] == CURRENT_SCHEMA_VERSION
+        ),
         "database_bytes_unchanged": (
             _sha256(database) == before_database["sha256"]
             and database.stat().st_size == before_database["size"]

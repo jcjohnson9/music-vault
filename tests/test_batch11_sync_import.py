@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PySide6.QtGui import QColor, QImage
 
 from music_vault.core.audio_inspection import AudioInspection
 from music_vault.core.audio_quality_config import (
@@ -11,7 +12,7 @@ from music_vault.core.audio_quality_config import (
     MP3_320_COMPATIBILITY_PROFILE,
 )
 from music_vault.core.db import MusicVaultDB
-from music_vault.core.importer import import_file
+from music_vault.core.importer import ImportSourceContext, import_file
 from music_vault.core.multi_source_sync import MultiSourceSyncOrchestrator
 from music_vault.core.sync_result import (
     PlaylistSnapshot,
@@ -82,6 +83,18 @@ class _QualitySyncer:
         )
         if VIDEO_ID in set(self.config.existing_video_ids):
             result.existing_count = 1
+            result.successful_video_ids.add(VIDEO_ID)
+            return result
+        local_path = self.config.shared_download_index.get(VIDEO_ID)
+        if local_path is not None:
+            result.existing_count = 1
+            result.import_items.append(
+                SyncImportItem(
+                    str(local_path),
+                    VIDEO_ID,
+                    source_item_ids=(source_item_id,),
+                )
+            )
             result.successful_video_ids.add(VIDEO_ID)
             return result
 
@@ -181,11 +194,68 @@ def test_source_override_reuses_first_canonical_file_and_persists_quality(tmp_pa
         0,
         len(b"synthetic opus"),
     )
+    # Source B requests MP3 compatibility, but the shared canonical item is
+    # not redownloaded. Its result reports the already stored Best Original
+    # representation without double-counting an acquisition or stored bytes.
     assert tuple(run_rows[1]) == (compatibility.id, 0, 0, 0, 0, 0)
+    assert aggregate.source_outcomes[1].reused_quality_profile_counts == {
+        BEST_ORIGINAL_PROFILE: 1
+    }
+    assert aggregate.reused_quality_profile_counts == {
+        BEST_ORIGINAL_PROFILE: 1
+    }
+    assert aggregate.reused_stored_codec_counts == {"opus": 1}
     assert transitions[-1]["last_sync_source_preserved_remux_count"] == 1
     assert transitions[-1]["last_sync_total_stored_bytes"] == len(
         b"synthetic opus"
     )
+    db.close()
+
+
+def test_verified_acquisition_facts_survive_a_later_source_import_retry(tmp_path):
+    db = MusicVaultDB(tmp_path / "library.sqlite3")
+    sources = SyncSourceService(db)
+    sources.create_source("PLbatch11RA", label="Initial import failure")
+    sources.create_source("PLbatch11RB", label="Retry source")
+    calls: list[object] = []
+    import_attempts = 0
+
+    def retrying_importer(target_db, item: SyncImportItem) -> int:
+        nonlocal import_attempts
+        import_attempts += 1
+        if import_attempts == 1:
+            raise RuntimeError("Synthetic first import failure")
+        return _synthetic_import(target_db, item)
+
+    orchestrator = MultiSourceSyncOrchestrator(
+        db,
+        tmp_path / "downloads",
+        archive_file=tmp_path / "archive.txt",
+        source_service=sources,
+        syncer_factory=lambda config, report: _QualitySyncer(
+            config,
+            report,
+            calls,
+        ),
+        importer=retrying_importer,
+    )
+
+    aggregate = orchestrator.sync_all_enabled()
+
+    assert aggregate.total_downloaded == 1
+    assert aggregate.total_existing == 1
+    assert aggregate.total_imported == 1
+    assert aggregate.source_outcomes[0].status == "complete_with_issues"
+    assert aggregate.source_outcomes[1].status == "complete"
+    assert import_attempts == 2
+    assert len(list((tmp_path / "downloads").rglob("*.opus"))) == 1
+    track = db.conn.execute("SELECT id FROM tracks").fetchone()
+    quality = db.get_track_media_quality(track["id"])
+    assert quality["acquisition_profile"] == BEST_ORIGINAL_PROFILE
+    assert quality["source_format_id"] == "synthetic-opus"
+    assert quality["source_codec"] == quality["stored_codec"] == "opus"
+    assert aggregate.total_source_preserved_remux == 1
+    assert aggregate.total_stored_bytes == len(b"synthetic opus")
     db.close()
 
 
@@ -256,7 +326,17 @@ def _patch_webm_import(monkeypatch, inspection: AudioInspection) -> None:
         "discover_ffmpeg",
         lambda: SimpleNamespace(ready=True, ffprobe_path=Path("ffprobe.exe")),
     )
-    monkeypatch.setattr(importer, "inspect_audio_file", lambda *_args, **_kwargs: inspection)
+    monkeypatch.setattr(
+        importer,
+        "is_verified_audio_only_webm",
+        lambda *_args, **_kwargs: bool(
+            inspection.audio_stream_count is not None
+            and inspection.audio_stream_count >= 1
+            and inspection.video_stream_count == 0
+            and inspection.codec
+            in {"opus", "aac", "vorbis", "mp3", "flac", "alac"}
+        ),
+    )
     monkeypatch.setattr(
         importer,
         "read_audio_metadata",
@@ -326,4 +406,122 @@ def test_webm_import_rejects_video_inconclusive_or_unsupported_media(
     assert db.conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 0
     assert media.read_bytes() == before_bytes
     assert media.stat().st_mtime_ns == before_mtime
+    db.close()
+
+
+def test_native_import_keeps_a_private_thumbnail_without_replacing_valid_artwork(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from music_vault.core import importer
+
+    media = tmp_path / f"Native [{VIDEO_ID}].opus"
+    media.write_bytes(b"synthetic native audio")
+    before_media = (media.read_bytes(), media.stat().st_mtime_ns)
+    first_thumbnail = tmp_path / f"First [{VIDEO_ID}].png"
+    second_thumbnail = tmp_path / f"Second [{VIDEO_ID}].png"
+    for path, color in (
+        (first_thumbnail, QColor("#336699")),
+        (second_thumbnail, QColor("#993366")),
+    ):
+        image = QImage(3, 3, QImage.Format.Format_ARGB32)
+        image.fill(color)
+        assert image.save(str(path), "PNG")
+    monkeypatch.setattr(importer, "covers_dir", lambda: tmp_path / "private-covers")
+    monkeypatch.setattr(
+        importer,
+        "read_audio_metadata",
+        lambda _path: {
+            "title": "Synthetic Native",
+            "artist": None,
+            "album": None,
+            "album_artist": None,
+            "release_date": None,
+            "year": None,
+            "duration_seconds": 1.0,
+            "title_provenance": "embedded",
+        },
+    )
+    monkeypatch.setattr(importer, "extract_embedded_cover", lambda _path: None)
+    db = MusicVaultDB(tmp_path / "library.sqlite3")
+
+    assert import_file(
+        db,
+        media,
+        ImportSourceContext(
+            "youtube",
+            VIDEO_ID,
+            private_cover_path=str(first_thumbnail),
+        ),
+    )
+    track = db.conn.execute(
+        "SELECT id, cover_path FROM tracks WHERE path=?",
+        (str(media.resolve()),),
+    ).fetchone()
+    first_private_cover = Path(track["cover_path"])
+    assert first_private_cover.is_file()
+    assert first_private_cover.is_relative_to((tmp_path / "private-covers").resolve())
+
+    assert import_file(
+        db,
+        media,
+        ImportSourceContext(
+            "youtube",
+            VIDEO_ID,
+            private_cover_path=str(second_thumbnail),
+        ),
+    )
+    refreshed_cover = db.conn.execute(
+        "SELECT cover_path FROM tracks WHERE id=?",
+        (track["id"],),
+    ).fetchone()[0]
+    assert Path(refreshed_cover).resolve() == first_private_cover.resolve()
+    assert (media.read_bytes(), media.stat().st_mtime_ns) == before_media
+    db.close()
+
+
+def test_optional_private_cover_storage_failure_does_not_fail_audio_import(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from music_vault.core import importer
+
+    media = tmp_path / f"Native [{VIDEO_ID}].opus"
+    media.write_bytes(b"synthetic native audio")
+    thumbnail = tmp_path / f"Native [{VIDEO_ID}].png"
+    image = QImage(3, 3, QImage.Format.Format_ARGB32)
+    image.fill(QColor("#336699"))
+    assert image.save(str(thumbnail), "PNG")
+    monkeypatch.setattr(
+        importer,
+        "read_audio_metadata",
+        lambda _path: {
+            "title": "Synthetic Native",
+            "artist": None,
+            "album": None,
+            "album_artist": None,
+            "release_date": None,
+            "year": None,
+            "duration_seconds": 1.0,
+            "title_provenance": "embedded",
+        },
+    )
+    monkeypatch.setattr(importer, "extract_embedded_cover", lambda _path: None)
+    monkeypatch.setattr(
+        importer,
+        "_save_cover",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("synthetic")),
+    )
+    db = MusicVaultDB(tmp_path / "library.sqlite3")
+
+    assert import_file(
+        db,
+        media,
+        ImportSourceContext(
+            "youtube",
+            VIDEO_ID,
+            private_cover_path=str(thumbnail),
+        ),
+    )
+    assert db.conn.execute("SELECT cover_path FROM tracks").fetchone()[0] is None
     db.close()

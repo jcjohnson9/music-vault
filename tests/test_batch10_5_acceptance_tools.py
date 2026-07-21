@@ -4,12 +4,14 @@ import hashlib
 import json
 import socket
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from music_vault.core.db import MusicVaultDB
+from music_vault.core import db as db_module
+from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB
 from music_vault.metadata import acceptance_repair
 from music_vault.metadata.artist_consolidation import (
     ArtistConsolidationPlan,
@@ -17,6 +19,23 @@ from music_vault.metadata.artist_consolidation import (
 )
 from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
 from tools.dev import batch10_5_acceptance as gate
+
+
+@contextmanager
+def _schema7_database_runtime():
+    """Build genuine historical schema-7 fixtures for the Batch 10.5 gate."""
+    original_version = db_module.CURRENT_SCHEMA_VERSION
+    original_create = db_module.create_media_quality_schema
+    original_seed = db_module.seed_existing_track_media_quality
+    db_module.CURRENT_SCHEMA_VERSION = 7
+    db_module.create_media_quality_schema = lambda _connection: None
+    db_module.seed_existing_track_media_quality = lambda _connection, *_track_ids: None
+    try:
+        yield
+    finally:
+        db_module.CURRENT_SCHEMA_VERSION = original_version
+        db_module.create_media_quality_schema = original_create
+        db_module.seed_existing_track_media_quality = original_seed
 
 
 def _runtime(tmp_path: Path, *, tracks: int = 2) -> tuple[Path, Path, Path]:
@@ -28,17 +47,18 @@ def _runtime(tmp_path: Path, *, tracks: int = 2) -> tuple[Path, Path, Path]:
     media.mkdir(parents=True)
     cache.mkdir(parents=True)
     database = data / "music_vault.sqlite3"
-    db = MusicVaultDB(database, backup_dir=data / "backups")
-    for index in range(tracks):
-        path = media / f"track-{index}.synthetic-audio"
-        path.write_bytes(f"synthetic-{index}".encode("ascii"))
-        db.upsert_track(
-            path,
-            title=f"Synthetic Title {index}",
-            artist="Synthetic Artist",
-            album="Synthetic Album",
-        )
-    db.close()
+    with _schema7_database_runtime():
+        db = MusicVaultDB(database, backup_dir=data / "backups")
+        for index in range(tracks):
+            path = media / f"track-{index}.synthetic-audio"
+            path.write_bytes(f"synthetic-{index}".encode("ascii"))
+            db.upsert_track(
+                path,
+                title=f"Synthetic Title {index}",
+                artist="Synthetic Artist",
+                album="Synthetic Album",
+            )
+        db.close()
     (cache / "index.json").write_text(
         json.dumps({"schema_version": 1, "entries": {}, "aliases": {}}),
         encoding="utf-8",
@@ -436,7 +456,10 @@ def test_ordinary_schema7_startup_does_not_auto_run_acceptance_repair(
     del root, cache
     reopened = MusicVaultDB(database, backup_dir=tmp_path / "reopen-backups")
     try:
-        assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert (
+            reopened.conn.execute("PRAGMA user_version").fetchone()[0]
+            == CURRENT_SCHEMA_VERSION
+        )
         assert reopened.conn.execute(
             "SELECT COUNT(*) FROM app_meta WHERE key=?", (gate.REPAIR_MARKER,)
         ).fetchone()[0] == 0
@@ -451,7 +474,10 @@ def test_future_pre7_migration_writes_marker_only_after_success(tmp_path: Path) 
         conn.execute("PRAGMA user_version=6")
     migrated = MusicVaultDB(database, backup_dir=tmp_path / "migration-backups")
     try:
-        assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert (
+            migrated.conn.execute("PRAGMA user_version").fetchone()[0]
+            == CURRENT_SCHEMA_VERSION
+        )
         assert migrated.conn.execute(
             "SELECT value FROM app_meta WHERE key=?", (gate.REPAIR_MARKER,)
         ).fetchone()[0] == "1"

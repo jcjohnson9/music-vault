@@ -680,7 +680,7 @@ def test_prerelease_schema7_adds_release_identity_columns_idempotently(tmp_path:
     db.close()
 
     reopened = MusicVaultDB(path)
-    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     assert {
         "musicbrainz_release_group_id",
         "provider_release_family_id",

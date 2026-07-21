@@ -7,6 +7,7 @@ import wave
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QMainWindow
@@ -172,6 +173,47 @@ def test_party_status_forbidden_field_scan_is_recursive() -> None:
     assert review._PARTY_REVIEW_FORBIDDEN_STATUS_FIELDS.intersection(
         review._status_field_names(unsafe)
     ) == {"samples"}
+
+
+def test_party_status_requires_redacted_identity_and_preserves_queue_count(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    status_path = runtime / "data" / "music_vault_status.json"
+    status_path.parent.mkdir(parents=True)
+    output = tmp_path / "output"
+    plan = ReviewPlan(
+        request_path=runtime / "plan.json",
+        runtime_root=runtime.resolve(),
+        output_dir=output.resolve(),
+        sizes=(ReviewSize(1280, 720),),
+        scenes=PARTY_REVIEW_SCENES,
+        settle_ms=100,
+    )
+    monkeypatch.setattr("music_vault.core.paths.app_status_path", lambda: status_path)
+    payload = {
+        "party_mode_active": True,
+        "party_mode_preset": "aurora",
+        "party_mode_lyrics_enabled": True,
+        "lyrics_available": True,
+        "lyrics_synchronized": True,
+        "playback": {
+            "currently_playing": None,
+            "current_title": None,
+            "current_artist": None,
+            "current_album": None,
+            "queue_count": 1,
+        },
+        "paths": {},
+    }
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert review._validate_party_status(plan, expected_queue_count=1)
+
+    payload["playback"]["currently_playing"] = 42
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(review.ReviewPlanError, match="exposed playback identity"):
+        review._validate_party_status(plan, expected_queue_count=1)
 
 
 def test_review_only_lyrics_provider_is_bounded_and_offline(monkeypatch) -> None:

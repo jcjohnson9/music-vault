@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from music_vault.core.db import CURRENT_SCHEMA_VERSION
 from music_vault.core import paths as runtime_paths
 from music_vault.ui import review as ui_review
 
@@ -44,7 +45,10 @@ def test_prepare_seeds_one_queued_dual_orientation_target(tmp_path: Path):
     runtime = _runtime(tool)
     try:
         manifest = tool.prepare(runtime, _synthetic_project(tmp_path))
-        assert manifest["database"]["counts"]["schema_version"] == 7
+        assert (
+            manifest["database"]["counts"]["schema_version"]
+            == CURRENT_SCHEMA_VERSION
+        )
         assert manifest["seed"] == {
             "orientation_target_count": 1,
             "automatic_queued_count": 1,
@@ -79,7 +83,7 @@ def test_review_manifest_requires_every_batch10_6_behavior(tmp_path: Path):
     behaviors.update(
         {
             "packaged_process": True,
-            "schema_version": 7,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "processed_count": 1,
             "discogs_query_count": 2,
             "musicbrainz_query_count": 1,

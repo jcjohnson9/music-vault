@@ -310,7 +310,7 @@ public tag, or Release.
 
 **Status:** Complete on the v1.1.0 development line after targeted/private,
 packaged, regression, build, CI, and delivery gates. Stable remains v1.0.0;
-Batch 11 is active and pending its ordinary delivery gates.
+Batch 11 followed on the same development line.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original
 
@@ -328,12 +328,12 @@ media.
 FLAC/WAV conversion theater, no Hi-Res claim, no automatic library upgrade,
 and no broad native-container tag writeback.
 
-**Status:** Implementation is in progress on the v1.1.0 development line and
-remains pending the ordinary Batch 11 regression, build, essential E2E, live
-migration, CI, merge, and cleanup gates. Do not mark Batch 11 Complete until
-those gates pass. Batches 1 through 10.6 remain Complete; stable remains
-v1.0.0 and development remains v1.1.0. Remaining metadata-polish items are
-deferred and are not Batch 11 blockers. Batch 12 is next only after acceptance.
+**Status:** Complete on the v1.1.0 development line after the ordinary focused
+and complete regression, official build, essential E2E, controlled live
+migration, branch/main CI, merge, and cleanup gates. Batches 1 through 11 are
+Complete; stable remains v1.0.0 and development remains v1.1.0. Remaining
+metadata-polish items are deferred and are not Batch 11 blockers. Batch 12 is
+Next.
 
 ## Batch 12 — Selective Library and Playlist Mobile Export
 
@@ -346,7 +346,7 @@ and incremental reconciliation.
 
 **Non-goals:** No Android application in this batch and no cloud account system.
 
-**Status:** Planned post-V1 and next after Batch 11 acceptance.
+**Status:** Next on the v1.1.0 development roadmap.
 
 ## Batch 13 — Independent Android Music Vault Foundation
 

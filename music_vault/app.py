@@ -692,12 +692,12 @@ class MusicVaultWindow(QMainWindow):
             isinstance(saved, dict)
             and "party_mode_config_version" not in saved
         )
-        if needs_party_migration or needs_audio_migration:
+        if needs_party_migration:
             party_source.pop("party_mode_config_version", None)
         config.update(normalize_party_mode_settings(party_source))
         config.update(normalize_lyrics_settings(config))
         config.update(normalize_metadata_intelligence_settings(config))
-        if needs_party_migration:
+        if needs_party_migration or needs_audio_migration:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = path.with_name(f"{path.name}.tmp")
@@ -1606,6 +1606,33 @@ class MusicVaultWindow(QMainWindow):
             f"imported {int(getattr(result, 'total_imported', 0) or 0)}, "
             f"failed items {int(getattr(result, 'total_failed_items', 0) or 0)}."
         )
+        reused_profiles = getattr(result, "reused_quality_profile_counts", {})
+        reused_codecs = getattr(result, "reused_stored_codec_counts", {})
+        if isinstance(reused_profiles, dict) and any(reused_profiles.values()):
+            profile_labels = {
+                "best_original": "Best Original",
+                "mp3_320_compatibility": "MP3 320 Compatibility",
+                "legacy_youtube_mp3": "Legacy YouTube MP3",
+                "local_import": "Local Original",
+                "unknown": "Unknown",
+            }
+            profile_summary = ", ".join(
+                f"{profile_labels.get(profile, 'Unknown')} {int(count)}"
+                for profile, count in sorted(reused_profiles.items())
+                if int(count) > 0
+            )
+            codec_summary = ", ".join(
+                f"{str(codec).upper()} {int(count)}"
+                for codec, count in sorted(
+                    reused_codecs.items()
+                    if isinstance(reused_codecs, dict)
+                    else ()
+                )
+                if int(count) > 0
+            )
+            summary += f" Reused existing representations: {profile_summary}."
+            if codec_summary:
+                summary += f" Stored codecs reused: {codec_summary}."
         if status == "complete":
             QMessageBox.information(self, "Source synchronization complete", summary)
         else:
@@ -3626,7 +3653,11 @@ class MusicVaultWindow(QMainWindow):
         if not folder:
             return
 
-        count = import_folder(self.db, folder)
+        count = import_folder(
+            self.db,
+            folder,
+            ffprobe_path=self.import_ffprobe_path(),
+        )
         if count:
             self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)
             self.wake_metadata_intelligence()
@@ -3761,40 +3792,8 @@ class MusicVaultWindow(QMainWindow):
         if not isinstance(result, SyncResult):
             result = SyncResult.failed_result("The sync worker returned an invalid result.")
 
-        imported_count = 0
-        for item in result.import_items:
-            try:
-                imported = import_file(
-                    self.db,
-                    item.path,
-                    ImportSourceContext(
-                        source_kind="youtube",
-                        source_video_id=item.video_id,
-                        source_upload_date=item.source_upload_date,
-                    ),
-                )
-                canonical_track_id = self.db.canonical_track_id(
-                    "youtube",
-                    item.video_id,
-                )
-                if item.quality_facts and canonical_track_id is not None:
-                    self.db.upsert_track_media_quality(
-                        canonical_track_id,
-                        **dict(item.quality_facts),
-                    )
-                    result.record_quality_facts(item.quality_facts)
-                if imported:
-                    imported_count += 1
-                    result.successful_video_ids.add(item.video_id)
-            except Exception as exc:
-                result.add_failure(
-                    SyncFailure(
-                        item.video_id,
-                        Path(item.path).stem,
-                        sanitize_error_text(exc),
-                        "import",
-                    )
-                )
+        imported_count = self._import_legacy_youtube_items(result)
+        self._record_legacy_youtube_reused_quality_facts(result)
 
         result.finish_imports(imported_count)
         if imported_count:
@@ -3849,7 +3848,122 @@ class MusicVaultWindow(QMainWindow):
             self.log_youtube(f"- {failure.title or failure.video_id or 'Sync'}: {failure.reason}")
 
         sources = self.sync_source_service.list_active()
-        self.app_sync_status = {
+        self.app_sync_status = self._legacy_youtube_status_payload(
+            result,
+            sync_source_count=len(sources),
+            enabled_sync_source_count=sum(source.enabled for source in sources),
+        )
+        self.write_app_status()
+
+        summary = (
+            f"{values['status']}. Downloaded {result.downloaded_count}, "
+            f"imported {result.imported_count}, failed {result.failed_count}."
+        )
+        if result.status == "complete":
+            QMessageBox.information(self, "YouTube sync complete", summary)
+        else:
+            QMessageBox.warning(self, "YouTube sync result", summary)
+
+    def _import_legacy_youtube_items(self, result: SyncResult) -> int:
+        """Import legacy-worker results only from the configured download root."""
+
+        download_root = Path(
+            self.config.get("download_folder") or default_downloads_dir()
+        ).expanduser().resolve()
+        import_ffprobe_path = (
+            self.import_ffprobe_path()
+            if any(
+                Path(item.path).suffix.casefold() == ".webm"
+                for item in result.import_items
+            )
+            else None
+        )
+        imported_count = 0
+        for item in result.import_items:
+            try:
+                item_path = Path(item.path).expanduser().resolve()
+                if not item_path.is_relative_to(download_root):
+                    raise RuntimeError(
+                        "The downloaded source file is outside the configured download folder."
+                    )
+                if not item_path.is_file():
+                    raise RuntimeError("The downloaded source file is missing.")
+                imported = import_file(
+                    self.db,
+                    item_path,
+                    ImportSourceContext(
+                        source_kind="youtube",
+                        source_video_id=item.video_id,
+                        source_upload_date=item.source_upload_date,
+                        private_cover_path=item.private_cover_path,
+                        ffprobe_path=import_ffprobe_path,
+                    ),
+                )
+                if not imported:
+                    raise RuntimeError("The downloaded source file could not be imported.")
+                canonical_track_id = self.db.canonical_track_id(
+                    "youtube",
+                    item.video_id,
+                    require_existing_file=True,
+                )
+                if canonical_track_id is None:
+                    raise RuntimeError("The imported source track could not be located.")
+                canonical_track = self.db.get_track(canonical_track_id)
+                if canonical_track is None:
+                    raise RuntimeError("The imported source track could not be located.")
+                canonical_path = Path(str(canonical_track["path"])).resolve()
+                if canonical_path != item_path:
+                    raise RuntimeError(
+                        "The imported source track does not match the downloaded file."
+                    )
+                if item.quality_facts:
+                    self.db.upsert_track_media_quality(
+                        canonical_track_id,
+                        **dict(item.quality_facts),
+                    )
+                    result.record_quality_facts(item.quality_facts)
+                imported_count += 1
+                result.successful_video_ids.add(item.video_id)
+            except Exception as exc:
+                result.add_failure(
+                    SyncFailure(
+                        item.video_id,
+                        Path(item.path).stem,
+                        sanitize_error_text(exc),
+                        "import",
+                    )
+                )
+        return imported_count
+
+    def _record_legacy_youtube_reused_quality_facts(
+        self,
+        result: SyncResult,
+    ) -> None:
+        """Record reused representations without counting a new acquisition."""
+
+        import_video_ids = {item.video_id for item in result.import_items}
+        for video_id in sorted(result.successful_video_ids - import_video_ids):
+            canonical_track_id = self.db.canonical_track_id(
+                "youtube",
+                video_id,
+                require_existing_file=True,
+            )
+            if canonical_track_id is None:
+                continue
+            stored_facts = self.db.get_track_media_quality(canonical_track_id)
+            if stored_facts is not None:
+                result.record_reused_quality_facts(dict(stored_facts))
+
+    @staticmethod
+    def _legacy_youtube_status_payload(
+        result: SyncResult,
+        *,
+        sync_source_count: int,
+        enabled_sync_source_count: int,
+    ) -> dict[str, object]:
+        """Return the identity-free legacy summary with quality aggregates."""
+
+        return {
             "last_sync_at": result.finished_at,
             "last_sync_status": result.status,
             "last_sync_playlist_title": None,
@@ -3862,21 +3976,20 @@ class MusicVaultWindow(QMainWindow):
             "last_sync_existing_count": result.existing_count,
             "last_sync_failed_count": result.failed_count,
             "last_sync_failures": [],
-            "sync_source_count": len(sources),
-            "enabled_sync_source_count": sum(source.enabled for source in sources),
+            "sync_source_count": int(sync_source_count),
+            "enabled_sync_source_count": int(enabled_sync_source_count),
             "active_sync_batch": False,
             "active_sync_source_index": None,
+            "last_sync_source_preserved_count": result.source_preserved_count,
+            "last_sync_source_preserved_remux_count": (
+                result.source_preserved_remux_count
+            ),
+            "last_sync_mp3_compatibility_transcode_count": (
+                result.mp3_compatibility_transcode_count
+            ),
+            "last_sync_quality_failure_count": result.quality_failure_count,
+            "last_sync_total_stored_bytes": result.total_stored_bytes,
         }
-        self.write_app_status()
-
-        summary = (
-            f"{values['status']}. Downloaded {result.downloaded_count}, "
-            f"imported {result.imported_count}, failed {result.failed_count}."
-        )
-        if result.status == "complete":
-            QMessageBox.information(self, "YouTube sync complete", summary)
-        else:
-            QMessageBox.warning(self, "YouTube sync result", summary)
 
     def selected_track_id(self) -> int | None:
         row = self.library_table.currentRow()
@@ -4725,6 +4838,15 @@ class MusicVaultWindow(QMainWindow):
             self._last_ffmpeg_discovery = result
         return result
 
+    def import_ffprobe_path(self) -> Path | None:
+        """Return the centrally resolved probe used for guarded WebM imports."""
+
+        try:
+            result = self.discover_ffmpeg_readiness()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return result.ffprobe_path if result.ready else None
+
     def invalidate_ffmpeg_discovery(self) -> None:
         self._last_ffmpeg_discovery = None
 
@@ -4886,7 +5008,11 @@ class MusicVaultWindow(QMainWindow):
             try:
                 if not result.local_import_folder.is_dir():
                     raise FileNotFoundError("The selected import folder is unavailable.")
-                count = import_folder(self.db, str(result.local_import_folder))
+                count = import_folder(
+                    self.db,
+                    str(result.local_import_folder),
+                    ffprobe_path=self.import_ffprobe_path(),
+                )
                 imported_count = count
                 if count:
                     self.invalidate_browser_data(BrowserInvalidationReason.IMPORT_FOLDER)

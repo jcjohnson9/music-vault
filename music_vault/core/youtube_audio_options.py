@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -25,6 +26,7 @@ from .audio_quality import (
 _SUPPORTED_SOURCE_EXTENSIONS = frozenset(
     {".webm", ".m4a", ".mp4", ".ogg", ".opus", ".mp3", ".flac", ".aac", ".mkv"}
 )
+_ATOMIC_FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 
 class SourceFormatSelectionError(ValueError):
@@ -147,6 +149,8 @@ def source_format_eligibility(
 ) -> FormatEligibility:
     if not source.format_id:
         return FormatEligibility(False, "missing_format_id")
+    if not _ATOMIC_FORMAT_ID_RE.fullmatch(source.format_id):
+        return FormatEligibility(False, "non_atomic_format_id")
     if source.is_drm:
         return FormatEligibility(False, "drm")
     if source.codec not in SUPPORTED_SOURCE_CODECS:
@@ -241,9 +245,29 @@ def build_audio_download_plan(
     bitrate_ceiling_kbps: int = PRACTICAL_SOURCE_BITRATE_CEILING_KBPS,
 ) -> AudioDownloadPlan:
     selected_profile = normalize_profile(profile)
-    source = select_source_audio_format(
-        formats, bitrate_ceiling_kbps=bitrate_ceiling_kbps
-    )
+    normalized_formats = _coerce_formats(formats)
+    if selected_profile == MP3_320_COMPATIBILITY_PROFILE:
+        # yt-dlp's FFmpegExtractAudio intentionally stream-copies an input that
+        # is already MP3, even when ``preferredquality`` is set.  Exclude those
+        # sources so every successful compatibility plan really performs the
+        # lossy MP3 conversion that its provenance claims.
+        transcodable_formats = [
+            item for item in normalized_formats if item.codec != "mp3"
+        ]
+        try:
+            source = select_source_audio_format(
+                transcodable_formats,
+                bitrate_ceiling_kbps=bitrate_ceiling_kbps,
+            )
+        except SourceFormatSelectionError as exc:
+            raise SourceFormatSelectionError(
+                "MP3 320 Compatibility requires a supported non-MP3 source "
+                "so the compatibility transcode can be verified."
+            ) from exc
+    else:
+        source = select_source_audio_format(
+            normalized_formats, bitrate_ceiling_kbps=bitrate_ceiling_kbps
+        )
     if selected_profile == MP3_320_COMPATIBILITY_PROFILE:
         return AudioDownloadPlan(
             profile=selected_profile,
@@ -272,6 +296,7 @@ def build_yt_dlp_audio_options(
     plan: AudioDownloadPlan,
     *,
     embed_thumbnail: bool = True,
+    retain_thumbnail: bool = False,
 ) -> dict[str, Any]:
     """Build the profile-specific, single-stream yt-dlp option fragment.
 
@@ -301,7 +326,7 @@ def build_yt_dlp_audio_options(
     return {
         "format": plan.source.format_id,
         "noplaylist": True,
-        "writethumbnail": bool(embed_thumbnail),
+        "writethumbnail": bool(embed_thumbnail or retain_thumbnail),
         "write_all_thumbnails": False,
         "embedthumbnail": bool(embed_thumbnail),
         "addmetadata": True,

@@ -49,7 +49,7 @@ v1.1.0 development line. **Best Original** is the recommended default and keeps
 the selected supported source codec without lossy re-encoding; **MP3 320
 Compatibility** remains available for device/software compatibility and is
 explicitly described as a lossy transcode, not a fidelity improvement. Batch 11
-remains pending its ordinary delivery gates and is not part of public v1.0.0.
+is complete on the v1.1.0 development line and is not part of public v1.0.0.
 
 ## Install the portable release
 
@@ -285,11 +285,10 @@ Multiple Source Playlists, Batch 10.1 Discogs-first metadata intelligence,
 Batch 10.2 timestamp preservation, Batch 10.3 canonical media browsing, Batch
 10.4 migration-startup quiescence, and Batch 10.5 metadata acceptance and
 artist-identity correction, plus Batch 10.6 dual-orientation metadata
-acceptance, are complete on the v1.1.0 development line. Batch 11 Best Original
-audio quality is under ordinary-batch acceptance and must not be marked
-complete until its remaining gates pass; Batch 12 mobile export follows only
-after that acceptance. Remaining metadata-polish items are deferred and are not
-Batch 11 blockers. See the [roadmap](docs/ROADMAP.md).
+acceptance and Batch 11 Best Original audio quality, are complete on the v1.1.0
+development line. Batch 12 — Selective Library and Playlist Mobile Export is
+next. Remaining metadata-polish items are deferred and are not Batch 11
+blockers. See the [roadmap](docs/ROADMAP.md).
 
 ## Licensing
 

@@ -115,6 +115,13 @@ class SyncImportItem:
         compare=False,
         repr=False,
     )
+    # A newly downloaded, local thumbnail may be carried to the importer for
+    # content-addressed private cover storage. It is never exported to status.
+    private_cover_path: str | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass
@@ -143,6 +150,8 @@ class SyncResult:
     mp3_compatibility_transcode_count: int = 0
     quality_failure_count: int = 0
     total_stored_bytes: int = 0
+    reused_quality_profile_counts: dict[str, int] = field(default_factory=dict)
+    reused_stored_codec_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def failed_count(self) -> int:
@@ -176,6 +185,33 @@ class SyncResult:
         except (TypeError, ValueError, OverflowError):
             stored_bytes = 0
         self.total_stored_bytes += max(0, stored_bytes)
+
+    def record_reused_quality_facts(
+        self,
+        values: Mapping[str, object] | None,
+    ) -> None:
+        """Report an existing representation without counting a new acquisition."""
+
+        if not isinstance(values, Mapping):
+            return
+        profile = str(values.get("acquisition_profile") or "unknown").strip().casefold()
+        if profile not in {
+            "best_original",
+            "mp3_320_compatibility",
+            "legacy_youtube_mp3",
+            "local_import",
+            "unknown",
+        }:
+            profile = "unknown"
+        self.reused_quality_profile_counts[profile] = (
+            self.reused_quality_profile_counts.get(profile, 0) + 1
+        )
+        codec = str(values.get("stored_codec") or "unknown").strip().casefold()
+        if codec not in {"opus", "aac", "vorbis", "mp3", "flac", "alac"}:
+            codec = "unknown"
+        self.reused_stored_codec_counts[codec] = (
+            self.reused_stored_codec_counts.get(codec, 0) + 1
+        )
 
     def finish_imports(self, imported_count: int) -> None:
         self.imported_count = imported_count
@@ -274,6 +310,8 @@ class MultiSourceSyncResult:
     total_mp3_compatibility_transcodes: int = 0
     total_quality_failures: int = 0
     total_stored_bytes: int = 0
+    reused_quality_profile_counts: dict[str, int] = field(default_factory=dict)
+    reused_stored_codec_counts: dict[str, int] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_now)
     finished_at: str = field(default_factory=utc_now)
     batch_token: str | None = None
@@ -290,6 +328,18 @@ class MultiSourceSyncResult:
         stopped_after_current: bool = False,
     ) -> "MultiSourceSyncResult":
         materialized = list(outcomes)
+        reused_quality_profile_counts: dict[str, int] = {}
+        for result in materialized:
+            for profile, count in result.reused_quality_profile_counts.items():
+                reused_quality_profile_counts[profile] = (
+                    reused_quality_profile_counts.get(profile, 0) + max(0, int(count))
+                )
+        reused_stored_codec_counts: dict[str, int] = {}
+        for result in materialized:
+            for codec, count in result.reused_stored_codec_counts.items():
+                reused_stored_codec_counts[codec] = (
+                    reused_stored_codec_counts.get(codec, 0) + max(0, int(count))
+                )
         completed = sum(result.status == "complete" for result in materialized)
         issues = sum(result.status == "complete_with_issues" for result in materialized)
         failed = sum(result.status == "failed" for result in materialized)
@@ -332,6 +382,8 @@ class MultiSourceSyncResult:
                 result.quality_failure_count for result in materialized
             ),
             total_stored_bytes=sum(result.total_stored_bytes for result in materialized),
+            reused_quality_profile_counts=reused_quality_profile_counts,
+            reused_stored_codec_counts=reused_stored_codec_counts,
             started_at=started_at,
             finished_at=utc_now(),
             batch_token=batch_token,

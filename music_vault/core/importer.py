@@ -4,15 +4,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from mutagen import File as MutagenFile
 from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import Picture
+from PySide6.QtGui import QImage
 
-from .audio_inspection import AudioInspectionError, inspect_audio_file
-from .audio_quality import SUPPORTED_SOURCE_CODECS
+from .audio_inspection import is_verified_audio_only_webm
 from .ffmpeg import discover_ffmpeg
 from .paths import covers_dir
 from .safety import normalize_source_upload_date
@@ -38,6 +38,12 @@ class ImportSourceContext:
     source_kind: str
     source_video_id: str | None = None
     source_upload_date: str | None = None
+    private_cover_path: str | None = None
+    ffprobe_path: str | Path | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 def _clean_text(value) -> str | None:
@@ -116,6 +122,9 @@ def _cover_extension(mime: str | None, data: bytes) -> str:
     if "png" in mime or data.startswith(b"\x89PNG"):
         return ".png"
 
+    if "webp" in mime or (data.startswith(b"RIFF") and data[8:12] == b"WEBP"):
+        return ".webp"
+
     return ".jpg"
 
 
@@ -135,6 +144,56 @@ def _save_cover(data: bytes, mime: str | None = None) -> str | None:
         target.write_bytes(data)
 
     return str(target.resolve())
+
+
+def _save_private_cover_reference(path: str | Path | None) -> str | None:
+    """Validate and copy one bounded downloaded thumbnail into private covers."""
+
+    if not path:
+        return None
+    try:
+        source = Path(path).expanduser().resolve(strict=True)
+        if not source.is_file() or source.stat().st_size > 25 * 1024 * 1024:
+            return None
+        data = source.read_bytes()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not data:
+        return None
+    image = QImage.fromData(data)
+    if (
+        image.isNull()
+        or image.width() <= 0
+        or image.height() <= 0
+        or image.width() * image.height() > 100_000_000
+    ):
+        return None
+    try:
+        return _save_cover(data, source.suffix)
+    except (OSError, RuntimeError, ValueError):
+        # Downloaded artwork is optional. A verified audio import must remain
+        # usable when private cover storage is unavailable.
+        return None
+
+
+def _existing_cover_path(value: object) -> str | None:
+    if not value:
+        return None
+    try:
+        path = Path(str(value)).expanduser().resolve(strict=True)
+        if not path.is_file() or not 0 < path.stat().st_size <= 25 * 1024 * 1024:
+            return None
+        image = QImage.fromData(path.read_bytes())
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        image.isNull()
+        or image.width() <= 0
+        or image.height() <= 0
+        or image.width() * image.height() > 100_000_000
+    ):
+        return None
+    return str(path)
 
 
 def extract_embedded_cover(path: str | Path) -> str | None:
@@ -196,27 +255,24 @@ def extract_embedded_cover(path: str | Path) -> str | None:
     return None
 
 
-def _is_verified_audio_only_webm(path: Path) -> bool:
+def _is_verified_audio_only_webm(
+    path: Path,
+    *,
+    ffprobe_path: str | Path | None = None,
+) -> bool:
     """Fail closed unless read-only inspection proves a safe audio WebM."""
 
-    try:
-        discovery = discover_ffmpeg()
-    except (OSError, RuntimeError, ValueError):
-        return False
-    if not discovery.ready or discovery.ffprobe_path is None:
-        return False
-    try:
-        inspection = inspect_audio_file(
-            path,
-            ffprobe_path=discovery.ffprobe_path,
-        )
-    except (AudioInspectionError, OSError, RuntimeError, ValueError):
-        return False
-    return bool(
-        inspection.audio_stream_count is not None
-        and inspection.audio_stream_count >= 1
-        and inspection.video_stream_count == 0
-        and inspection.codec in SUPPORTED_SOURCE_CODECS
+    if ffprobe_path is None:
+        try:
+            discovery = discover_ffmpeg()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if not discovery.ready or discovery.ffprobe_path is None:
+            return False
+        ffprobe_path = discovery.ffprobe_path
+    return is_verified_audio_only_webm(
+        path,
+        ffprobe_path=ffprobe_path,
     )
 
 
@@ -224,24 +280,38 @@ def import_file(
     db,
     path: str | Path,
     source: ImportSourceContext | None = None,
+    *,
+    ffprobe_path: str | Path | None = None,
 ) -> bool:
     path = Path(path)
 
     if path.suffix.lower() not in AUDIO_EXTENSIONS:
         return False
-    if path.suffix.lower() == ".webm" and not _is_verified_audio_only_webm(path):
+    effective_ffprobe_path = ffprobe_path or (
+        source.ffprobe_path if source is not None else None
+    )
+    if path.suffix.lower() == ".webm" and not _is_verified_audio_only_webm(
+        path,
+        ffprobe_path=effective_ffprobe_path,
+    ):
         return False
 
     resolved_path = str(path.resolve())
+    existing = db.conn.execute(
+        "SELECT source_kind, source_video_id, source_upload_date, cover_path "
+        "FROM tracks WHERE path=?",
+        (resolved_path,),
+    ).fetchone()
+    existing_cover = _existing_cover_path(
+        existing["cover_path"] if existing is not None else None
+    )
     metadata = read_audio_metadata(path)
-    cover_path = extract_embedded_cover(path)
+    cover_path = existing_cover or extract_embedded_cover(path)
+    if cover_path is None and source is not None:
+        cover_path = _save_private_cover_reference(source.private_cover_path)
     source_upload_date = None
     raw_release_date = metadata.get("release_date", metadata.get("year"))
 
-    existing = db.conn.execute(
-        "SELECT source_kind, source_video_id, source_upload_date FROM tracks WHERE path=?",
-        (resolved_path,),
-    ).fetchone()
     is_new_track = existing is None
     raw_source_kind = (
         source.source_kind
@@ -339,7 +409,12 @@ def import_file(
     return True
 
 
-def import_folder(db, folder: str | Path) -> int:
+def import_folder(
+    db,
+    folder: str | Path,
+    *,
+    ffprobe_path: str | Path | None = None,
+) -> int:
     folder = Path(folder)
 
     if not folder.exists():
@@ -349,7 +424,7 @@ def import_folder(db, folder: str | Path) -> int:
 
     for path in folder.rglob("*"):
         if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
-            if import_file(db, path):
+            if import_file(db, path, ffprobe_path=ffprobe_path):
                 count += 1
 
     return count

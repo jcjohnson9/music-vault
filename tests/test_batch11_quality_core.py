@@ -101,6 +101,15 @@ def test_selection_rejects_drm_video_only_unknown_codec_and_impractical_bitrate(
         select_source_audio_format(rejected)
 
 
+@pytest.mark.parametrize(
+    "format_id",
+    ("251/140", "137+140", "best[acodec=opus]", "audio choice"),
+)
+def test_format_id_must_be_one_atomic_provider_identifier(format_id):
+    with pytest.raises(SourceFormatSelectionError):
+        select_source_audio_format([_format(format_id)])
+
+
 def test_unknown_bitrate_is_eligible_and_supported_lossless_can_justify_ceiling():
     unknown = SourceAudioFormat.from_mapping(_format("unknown-rate", bitrate=None))
     assert source_format_eligibility(unknown).eligible is True
@@ -116,12 +125,22 @@ def test_best_original_plan_preserves_codec_and_has_no_mp3_encoder_or_bitrate():
     plan = build_audio_download_plan(
         [_format("dynamic-opus-format")], BEST_ORIGINAL_PROFILE
     )
-    options = build_yt_dlp_audio_options(plan)
+    options = build_yt_dlp_audio_options(
+        plan,
+        embed_thumbnail=False,
+        retain_thumbnail=True,
+    )
     extract = options["postprocessors"][0]
     assert options["format"] == "dynamic-opus-format"
     assert "/" not in options["format"]
     assert extract == {"key": "FFmpegExtractAudio", "preferredcodec": "best"}
     assert "preferredquality" not in extract
+    assert options["writethumbnail"] is True
+    assert options["embedthumbnail"] is False
+    assert not any(
+        processor["key"] == "EmbedThumbnail"
+        for processor in options["postprocessors"]
+    )
     assert plan.output_extension == ".opus"
     assert plan.expected_final_codec == "opus"
     assert plan.transformation_kind == "source_preserved_remux"
@@ -174,6 +193,35 @@ def test_mp3_compatibility_plan_is_explicitly_lossy_and_locked_to_320():
     assert plan.transformation_kind == "lossy_transcode"
     assert plan.compatibility_mp3_bitrate_kbps == 320
     assert options["writethumbnail"] is False
+
+
+def test_mp3_compatibility_never_false_labels_an_mp3_stream_copy():
+    plan = build_audio_download_plan(
+        [
+            _format("lower-opus", codec="opus", extension="webm"),
+            _format("higher-mp3", codec="mp3", extension="mp3"),
+        ],
+        MP3_320_COMPATIBILITY_PROFILE,
+    )
+    assert plan.source.format_id == "lower-opus"
+    assert plan.source.codec == "opus"
+    assert plan.transformation_kind == "lossy_transcode"
+
+    with pytest.raises(SourceFormatSelectionError, match="non-MP3 source"):
+        build_audio_download_plan(
+            [_format("only-mp3", codec="mp3", extension="mp3")],
+            MP3_320_COMPATIBILITY_PROFILE,
+        )
+
+
+def test_best_original_still_preserves_a_native_mp3_source():
+    plan = build_audio_download_plan(
+        [_format("native-mp3", codec="mp3", extension="mp3")],
+        BEST_ORIGINAL_PROFILE,
+    )
+    assert plan.source.codec == "mp3"
+    assert plan.output_extension == ".mp3"
+    assert plan.transformation_kind == "none"
 
 
 def test_quality_wording_never_claims_lossless_or_a_fidelity_upgrade():
@@ -276,7 +324,12 @@ def test_ffprobe_inspection_is_bounded_shell_free_and_collects_stream_facts(tmp_
                             "bit_rate": "160000",
                             "sample_rate": "48000",
                             "channels": 2,
-                        }
+                        },
+                        {
+                            "codec_type": "video",
+                            "codec_name": "mjpeg",
+                            "disposition": {"attached_pic": 1},
+                        },
                     ],
                 }
             ),
@@ -291,6 +344,7 @@ def test_ffprobe_inspection_is_bounded_shell_free_and_collects_stream_facts(tmp_
     )
     command, kwargs = calls[0]
     assert isinstance(command, list)
+    assert "stream_disposition=attached_pic" in command[command.index("-show_entries") + 1]
     assert kwargs["shell"] is False
     assert kwargs["timeout"] == 10.0
     assert inspection.codec == "opus"

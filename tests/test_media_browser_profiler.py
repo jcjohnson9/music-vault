@@ -19,7 +19,7 @@ def test_profiler_uses_required_scale_shapes_and_synthetic_small_run(qapp):
     assert payload["network_attempt_count"] == 0
     assert payload["credential_read_count"] == 0
     assert dataset["tracks"] == 30
-    assert dataset["schema_version"] == 7
+    assert dataset["schema_version"] == 8
     assert dataset["integrity"] == "ok"
     assert dataset["actual_albums"] == 10
     assert dataset["actual_artists"] == 20

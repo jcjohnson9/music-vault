@@ -16,6 +16,7 @@ import music_vault.app as app_module
 from music_vault.app import MusicVaultWindow
 from music_vault.core.audio_analysis import AudioFeatures
 from music_vault.core import paths
+from music_vault.ui import review
 from music_vault.ui.party_mode import (
     PARTY_MODE_DEFAULTS,
     PARTY_PRESETS,
@@ -361,6 +362,29 @@ def test_preset_overlay_help_and_safe_shortcuts_are_automatable(party_surface) -
     assert window.overlay_visible is True
     assert "play" in host.calls
     assert window.current_preset != cycled
+
+
+def test_review_normalizes_editor_focus_before_party_overlay_shortcut(
+    party_surface,
+    qapp,
+) -> None:
+    _host, window = party_surface
+    window.show()
+    window.show_overlay()
+    qapp.processEvents()
+
+    editor = QLineEdit(window)
+    editor.show()
+    editor.setFocus(Qt.FocusReason.OtherFocusReason)
+    qapp.processEvents()
+    assert QApplication.focusWidget() is editor
+    review._send_review_key(window, Qt.Key.Key_H, text="h")
+    assert window.overlay_visible is True
+
+    review._normalize_party_review_shortcut_focus(window, qapp)
+    assert QApplication.focusWidget() is window.help_button
+    review._send_review_key(window, Qt.Key.Key_H, text="h")
+    assert window.overlay_visible is False
 
 
 def test_escape_and_f11_each_close_party_mode(party_surface, qapp) -> None:

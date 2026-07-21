@@ -16,6 +16,10 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtTest import QTest
 
 from music_vault.core import paths
+from music_vault.core.audio_quality_config import (
+    BEST_ORIGINAL_PROFILE,
+    MP3_320_COMPATIBILITY_PROFILE,
+)
 from music_vault.core.db import MusicVaultDB
 from music_vault.core.runtime_policy import RuntimePolicy
 from music_vault.ui import icons
@@ -522,6 +526,57 @@ def isolated_ui_window(tmp_path: Path, monkeypatch, qapp):
     finally:
         qapp.processEvents()
         paths._resolved_project_root.cache_clear()
+
+
+def test_batch11_settings_profile_is_honest_persistent_and_non_destructive(
+    isolated_ui_window,
+    monkeypatch,
+) -> None:
+    fixture = isolated_ui_window
+    window = fixture.window
+    combo = window.settings_download_quality_profile
+    labels = [combo.itemText(index) for index in range(combo.count())]
+    assert labels == [
+        "Best Original — Recommended",
+        "MP3 320 Compatibility",
+    ]
+    assert combo.currentData() == BEST_ORIGINAL_PROFILE
+    assert "does not make YouTube audio lossless" in (
+        window.settings_quality_description.text()
+    )
+    media_paths = [Path(row["path"]) for row in window.db.list_tracks()]
+    snapshots = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns) for path in media_paths
+    }
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        window,
+        "sync_youtube_playlist",
+        lambda: sync_calls.append(True),
+    )
+
+    combo.setCurrentIndex(combo.findData(MP3_320_COMPATIBILITY_PROFILE))
+
+    assert sync_calls == []
+    assert "cannot improve source fidelity" in (
+        window.settings_quality_description.text()
+    )
+    monkeypatch.setattr(
+        fixture.app_module.QMessageBox,
+        "information",
+        lambda *_args, **_kwargs: None,
+    )
+    window.save_settings_from_ui()
+    persisted = json.loads(window.config_file_path().read_text(encoding="utf-8"))
+    assert persisted["download_quality_profile"] == (
+        MP3_320_COMPATIBILITY_PROFILE
+    )
+    assert persisted["compatibility_mp3_bitrate_kbps"] == 320
+    assert "MP3 320 Compatibility" in window.config_status.text()
+    assert "Library Quality Inventory" in window.quality_inventory_status.text()
+    for path, (before_bytes, before_mtime) in snapshots.items():
+        assert path.read_bytes() == before_bytes
+        assert path.stat().st_mtime_ns == before_mtime
 
 
 def _widget_rect_in_window(widget, window) -> QRect:

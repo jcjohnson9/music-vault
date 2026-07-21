@@ -392,7 +392,7 @@ def test_schema6_to_7_imports_only_accepted_unambiguous_member_of_evidence(
 
     migrated = MusicVaultDB(path, backup_dir=tmp_path / "migration-backups")
 
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 8
     relationships = migrated.conn.execute(
         """
         SELECT subject_artist_id, related_artist_id, provenance

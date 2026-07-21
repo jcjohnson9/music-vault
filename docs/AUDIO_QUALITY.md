@@ -1,9 +1,7 @@
 # Audio Quality Profiles
 
-Audio-quality profiles are part of the Music Vault v1.1.0 development line.
-The latest public stable release remains v1.0.0. Batch 11 is not complete until
-its ordinary implementation, regression, build, packaged, live-migration, CI,
-merge, and cleanup gates pass.
+Batch 11 is complete on the Music Vault v1.1.0 development line. The latest
+public stable release remains v1.0.0.
 
 ## Profiles
 
@@ -32,6 +30,11 @@ sample rate, or increase its bit depth.
 MP3 at 320 kbps for broad device and software compatibility. The conversion is
 recorded as a lossy compatibility transcode. It cannot improve the fidelity of
 the source and may use more storage.
+
+Music Vault excludes an already-MP3 input from this profile because yt-dlp
+would otherwise stream-copy it while falsely implying that a 320 kbps
+transcode occurred. If no supported non-MP3 source is available, the item
+fails closed; Best Original can still preserve a native MP3 source unchanged.
 
 The compatibility profile is an explicit alternative, not the recommended
 default. Changing either global profile does not start synchronization,

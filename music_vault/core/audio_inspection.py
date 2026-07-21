@@ -118,7 +118,9 @@ def _inspect_with_ffprobe(
         "-v",
         "error",
         "-show_entries",
-        "format=format_name,duration,bit_rate:stream=codec_type,codec_name,bit_rate,sample_rate,channels,duration",
+        "format=format_name,duration,bit_rate:"
+        "stream=codec_type,codec_name,bit_rate,sample_rate,channels,duration:"
+        "stream_disposition=attached_pic",
         "-of",
         "json",
         str(path),
@@ -170,7 +172,14 @@ def _inspect_with_ffprobe(
     video_streams = [
         row
         for row in stream_rows
-        if isinstance(row, Mapping) and row.get("codec_type") == "video"
+        if (
+            isinstance(row, Mapping)
+            and row.get("codec_type") == "video"
+            and not (
+                isinstance(row.get("disposition"), Mapping)
+                and row["disposition"].get("attached_pic") in (1, True, "1")
+            )
+        )
     ]
     primary = audio_streams[0] if audio_streams else {}
     format_row = payload.get("format")
@@ -364,6 +373,50 @@ def require_verified_final_audio(
     return inspection
 
 
+def is_verified_audio_only_webm(
+    path: str | Path,
+    *,
+    ffprobe_path: str | Path | None,
+) -> bool:
+    """Return whether a WebM is conclusively safe for audio-library reuse."""
+
+    if ffprobe_path is None or Path(path).suffix.casefold() != ".webm":
+        return False
+    try:
+        inspection = inspect_audio_file(path, ffprobe_path=ffprobe_path)
+    except (AudioInspectionError, OSError, RuntimeError, ValueError):
+        return False
+    return bool(
+        inspection.extension == ".webm"
+        and inspection.audio_stream_count is not None
+        and inspection.audio_stream_count >= 1
+        and inspection.video_stream_count == 0
+        and inspection.codec in SUPPORTED_SOURCE_CODECS
+    )
+
+
+def is_verified_reusable_audio(
+    path: str | Path,
+    *,
+    ffprobe_path: str | Path | None = None,
+) -> bool:
+    """Fail closed unless an existing candidate is one playable audio file."""
+
+    try:
+        inspection = inspect_audio_file(path, ffprobe_path=ffprobe_path)
+    except (AudioInspectionError, OSError, RuntimeError, ValueError):
+        return False
+    return bool(
+        inspection.extension in SUPPORTED_STORED_AUDIO_EXTENSIONS
+        and inspection.audio_stream_count == 1
+        and inspection.video_stream_count == 0
+        and inspection.codec in SUPPORTED_SOURCE_CODECS
+        and inspection.duration_seconds is not None
+        and inspection.duration_seconds > 0
+        and inspection.filesize_bytes > 0
+    )
+
+
 class DeterministicFinalPathTracker:
     """Collect only yt-dlp hook/result evidence; never scan a directory."""
 
@@ -401,6 +454,11 @@ class DeterministicFinalPathTracker:
                 if isinstance(item, Mapping):
                     for key in ("filepath", "filename"):
                         self.record_path(item.get(key))
+        thumbnails = info.get("thumbnails")
+        if isinstance(thumbnails, list):
+            for item in thumbnails:
+                if isinstance(item, Mapping):
+                    self.record_path(item.get("filepath"))
 
     def progress_hook(self, event: Mapping[str, Any]) -> None:
         if str(event.get("status") or "").casefold() != "finished":
@@ -476,6 +534,8 @@ __all__ = [
     "FinalAudioVerification",
     "FinalPathEvidenceError",
     "inspect_audio_file",
+    "is_verified_audio_only_webm",
+    "is_verified_reusable_audio",
     "require_verified_final_audio",
     "verify_final_audio",
 ]

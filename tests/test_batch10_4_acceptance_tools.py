@@ -6,11 +6,13 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from music_vault.core import acceptance_network
+from music_vault.core import db as db_module
 from music_vault.core import paths
 from music_vault.core.db import MusicVaultDB
 from music_vault.metadata.artist_images import (
@@ -42,13 +44,31 @@ def _reset_runtime_paths(monkeypatch: pytest.MonkeyPatch):
     paths._resolved_project_root.cache_clear()
 
 
+@contextmanager
+def _schema7_database_runtime():
+    """Reproduce the historical schema-7 runtime without Batch 11 tables."""
+    original_version = db_module.CURRENT_SCHEMA_VERSION
+    original_create = db_module.create_media_quality_schema
+    original_seed = db_module.seed_existing_track_media_quality
+    db_module.CURRENT_SCHEMA_VERSION = 7
+    db_module.create_media_quality_schema = lambda _connection: None
+    db_module.seed_existing_track_media_quality = lambda _connection, *_track_ids: None
+    try:
+        yield
+    finally:
+        db_module.CURRENT_SCHEMA_VERSION = original_version
+        db_module.create_media_quality_schema = original_create
+        db_module.seed_existing_track_media_quality = original_seed
+
+
 def _migrate_schema7(root: Path, database: Path) -> None:
     previous = os.environ.get("MUSIC_VAULT_PROJECT_ROOT")
     os.environ["MUSIC_VAULT_PROJECT_ROOT"] = str(root)
     paths._resolved_project_root.cache_clear()
     try:
-        db = MusicVaultDB(database, backup_dir=root / "data" / "backups")
-        db.close()
+        with _schema7_database_runtime():
+            db = MusicVaultDB(database, backup_dir=root / "data" / "backups")
+            db.close()
     finally:
         if previous is None:
             os.environ.pop("MUSIC_VAULT_PROJECT_ROOT", None)
@@ -595,7 +615,8 @@ def test_packaged_quiescence_prepare_is_schema6_synthetic_and_aggregate_only(
         runtime.name + packaged_quiescence.SECOND_REVIEW_OUTPUT_SUFFIX
     )
     try:
-        manifest = packaged_quiescence.prepare(runtime, project)
+        with _schema7_database_runtime():
+            manifest = packaged_quiescence.prepare(runtime, project)
         assert manifest["manifest_format_version"] == 1
         assert manifest["baseline"]["database"]["health"]["schema_version"] == 6
         assert manifest["explicit_backup"]["verified"] is True
