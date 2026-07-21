@@ -39,6 +39,13 @@ from PySide6.QtWidgets import (
 from music_vault.ui.components import ElidedLabel, EmptyState
 from music_vault.ui.icons import ui_icon
 from music_vault.ui.theme import COLORS, repolish
+from music_vault.core.audio_quality import profile_description
+from music_vault.core.audio_quality_config import (
+    BEST_ORIGINAL_PROFILE,
+    INHERIT_PROFILE,
+    MP3_320_COMPATIBILITY_PROFILE,
+    normalize_source_download_quality_profile,
+)
 from music_vault.core.safety import sanitize_error_text
 
 
@@ -53,6 +60,22 @@ SUMMARY_FIELDS = (
     ("downloaded", "Downloaded"),
     ("existing", "Existing"),
     ("failed_items", "Failed Items"),
+)
+
+QUALITY_PROFILE_LABELS = {
+    INHERIT_PROFILE: "Use Global Setting",
+    BEST_ORIGINAL_PROFILE: "Best Original",
+    MP3_320_COMPATIBILITY_PROFILE: "MP3 320 Compatibility",
+}
+
+QUALITY_SYNC_STATUS_FIELDS = frozenset(
+    {
+        "last_sync_source_preserved_count",
+        "last_sync_source_preserved_remux_count",
+        "last_sync_mp3_compatibility_transcode_count",
+        "last_sync_quality_failure_count",
+        "last_sync_total_stored_bytes",
+    }
 )
 
 
@@ -130,6 +153,7 @@ class SyncSourceView:
     failed_count: int
     unresolved_failure_count: int
     last_error: str | None
+    download_quality_profile: str = INHERIT_PROFILE
 
     @property
     def display_label(self) -> str:
@@ -148,6 +172,10 @@ class SyncSourceView:
     @property
     def status_label(self) -> str:
         return _friendly_status(self.last_sync_status)
+
+    @property
+    def quality_profile_label(self) -> str:
+        return QUALITY_PROFILE_LABELS[self.download_quality_profile]
 
     @property
     def shortened_external_id(self) -> str:
@@ -205,6 +233,9 @@ class SyncSourceView:
                 if _value(source, "last_error")
                 else None
             ),
+            download_quality_profile=normalize_source_download_quality_profile(
+                _value(source, "download_quality_profile", default=INHERIT_PROFILE)
+            ),
         )
 
 
@@ -219,6 +250,7 @@ class SourceEditorValues:
     destination_kind: str
     destination_playlist_id: int | None
     new_playlist_name: str | None
+    download_quality_profile: str = INHERIT_PROFILE
 
 
 class SyncSourceItemDelegate(QStyledItemDelegate):
@@ -570,10 +602,14 @@ class SyncCenterWidget(QWidget):
         self.detail_folder = QLabel()
         self.detail_folder.setObjectName("StatusLine")
         self.detail_folder.setWordWrap(True)
+        self.detail_quality_profile = QLabel()
+        self.detail_quality_profile.setObjectName("StatusLine")
+        self.detail_quality_profile.setWordWrap(True)
         layout.addWidget(self.detail_remote_title)
         layout.addWidget(self.detail_identity)
         layout.addWidget(self.detail_destination)
         layout.addWidget(self.detail_folder)
+        layout.addWidget(self.detail_quality_profile)
 
         metrics = QGridLayout()
         self.detail_metric_labels: dict[str, QLabel] = {}
@@ -717,6 +753,9 @@ class SyncCenterWidget(QWidget):
             else "Assigned after the source is saved"
         )
         self.detail_folder.setText(f"Stable Download Folder: {relative_folder}")
+        self.detail_quality_profile.setText(
+            f"Future Download Quality: {view.quality_profile_label}"
+        )
         self.detail_status.setText(view.status_label)
         self.detail_status.setProperty(
             "syncState", str(view.last_sync_status or "idle").casefold()
@@ -1036,6 +1075,31 @@ class SourceEditorDialog(QDialog):
         self.sort_order.setAccessibleName("Source execution order")
         form.addRow("Execution Order", self.sort_order)
 
+        self.download_quality_profile = QComboBox()
+        self.download_quality_profile.setObjectName("QualityCombo")
+        self.download_quality_profile.setAccessibleName(
+            "Future download quality for this source"
+        )
+        for profile, label in QUALITY_PROFILE_LABELS.items():
+            self.download_quality_profile.addItem(label, profile)
+        selected_profile = (
+            self._source.download_quality_profile
+            if self._source is not None
+            else INHERIT_PROFILE
+        )
+        profile_index = self.download_quality_profile.findData(selected_profile)
+        self.download_quality_profile.setCurrentIndex(max(0, profile_index))
+        self.download_quality_profile.currentIndexChanged.connect(
+            self._update_quality_description
+        )
+        form.addRow("Future Audio Quality", self.download_quality_profile)
+
+        self.quality_description = QLabel()
+        self.quality_description.setObjectName("MutedLabel")
+        self.quality_description.setWordWrap(True)
+        self.quality_description.setTextFormat(Qt.TextFormat.PlainText)
+        form.addRow("", self.quality_description)
+
         self.destination = QComboBox()
         self.destination.setObjectName("QualityCombo")
         self.destination.addItem("Library Only", "library")
@@ -1100,6 +1164,7 @@ class SourceEditorDialog(QDialog):
         root.addWidget(buttons)
 
         self._validate_identity()
+        self._update_quality_description()
         self._update_destination_fields()
 
     def _update_new_playlist_name_suggestion(self, label: str) -> None:
@@ -1163,6 +1228,19 @@ class SourceEditorDialog(QDialog):
         self.new_playlist_name_label.setVisible(managed and not existing)
         self.new_playlist_name.setVisible(managed and not existing)
 
+    def _update_quality_description(self, _index: int = -1) -> None:
+        profile = normalize_source_download_quality_profile(
+            self.download_quality_profile.currentData()
+        )
+        if profile == INHERIT_PROFILE:
+            description = (
+                "Uses the global future-download setting. Saving this source does not "
+                "start synchronization or replace an existing file."
+            )
+        else:
+            description = profile_description(profile)
+        self.quality_description.setText(description)
+
     def set_error(self, message: str | None) -> None:
         self.error_label.setText(message or "")
         self.error_label.setVisible(bool(message))
@@ -1194,6 +1272,9 @@ class SourceEditorDialog(QDialog):
             destination_kind=destination_kind,
             destination_playlist_id=playlist_id,
             new_playlist_name=new_name or None,
+            download_quality_profile=normalize_source_download_quality_profile(
+                self.download_quality_profile.currentData()
+            ),
         )
 
     def _accept_if_valid(self) -> None:
@@ -1256,6 +1337,7 @@ _BATCH_STATUS_FIELDS = frozenset(
         "last_sync_batch_downloaded_count",
         "last_sync_batch_imported_count",
         "last_sync_batch_item_failure_count",
+        *QUALITY_SYNC_STATUS_FIELDS,
     }
 )
 
@@ -1263,7 +1345,10 @@ _BATCH_STATUS_FIELDS = frozenset(
 def aggregate_status_transition(values: Mapping[str, object]) -> dict[str, object]:
     """Whitelist privacy-safe batch aggregates for App Status."""
 
-    return {key: values[key] for key in _BATCH_STATUS_FIELDS if key in values}
+    safe = {key: values[key] for key in _BATCH_STATUS_FIELDS if key in values}
+    for key in QUALITY_SYNC_STATUS_FIELDS.intersection(safe):
+        safe[key] = max(0, _integer(safe[key]))
+    return safe
 
 
 def multi_source_status_payload(
@@ -1314,6 +1399,21 @@ def multi_source_status_payload(
         ),
         "last_sync_batch_item_failure_count": _integer(
             _value(result, "total_failed_items")
+        ),
+        "last_sync_source_preserved_count": _integer(
+            _value(result, "total_source_preserved")
+        ),
+        "last_sync_source_preserved_remux_count": _integer(
+            _value(result, "total_source_preserved_remux")
+        ),
+        "last_sync_mp3_compatibility_transcode_count": _integer(
+            _value(result, "total_mp3_compatibility_transcodes")
+        ),
+        "last_sync_quality_failure_count": _integer(
+            _value(result, "total_quality_failures")
+        ),
+        "last_sync_total_stored_bytes": _integer(
+            _value(result, "total_stored_bytes")
         ),
     }
 
@@ -1570,6 +1670,7 @@ class SyncCenterController(QObject):
                     enabled=values.enabled,
                     destination_kind=values.destination_kind,
                     destination_playlist_id=playlist_id,
+                    download_quality_profile=values.download_quality_profile,
                 )
                 self._place_source(source.id, values.sort_order)
                 self.refresh(preserve_detail=False)
@@ -1605,6 +1706,7 @@ class SyncCenterController(QObject):
                     enabled=values.enabled,
                     destination_kind=values.destination_kind,
                     destination_playlist_id=playlist_id,
+                    download_quality_profile=values.download_quality_profile,
                 )
                 self._place_source(source_id, values.sort_order)
                 self.refresh()

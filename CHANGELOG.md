@@ -7,6 +7,14 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Added
 
+- Added the schema-v8 private `track_media_quality` inventory for known source
+  and stored format/codec facts, acquisition profile, transformation,
+  inspection state, provenance, and timestamps. Legacy classification remains
+  conservative and does not invent a source codec or bitrate.
+- Added **Best Original** as the recommended default for future authorized
+  downloads, retained **MP3 320 Compatibility**, and added per-saved-source
+  **Use Global Setting**, Best Original, and compatibility overrides.
+
 - Added schema-v7 canonical albums and track memberships, edition metadata,
   artist aliases, verified artist relationships, and durable indexes without
   changing track rows, artwork paths, media files, source memberships, or
@@ -60,6 +68,13 @@ Notable changes to Music Vault are documented here. The format follows
 
 ### Changed
 
+- Best Original retains supported source codecs and uses container-only
+  remuxing when needed; MP3 320 is described and recorded as a lossy
+  compatibility transcode that cannot improve source fidelity.
+- Cross-source duplicates continue to reuse one canonical track and the first
+  successfully acquired media representation, regardless of a later source's
+  requested profile. Existing media receives no automatic quality upgrade.
+
 - Album cards now use canonical master/release-family identity so ordinary
   reissues, deluxe editions, years, formats, countries, and alternate covers do
   not duplicate top-level albums. Representative artwork is browser-only and
@@ -92,6 +107,11 @@ Notable changes to Music Vault are documented here. The format follows
   membership and local playlist order.
 
 ### Security and privacy
+
+- Kept quality inventory and source overrides in private runtime storage,
+  added no browser-cookie access, and made final-file/codec validation fail
+  closed without exposing credentials or claiming YouTube audio is lossless or
+  Hi-Res.
 
 - Kept canonical album/artist identifiers, aliases, relationships, review
   evidence, portrait cache content, and provider references in private runtime

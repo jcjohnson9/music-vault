@@ -25,10 +25,23 @@ from PySide6.QtWidgets import (
 )
 
 from music_vault.version import APP_VERSION, DISPLAY_VERSION
+from music_vault.core.audio_quality import profile_description
+from music_vault.core.audio_quality_config import (
+    BEST_ORIGINAL_PROFILE,
+    DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS,
+    DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+    MP3_320_COMPATIBILITY_PROFILE,
+    normalize_compatibility_mp3_bitrate_kbps,
+    normalize_download_quality_profile,
+)
 from music_vault.ui.theme import COLORS, application_stylesheet
 
 
 SUPPORTED_AUDIO_QUALITIES = ("192", "256", "320")
+DOWNLOAD_QUALITY_PROFILE_CHOICES = (
+    ("Best Original — Recommended", BEST_ORIGINAL_PROFILE),
+    ("MP3 320 Compatibility", MP3_320_COMPATIBILITY_PROFILE),
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +64,8 @@ class OnboardingResult:
     ffmpeg_location: str | None
     create_shortcut: bool
     skipped: bool = False
+    download_quality_profile: str = DEFAULT_DOWNLOAD_QUALITY_PROFILE
+    compatibility_mp3_bitrate_kbps: int = DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
 
 
 def _nonempty_file(path: Path) -> bool:
@@ -150,6 +165,16 @@ def sanitized_onboarding_config(
     config.update(
         {
             "download_folder": str(result.download_folder.resolve()),
+            "download_quality_profile": normalize_download_quality_profile(
+                result.download_quality_profile
+            ),
+            "compatibility_mp3_bitrate_kbps": (
+                normalize_compatibility_mp3_bitrate_kbps(
+                    result.compatibility_mp3_bitrate_kbps
+                )
+            ),
+            # Retain the former value for one-release caller compatibility. It
+            # no longer selects the acquisition profile.
             "audio_quality": result.audio_quality,
             "onboarding_completed": True,
             "authorized_use_acknowledged": result.authorized_use_acknowledged,
@@ -358,20 +383,52 @@ QWizard#FirstRunWizard QLabel#qt_wizard_subtitle {{
     def _add_quality_page(self, config: Mapping[str, object]) -> None:
         page, layout = _page(
             "Audio Quality",
-            "Choose the conversion target used by optional YouTube downloads.",
+            "Choose how future authorized YouTube downloads are stored.",
         )
-        self.audio_quality = QComboBox()
+        self.download_quality_profile = QComboBox()
+        self.download_quality_profile.setAccessibleName(
+            "Future YouTube download quality profile"
+        )
+        for label, profile in DOWNLOAD_QUALITY_PROFILE_CHOICES:
+            self.download_quality_profile.addItem(label, profile)
+        selected_profile = normalize_download_quality_profile(
+            config.get("download_quality_profile")
+        )
+        selected_index = self.download_quality_profile.findData(selected_profile)
+        self.download_quality_profile.setCurrentIndex(max(0, selected_index))
+        layout.addWidget(self.download_quality_profile)
+
+        self.quality_description = _body("")
+        layout.addWidget(self.quality_description)
+        layout.addWidget(
+            _body(
+                "This setting applies only to future missing-track downloads. It does not "
+                "convert, replace, or duplicate an existing library file."
+            )
+        )
+        self.download_quality_profile.currentIndexChanged.connect(
+            self._refresh_quality_description
+        )
+        self._refresh_quality_description()
+
+        # Preserve the former widget/result API for one release so callers that
+        # still pass a numeric value remain source-compatible. This field is not
+        # shown and no longer controls the acquisition profile.
+        self.audio_quality = QComboBox(self)
         self.audio_quality.addItems(list(SUPPORTED_AUDIO_QUALITIES))
         quality = str(config.get("audio_quality", "320"))
         self.audio_quality.setCurrentText(
             quality if quality in SUPPORTED_AUDIO_QUALITIES else "320"
         )
-        layout.addWidget(self.audio_quality)
-        layout.addWidget(
-            _body("This controls the conversion target; it cannot improve the quality of the source audio.")
-        )
+        self.audio_quality.hide()
         layout.addStretch(1)
         self.addPage(page)
+
+    def _refresh_quality_description(self, _index: int = -1) -> None:
+        profile = normalize_download_quality_profile(
+            self.download_quality_profile.currentData()
+        )
+        self.quality_description.setText(profile_description(profile))
 
     def _add_ffmpeg_page(self, ready: bool, location: str | None) -> None:
         page, layout = _page(
@@ -476,10 +533,12 @@ QWizard#FirstRunWizard QLabel#qt_wizard_subtitle {{
         youtube = "Ready" if self.configure_youtube.isChecked() and self.api_key.text().strip() else "Not configured"
         ffmpeg = "Ready" if self._ffmpeg_ready else "Not configured"
         shortcut = "Will be created" if self.create_shortcut.isChecked() else "Not requested"
+        quality = self.download_quality_profile.currentText()
         self.finish_summary.setText(
             f"Runtime Data: {self.data_folder.text().strip()}\n"
             f"Local Import: {local}\n"
             f"YouTube API: {youtube}\n"
+            f"Future Audio Quality: {quality}\n"
             f"FFmpeg: {ffmpeg}\n"
             f"Desktop Shortcut: {shortcut}"
         )
@@ -544,4 +603,10 @@ QWizard#FirstRunWizard QLabel#qt_wizard_subtitle {{
             ffmpeg_location=ffmpeg_text or None,
             create_shortcut=self.create_shortcut.isChecked(),
             skipped=self._skipped,
+            download_quality_profile=normalize_download_quality_profile(
+                self.download_quality_profile.currentData()
+            ),
+            compatibility_mp3_bitrate_kbps=(
+                DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+            ),
         )

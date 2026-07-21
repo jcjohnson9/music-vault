@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Literal
@@ -106,6 +107,14 @@ class SyncImportItem:
     # Occurrence linkage is additive bookkeeping and deliberately excluded
     # from equality so the Batch 2 import-item contract remains compatible.
     source_item_ids: tuple[str, ...] = field(default_factory=tuple, compare=False)
+    # Batch 11 quality provenance is optional so older provider/test factories
+    # remain source-compatible. Values are aggregate-safe facts only; raw
+    # provider responses and private query details never cross this boundary.
+    quality_facts: Mapping[str, object] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass
@@ -129,6 +138,11 @@ class SyncResult:
     snapshot: PlaylistSnapshot | None = None
     removed_occurrence_count: int = 0
     duplicate_occurrence_count: int = 0
+    source_preserved_count: int = 0
+    source_preserved_remux_count: int = 0
+    mp3_compatibility_transcode_count: int = 0
+    quality_failure_count: int = 0
+    total_stored_bytes: int = 0
 
     @property
     def failed_count(self) -> int:
@@ -140,9 +154,28 @@ class SyncResult:
 
     def add_failure(self, failure: SyncFailure) -> None:
         self.failures.append(failure)
+        if failure.error_category == "quality":
+            self.quality_failure_count += 1
         if failure.video_id:
             self.successful_video_ids.discard(failure.video_id)
         self.refresh_status()
+
+    def record_quality_facts(self, values: Mapping[str, object] | None) -> None:
+        if not isinstance(values, Mapping):
+            return
+        profile = str(values.get("acquisition_profile") or "").strip().casefold()
+        transformation = str(values.get("transformation_kind") or "").strip().casefold()
+        if transformation == "none":
+            self.source_preserved_count += 1
+        elif transformation == "source_preserved_remux":
+            self.source_preserved_remux_count += 1
+        if profile == "mp3_320_compatibility" and transformation == "lossy_transcode":
+            self.mp3_compatibility_transcode_count += 1
+        try:
+            stored_bytes = int(values.get("stored_filesize_bytes") or 0)
+        except (TypeError, ValueError, OverflowError):
+            stored_bytes = 0
+        self.total_stored_bytes += max(0, stored_bytes)
 
     def finish_imports(self, imported_count: int) -> None:
         self.imported_count = imported_count
@@ -193,6 +226,13 @@ class SyncResult:
             "last_sync_downloaded_count": self.downloaded_count,
             "last_sync_existing_count": self.existing_count,
             "last_sync_failed_count": self.failed_count,
+            "last_sync_source_preserved_count": self.source_preserved_count,
+            "last_sync_source_preserved_remux_count": self.source_preserved_remux_count,
+            "last_sync_mp3_compatibility_transcode_count": (
+                self.mp3_compatibility_transcode_count
+            ),
+            "last_sync_quality_failure_count": self.quality_failure_count,
+            "last_sync_total_stored_bytes": self.total_stored_bytes,
             "last_sync_failures": [failure.to_dict() for failure in self.failures[:25]],
         }
 
@@ -229,6 +269,11 @@ class MultiSourceSyncResult:
     total_failed_items: int = 0
     total_removed_occurrences: int = 0
     total_duplicate_occurrences: int = 0
+    total_source_preserved: int = 0
+    total_source_preserved_remux: int = 0
+    total_mp3_compatibility_transcodes: int = 0
+    total_quality_failures: int = 0
+    total_stored_bytes: int = 0
     started_at: str = field(default_factory=utc_now)
     finished_at: str = field(default_factory=utc_now)
     batch_token: str | None = None
@@ -274,6 +319,19 @@ class MultiSourceSyncResult:
             total_duplicate_occurrences=sum(
                 result.duplicate_occurrence_count for result in materialized
             ),
+            total_source_preserved=sum(
+                result.source_preserved_count for result in materialized
+            ),
+            total_source_preserved_remux=sum(
+                result.source_preserved_remux_count for result in materialized
+            ),
+            total_mp3_compatibility_transcodes=sum(
+                result.mp3_compatibility_transcode_count for result in materialized
+            ),
+            total_quality_failures=sum(
+                result.quality_failure_count for result in materialized
+            ),
+            total_stored_bytes=sum(result.total_stored_bytes for result in materialized),
             started_at=started_at,
             finished_at=utc_now(),
             batch_token=batch_token,

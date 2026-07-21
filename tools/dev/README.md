@@ -4,6 +4,14 @@ Run these helpers from PowerShell at the repository root. Each wrapper resolves
 the root and uses `.venv\Scripts\python.exe`; generated output and private
 runtime data are not source artifacts.
 
+Batch 11 quality behavior and boundaries are documented in
+[`docs/AUDIO_QUALITY.md`](../../docs/AUDIO_QUALITY.md). Its ordinary-batch
+quality gates use disposable generated audio, fake downloader/provider facts,
+no browser cookies, no secrets, no public network, and no personal media. A
+controlled live schema-7-to-8 migration is a separate explicitly authorized
+gate and must run with no-secret/no-network controls; this documentation does
+not assert that gate has passed.
+
 | Command | Purpose |
 | --- | --- |
 | `.\tools\dev\verify.ps1` | Parse/import active source and validate required project resources. |

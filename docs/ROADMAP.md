@@ -254,7 +254,7 @@ YouTube sync change, quality policy, tag rewrite, tag/release, or Batch 11 work.
 **Status:** Complete on the v1.1.0 development line after schema-v7 migration,
 consolidation, preservation, packaged UI, visual/performance, regression,
 publication-safety, and Batch 10.4 quiescence acceptance gates. Stable remains
-v1.0.0; Batch 11 remains next.
+v1.0.0; Batch 10.4 followed on the same development line.
 
 ## Batch 10.4 — Migration-Startup Quiescence and Post-Hoc Acceptance Recovery
 
@@ -291,7 +291,7 @@ or tag rewrite, source/playlist change, sync change, public tag, or Release.
 
 **Status:** Complete on the v1.1.0 development line after offline repair,
 preservation, packaged/UI/performance, regression, build, and delivery gates.
-Stable remains v1.0.0; Batch 11 remains next.
+Stable remains v1.0.0; Batch 10.6 followed on the same development line.
 
 ## Batch 10.6 — Dual-Orientation Title Resolution and Final Metadata Acceptance
 
@@ -310,21 +310,30 @@ public tag, or Release.
 
 **Status:** Complete on the v1.1.0 development line after targeted/private,
 packaged, regression, build, CI, and delivery gates. Stable remains v1.0.0;
-Batch 11 remains next.
+Batch 11 is active and pending its ordinary delivery gates.
 
 ## Batch 11 — Highest-Practical-Quality / Best Original
 
 **Objective:** Prefer the best useful source representation without misleading
 quality claims or wasteful transcoding.
 
-**Scope:** Define an honest quality policy, evaluate original Opus/M4A retention,
-retain a compatibility option, expose clear choices, and verify playback and
-metadata behavior for supported formats.
+**Scope:** Make Best Original the default for future missing-track downloads,
+retain supported source codecs through direct storage or container-only remux,
+offer an explicit MP3 320 compatibility transcode, persist schema-v8 quality
+provenance, support per-source overrides, preserve one-file cross-source
+identity, and verify native-format import/playback without changing existing
+media.
 
-**Non-goals:** No promise to create fidelity absent from the source and no
-unbounded file-size growth.
+**Non-goals:** No promise to create fidelity absent from the source, no
+FLAC/WAV conversion theater, no Hi-Res claim, no automatic library upgrade,
+and no broad native-container tag writeback.
 
-**Status:** Next on the v1.1.0 development roadmap.
+**Status:** Implementation is in progress on the v1.1.0 development line and
+remains pending the ordinary Batch 11 regression, build, essential E2E, live
+migration, CI, merge, and cleanup gates. Do not mark Batch 11 Complete until
+those gates pass. Batches 1 through 10.6 remain Complete; stable remains
+v1.0.0 and development remains v1.1.0. Remaining metadata-polish items are
+deferred and are not Batch 11 blockers. Batch 12 is next only after acceptance.
 
 ## Batch 12 — Selective Library and Playlist Mobile Export
 
@@ -337,7 +346,7 @@ and incremental reconciliation.
 
 **Non-goals:** No Android application in this batch and no cloud account system.
 
-**Status:** Planned post-V1.
+**Status:** Planned post-V1 and next after Batch 11 acceptance.
 
 ## Batch 13 — Independent Android Music Vault Foundation
 

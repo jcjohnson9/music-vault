@@ -9,6 +9,14 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Iterable
 
+from .audio_quality_config import (
+    DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS,
+    DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+    INHERIT_PROFILE,
+    normalize_compatibility_mp3_bitrate_kbps,
+    normalize_download_quality_profile,
+    normalize_source_download_quality_profile,
+)
 from .importer import ImportSourceContext, import_file
 from .paths import youtube_download_archive_path
 from .safety import sanitize_error_text
@@ -67,6 +75,10 @@ class MultiSourceSyncOrchestrator:
         *,
         archive_file: str | Path | None = None,
         audio_quality: str = "320",
+        download_quality_profile: str = DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+        compatibility_mp3_bitrate_kbps: int = (
+            DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+        ),
         ffmpeg_location: str | Path | None = None,
         source_service: SyncSourceService | None = None,
         membership_service=None,
@@ -79,7 +91,17 @@ class MultiSourceSyncOrchestrator:
         self.conn: sqlite3.Connection = db.conn
         self.download_root = Path(download_root).expanduser().resolve()
         self.archive_file = Path(archive_file or youtube_download_archive_path())
+        # Retain the former setting for source compatibility while all new
+        # acquisitions use the explicit, honest quality-profile contract.
         self.audio_quality = str(audio_quality or "320")
+        self.download_quality_profile = normalize_download_quality_profile(
+            download_quality_profile
+        )
+        self.compatibility_mp3_bitrate_kbps = (
+            normalize_compatibility_mp3_bitrate_kbps(
+                compatibility_mp3_bitrate_kbps
+            )
+        )
         self.ffmpeg_location = ffmpeg_location
         self.membership_service = membership_service
         self.source_service = source_service or SyncSourceService(
@@ -238,6 +260,19 @@ class MultiSourceSyncOrchestrator:
                 "last_sync_batch_downloaded_count": aggregate.total_downloaded,
                 "last_sync_batch_imported_count": aggregate.total_imported,
                 "last_sync_batch_item_failure_count": aggregate.total_failed_items,
+                "last_sync_source_preserved_count": (
+                    aggregate.total_source_preserved
+                ),
+                "last_sync_source_preserved_remux_count": (
+                    aggregate.total_source_preserved_remux
+                ),
+                "last_sync_mp3_compatibility_transcode_count": (
+                    aggregate.total_mp3_compatibility_transcodes
+                ),
+                "last_sync_quality_failure_count": (
+                    aggregate.total_quality_failures
+                ),
+                "last_sync_total_stored_bytes": aggregate.total_stored_bytes,
             }
         )
         self._emit("batch_finished", len(outcomes), selected_count, result=None)
@@ -255,6 +290,14 @@ class MultiSourceSyncOrchestrator:
         valid_database_ids: set[str],
     ) -> SyncResult:
         source_destination = self.download_root / "sources" / source.storage_key
+        source_profile = normalize_source_download_quality_profile(
+            source.download_quality_profile
+        )
+        effective_profile = (
+            self.download_quality_profile
+            if source_profile == INHERIT_PROFILE
+            else normalize_download_quality_profile(source_profile)
+        )
         config = YouTubeSyncConfig(
             playlist_url=source.source_url,
             output_dir=self.download_root,
@@ -270,6 +313,10 @@ class MultiSourceSyncOrchestrator:
             # factories; the authoritative batch data is the zero-copy view.
             known_downloads=(),
             shared_download_index=shared_download_index,
+            download_quality_profile=effective_profile,
+            compatibility_mp3_bitrate_kbps=(
+                self.compatibility_mp3_bitrate_kbps
+            ),
         )
 
         def report(message: str) -> None:
@@ -398,7 +445,34 @@ class MultiSourceSyncOrchestrator:
                 )
                 if track_id is None:
                     raise RuntimeError("The imported source track could not be located.")
-                self._ensure_track_identity(item.video_id, track_id)
+                canonical_track_id = self._ensure_track_identity(
+                    item.video_id, track_id
+                )
+                if item.quality_facts is not None:
+                    canonical_row = self.conn.execute(
+                        "SELECT path FROM tracks WHERE id=?",
+                        (canonical_track_id,),
+                    ).fetchone()
+                    canonical_path = (
+                        Path(str(canonical_row["path"])).resolve()
+                        if canonical_row is not None
+                        else None
+                    )
+                    if canonical_path == item_path:
+                        self.db.upsert_track_media_quality(
+                            canonical_track_id,
+                            **dict(item.quality_facts),
+                        )
+                        result.record_quality_facts(item.quality_facts)
+                    else:
+                        # A defensive duplicate claim must never overwrite the
+                        # canonical file's actual stored representation with
+                        # facts collected from a different file.
+                        stored_facts = self.db.get_track_media_quality(
+                            canonical_track_id
+                        )
+                        if stored_facts is not None:
+                            result.record_quality_facts(dict(stored_facts))
                 result.successful_video_ids.add(item.video_id)
                 imported_count += 1
             except Exception as exc:
@@ -787,8 +861,11 @@ class MultiSourceSyncOrchestrator:
                 source_id, batch_token, started_at, finished_at, status,
                 visible_item_count, new_item_count, downloaded_count,
                 imported_count, existing_count, failed_count, removed_count,
-                duplicate_occurrence_count, first_error, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                duplicate_occurrence_count, source_preserved_count,
+                source_preserved_remux_count,
+                mp3_compatibility_transcode_count, quality_failure_count,
+                total_stored_bytes, first_error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_id,
@@ -804,6 +881,11 @@ class MultiSourceSyncOrchestrator:
                 result.failed_count,
                 result.removed_occurrence_count,
                 result.duplicate_occurrence_count,
+                result.source_preserved_count,
+                result.source_preserved_remux_count,
+                result.mp3_compatibility_transcode_count,
+                result.quality_failure_count,
+                result.total_stored_bytes,
                 sanitize_error_text(first_error) if first_error else None,
                 utc_now(),
             ),

@@ -11,6 +11,19 @@ from urllib.parse import parse_qs, urlparse
 import requests
 import yt_dlp
 
+from .audio_inspection import (
+    AudioInspectionError,
+    DeterministicFinalPathTracker,
+    inspect_audio_file,
+    require_verified_final_audio,
+)
+from .audio_quality_config import (
+    DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS,
+    DEFAULT_DOWNLOAD_QUALITY_PROFILE,
+    MP3_320_COMPATIBILITY_PROFILE,
+    normalize_compatibility_mp3_bitrate_kbps,
+    normalize_download_quality_profile,
+)
 from .ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
 from .paths import youtube_api_key_path
 from .runtime_policy import runtime_policy_for
@@ -28,10 +41,19 @@ from .sync_result import (
     SyncResult,
     utc_now,
 )
+from .youtube_audio_options import (
+    SourceFormatSelectionError,
+    build_audio_download_plan,
+    build_yt_dlp_audio_options,
+)
 
 
 ProgressCallback = Callable[[str], None]
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+class AudioQualityDownloadError(RuntimeError):
+    """A sanitized acquisition failure that must not be archived as success."""
 
 
 class _SanitizedYDLLogger:
@@ -74,6 +96,8 @@ class YouTubeSyncConfig:
         repr=False,
         compare=False,
     )
+    download_quality_profile: str = DEFAULT_DOWNLOAD_QUALITY_PROFILE
+    compatibility_mp3_bitrate_kbps: int = DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
 
 
 def scan_existing_downloads(output_root: str | Path) -> dict[str, Path]:
@@ -286,30 +310,22 @@ class AuthorizedYouTubePlaylistSyncer:
     ) -> SyncImportItem:
         destination = self._download_destination(playlist_title, playlist_id)
         destination.mkdir(parents=True, exist_ok=True)
-        opts = {
-            "format": "bestaudio/best",
+        profile = normalize_download_quality_profile(
+            self.config.download_quality_profile
+        )
+        compatibility_bitrate = normalize_compatibility_mp3_bitrate_kbps(
+            self.config.compatibility_mp3_bitrate_kbps
+        )
+        common_opts = {
             "ignoreerrors": False,
             "noplaylist": True,
-            "writethumbnail": True,
-            "embedthumbnail": True,
-            "addmetadata": True,
             "retries": 10,
             "fragment_retries": 10,
             "extractor_retries": 10,
             "socket_timeout": 30,
             "continuedl": True,
             "overwrites": False,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": self.config.audio_format,
-                    "preferredquality": self.config.audio_quality,
-                },
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"},
-            ],
             "outtmpl": str(destination / "%(title).180s [%(id)s].%(ext)s"),
-            "progress_hooks": [self._hook],
             "logger": _SanitizedYDLLogger(self._report),
             "quiet": True,
             "no_warnings": False,
@@ -317,34 +333,134 @@ class AuthorizedYouTubePlaylistSyncer:
         }
         ffmpeg_location = self._ffmpeg_location()
         if ffmpeg_location:
-            opts["ffmpeg_location"] = ffmpeg_location
+            common_opts["ffmpeg_location"] = ffmpeg_location
 
+        final_path: Path | None = None
         try:
+            metadata_opts = {
+                **common_opts,
+                "skip_download": True,
+                "writethumbnail": False,
+                "write_all_thumbnails": False,
+            }
+            with yt_dlp.YoutubeDL(metadata_opts) as ydl:
+                metadata = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}", download=False
+                )
+            if not isinstance(metadata, Mapping):
+                raise AudioQualityDownloadError(
+                    "The source did not provide usable audio format information."
+                )
+            raw_formats = metadata.get("formats")
+            formats = list(raw_formats) if isinstance(raw_formats, list) else [metadata]
+            duration = metadata.get("duration")
+            formats_with_duration = []
+            for item in formats:
+                if not isinstance(item, Mapping):
+                    continue
+                values = dict(item)
+                if values.get("duration") is None:
+                    values["duration"] = duration
+                formats_with_duration.append(values)
+            plan = build_audio_download_plan(
+                formats_with_duration,
+                profile,
+                compatibility_mp3_bitrate_kbps=compatibility_bitrate,
+            )
+            # Thumbnail embedding is intentionally limited to compatibility
+            # MP3. A valid source-preserved file must not fail merely because
+            # its native container cannot accept the thumbnail safely.
+            plan_opts = build_yt_dlp_audio_options(
+                plan,
+                embed_thumbnail=profile == MP3_320_COMPATIBILITY_PROFILE,
+            )
+            tracker = DeterministicFinalPathTracker(destination, video_id)
+            opts = {
+                **common_opts,
+                **plan_opts,
+                "progress_hooks": [self._hook, tracker.progress_hook],
+                "postprocessor_hooks": [tracker.postprocessor_hook],
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(
                     f"https://www.youtube.com/watch?v={video_id}", download=True
                 )
+            if not isinstance(info, Mapping):
+                raise AudioQualityDownloadError(
+                    "The item is unavailable through the supported public/unlisted workflow."
+                )
+            tracker.record_result(info)
+            final_path = tracker.resolve_final_path(
+                expected_extension=plan.output_extension
+            )
+            ffmpeg = self._resolve_ffmpeg_once()
+            inspection = inspect_audio_file(
+                final_path,
+                ffprobe_path=ffmpeg.ffprobe_path,
+            )
+            require_verified_final_audio(
+                inspection,
+                expected_codec=plan.expected_final_codec,
+                expected_duration_seconds=plan.source.duration_seconds,
+            )
+        except (SourceFormatSelectionError, AudioInspectionError) as exc:
+            if final_path is not None:
+                self._discard_rejected_download(final_path, destination, video_id)
+            raise AudioQualityDownloadError(sanitize_error_text(exc)) from None
+        except AudioQualityDownloadError:
+            if final_path is not None:
+                self._discard_rejected_download(final_path, destination, video_id)
+            raise
         except Exception as exc:
             raise RuntimeError(sanitize_error_text(exc)) from None
-        if not info:
-            raise RuntimeError(
-                "The item is unavailable through the supported public/unlisted workflow."
-            )
-
-        matches = [
-            path.resolve()
-            for path in destination.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in self.AUDIO_SUFFIXES
-            and extract_source_video_id(path) == video_id
-        ]
-        if not matches:
-            raise RuntimeError("Download completed but the resulting audio file was not found.")
+        quality_facts = {
+            "acquisition_profile": plan.profile,
+            "source_format_id": plan.source.format_id,
+            "source_extension": plan.source.extension,
+            "source_container": plan.source.container,
+            "source_codec": plan.source.codec,
+            "source_bitrate_kbps": plan.source.bitrate_kbps,
+            "source_sample_rate_hz": plan.source.sample_rate_hz,
+            "source_channels": plan.source.channels,
+            "source_filesize_bytes": plan.source.filesize_bytes,
+            "stored_extension": inspection.extension,
+            "stored_container": inspection.container,
+            "stored_codec": inspection.codec,
+            "stored_bitrate_kbps": inspection.bitrate_kbps,
+            "stored_sample_rate_hz": inspection.sample_rate_hz,
+            "stored_channels": inspection.channels,
+            "stored_filesize_bytes": inspection.filesize_bytes,
+            "transformation_kind": plan.transformation_kind,
+            "inspection_state": "inspected",
+            "provenance": "youtube_download_verified",
+            "inspected_at": utc_now(),
+        }
         return SyncImportItem(
-            path=str(matches[0]),
+            path=str(final_path),
             video_id=video_id,
             source_upload_date=normalize_source_upload_date(info.get("upload_date")),
+            quality_facts=quality_facts,
         )
+
+    @staticmethod
+    def _discard_rejected_download(
+        path: Path,
+        destination: Path,
+        video_id: str,
+    ) -> None:
+        """Remove only this attempt's verified, contained rejected output."""
+
+        try:
+            resolved = path.resolve()
+            root = destination.resolve()
+            if (
+                resolved.is_file()
+                and resolved.is_relative_to(root)
+                and extract_source_video_id(resolved) == video_id
+            ):
+                resolved.unlink()
+        except OSError:
+            pass
 
     def _hook(self, status: dict) -> None:
         state = status.get("status")
@@ -353,7 +469,7 @@ class AuthorizedYouTubePlaylistSyncer:
             percent = status.get("_percent_str", "").strip()
             self._report(f"Downloading {filename} {percent}".strip())
         elif state == "finished":
-            self._report("Download finished. Converting and tagging audio.")
+            self._report("Download finished. Verifying and preparing audio.")
         elif state == "error":
             self._report("Download error. The item will be recorded for retry.")
 
@@ -498,6 +614,17 @@ class AuthorizedYouTubePlaylistSyncer:
             self._report(f"Downloading: {title}")
             try:
                 import_item = self._download_one(video_id, playlist_id, playlist_title)
+            except AudioQualityDownloadError as exc:
+                result.add_failure(
+                    SyncFailure(
+                        video_id,
+                        title,
+                        sanitize_error_text(exc),
+                        "quality",
+                        item.source_item_id,
+                    )
+                )
+                continue
             except Exception as exc:
                 result.add_failure(
                     SyncFailure(
@@ -514,6 +641,7 @@ class AuthorizedYouTubePlaylistSyncer:
                 import_item.video_id,
                 import_item.source_upload_date,
                 tuple(occurrence_ids[video_id]),
+                import_item.quality_facts,
             )
             result.downloaded_count += 1
             result.downloaded_paths.append(import_item.path)

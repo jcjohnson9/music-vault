@@ -11,6 +11,9 @@ from mutagen import File as MutagenFile
 from mutagen.id3 import ID3, ID3NoHeaderError
 from mutagen.flac import Picture
 
+from .audio_inspection import AudioInspectionError, inspect_audio_file
+from .audio_quality import SUPPORTED_SOURCE_CODECS
+from .ffmpeg import discover_ffmpeg
 from .paths import covers_dir
 from .safety import normalize_source_upload_date
 from music_vault.metadata.service import MetadataService
@@ -18,7 +21,16 @@ from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStor
 from music_vault.metadata.artist_credits import seed_existing_artist_credits
 
 
-AUDIO_EXTENSIONS = {".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac"}
+AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".m4a",
+    ".flac",
+    ".wav",
+    ".ogg",
+    ".opus",
+    ".aac",
+    ".webm",
+}
 
 
 @dataclass(frozen=True)
@@ -184,6 +196,30 @@ def extract_embedded_cover(path: str | Path) -> str | None:
     return None
 
 
+def _is_verified_audio_only_webm(path: Path) -> bool:
+    """Fail closed unless read-only inspection proves a safe audio WebM."""
+
+    try:
+        discovery = discover_ffmpeg()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not discovery.ready or discovery.ffprobe_path is None:
+        return False
+    try:
+        inspection = inspect_audio_file(
+            path,
+            ffprobe_path=discovery.ffprobe_path,
+        )
+    except (AudioInspectionError, OSError, RuntimeError, ValueError):
+        return False
+    return bool(
+        inspection.audio_stream_count is not None
+        and inspection.audio_stream_count >= 1
+        and inspection.video_stream_count == 0
+        and inspection.codec in SUPPORTED_SOURCE_CODECS
+    )
+
+
 def import_file(
     db,
     path: str | Path,
@@ -192,6 +228,8 @@ def import_file(
     path = Path(path)
 
     if path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return False
+    if path.suffix.lower() == ".webm" and not _is_verified_audio_only_webm(path):
         return False
 
     resolved_path = str(path.resolve())

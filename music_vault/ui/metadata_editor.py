@@ -34,6 +34,13 @@ from music_vault.metadata.artwork import (
     prepare_local_artwork,
     store_prepared_artwork,
 )
+from music_vault.core.audio_quality import (
+    BEST_ORIGINAL_PROFILE,
+    MP3_320_COMPATIBILITY_PROFILE,
+    compare_source_and_stored,
+    normalize_codec,
+)
+from music_vault.core.media_quality_schema import get_track_media_quality
 from music_vault.metadata.musicbrainz_enricher import (
     LOW_CONFIDENCE_SCORE,
     MetadataCandidate,
@@ -77,9 +84,171 @@ LEGACY_TEXT_FIELDS = (
     "release_date",
 )
 
+QUALITY_PROFILE_LABELS = {
+    BEST_ORIGINAL_PROFILE: "Best Original",
+    MP3_320_COMPATIBILITY_PROFILE: "MP3 320 Compatibility",
+    "legacy_youtube_mp3": "Legacy YouTube MP3",
+    "local_import": "Local Original",
+    "unknown": "Unknown",
+}
+
+QUALITY_CODEC_LABELS = {
+    "aac": "AAC",
+    "alac": "ALAC",
+    "flac": "FLAC",
+    "mp3": "MP3",
+    "opus": "Opus",
+    "vorbis": "Vorbis",
+}
+
 
 def _display_value(value: str | None) -> str:
     return value or "Not set"
+
+
+def _quality_value(row: object, key: str) -> object | None:
+    try:
+        return row[key]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        return getattr(row, key, None)
+
+
+def _known_positive_int(value: object) -> int | None:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if normalized > 0 else None
+
+
+def _quality_codec_label(value: object) -> str | None:
+    normalized = normalize_codec(value)
+    return QUALITY_CODEC_LABELS.get(normalized) if normalized else None
+
+
+def _quality_format_label(extension: object, container: object) -> str | None:
+    suffix = str(extension or "").strip().casefold()
+    if suffix and not suffix.startswith("."):
+        suffix = f".{suffix}"
+    container_text = str(container or "").strip()
+    if suffix:
+        return suffix
+    return container_text or None
+
+
+def _format_quality_bitrate(value: object) -> str | None:
+    bitrate = _known_positive_int(value)
+    return f"Approximately {bitrate:,} kbps" if bitrate is not None else None
+
+
+def _format_quality_sample_rate(value: object) -> str | None:
+    sample_rate = _known_positive_int(value)
+    return f"{sample_rate:,} Hz" if sample_rate is not None else None
+
+
+def _format_quality_channels(value: object) -> str | None:
+    channels = _known_positive_int(value)
+    if channels == 1:
+        return "1 (mono)"
+    if channels == 2:
+        return "2 (stereo)"
+    return str(channels) if channels is not None else None
+
+
+def _format_quality_file_size(value: object) -> str | None:
+    size = _known_positive_int(value)
+    if size is None:
+        return None
+    units = ("bytes", "KB", "MB", "GB", "TB")
+    amount = float(size)
+    unit = units[0]
+    for candidate in units[1:]:
+        if amount < 1024:
+            break
+        amount /= 1024
+        unit = candidate
+    if unit == "bytes":
+        return f"{size:,} bytes"
+    return f"{amount:.1f} {unit} ({size:,} bytes)"
+
+
+def _quality_transformation_text(row: object) -> str | None:
+    profile = str(_quality_value(row, "acquisition_profile") or "").casefold()
+    kind = str(_quality_value(row, "transformation_kind") or "").casefold()
+    source_codec = _quality_value(row, "source_codec")
+    stored_codec = _quality_value(row, "stored_codec")
+    if profile in {BEST_ORIGINAL_PROFILE, MP3_320_COMPATIBILITY_PROFILE}:
+        comparison = compare_source_and_stored(
+            profile=profile,
+            source_codec=source_codec,
+            stored_codec=stored_codec,
+            source_bitrate_kbps=_quality_value(row, "source_bitrate_kbps"),
+            stored_bitrate_kbps=_quality_value(row, "stored_bitrate_kbps"),
+            transformation_kind=kind or None,
+        )
+        return comparison.transformation_text
+    if kind == "legacy_inferred_transcode":
+        return "Legacy YouTube MP3; source quality was not recorded"
+    if kind == "local_original":
+        return "Local original; no automatic conversion recorded"
+    if kind == "lossy_transcode":
+        return "Lossy transcode recorded; not a fidelity upgrade"
+    if kind == "source_preserved_remux":
+        return "Container-only remux recorded; source codec comparison unavailable"
+    if kind == "none":
+        return "No lossy re-encoding recorded"
+    return None
+
+
+def _quality_display_rows(row: object | None) -> tuple[tuple[str, str, str], ...]:
+    if row is None:
+        return ()
+    profile = str(_quality_value(row, "acquisition_profile") or "").casefold()
+    sample_rate = _quality_value(row, "stored_sample_rate_hz") or _quality_value(
+        row, "source_sample_rate_hz"
+    )
+    channels = _quality_value(row, "stored_channels") or _quality_value(
+        row, "source_channels"
+    )
+    file_size = _quality_value(row, "stored_filesize_bytes") or _quality_value(
+        row, "source_filesize_bytes"
+    )
+    candidates = (
+        ("acquisition_profile", "Acquisition profile", QUALITY_PROFILE_LABELS.get(profile)),
+        (
+            "source_format",
+            "Source format",
+            _quality_format_label(
+                _quality_value(row, "source_extension"),
+                _quality_value(row, "source_container"),
+            ),
+        ),
+        ("source_codec", "Source codec", _quality_codec_label(_quality_value(row, "source_codec"))),
+        (
+            "source_bitrate",
+            "Source bitrate",
+            _format_quality_bitrate(_quality_value(row, "source_bitrate_kbps")),
+        ),
+        (
+            "stored_format",
+            "Stored format",
+            _quality_format_label(
+                _quality_value(row, "stored_extension"),
+                _quality_value(row, "stored_container"),
+            ),
+        ),
+        ("stored_codec", "Stored codec", _quality_codec_label(_quality_value(row, "stored_codec"))),
+        (
+            "stored_bitrate",
+            "Stored bitrate",
+            _format_quality_bitrate(_quality_value(row, "stored_bitrate_kbps")),
+        ),
+        ("sample_rate", "Sample rate", _format_quality_sample_rate(sample_rate)),
+        ("channels", "Channels", _format_quality_channels(channels)),
+        ("file_size", "File size", _format_quality_file_size(file_size)),
+        ("transformation", "Transformation", _quality_transformation_text(row)),
+    )
+    return tuple((key, label, value) for key, label, value in candidates if value)
 
 
 class MetadataFieldEditor(QFrame):
@@ -474,10 +643,12 @@ class MetadataEditorDialog(QDialog):
         self.tabs.setObjectName("MetadataTabs")
         self.edit_tab = self._build_edit_tab()
         self.sources_tab = self._build_sources_tab()
+        self.quality_tab = self._build_quality_tab()
         self.musicbrainz_tab = self._build_musicbrainz_tab()
         self.history_tab = self._build_history_tab()
         self.tabs.addTab(self.edit_tab, "Edit")
         self.tabs.addTab(self.sources_tab, "Sources")
+        self.tabs.addTab(self.quality_tab, "Quality")
         self.tabs.addTab(self.musicbrainz_tab, "MusicBrainz")
         self.tabs.addTab(self.history_tab, "History")
         root.addWidget(self.tabs, 1)
@@ -778,6 +949,73 @@ class MetadataEditorDialog(QDialog):
             )
             for column, value in enumerate(row_values):
                 self.observations_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _build_quality_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        note = QLabel(
+            "Audio quality details are read only. Music Vault shows only recorded or "
+            "observed facts; opening this tab performs no network lookup and does not "
+            "modify the media file or its embedded tags."
+        )
+        note.setObjectName("MetadataInfoBanner")
+        note.setWordWrap(True)
+        note.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(note)
+
+        try:
+            quality_row = get_track_media_quality(self.service.conn, self.track_id)
+        except Exception:
+            quality_row = None
+        rows = _quality_display_rows(quality_row)
+        self.quality_context_labels: dict[str, QLabel] = {}
+
+        if rows:
+            context = QGroupBox("Recorded audio quality facts")
+            context_layout = QGridLayout(context)
+            for row_index, (key, label, value) in enumerate(rows):
+                key_label = QLabel(label)
+                key_label.setObjectName("MutedLabel")
+                value_label = QLabel(value)
+                value_label.setTextFormat(Qt.TextFormat.PlainText)
+                value_label.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                value_label.setWordWrap(True)
+                context_layout.addWidget(key_label, row_index, 0)
+                context_layout.addWidget(value_label, row_index, 1)
+                self.quality_context_labels[key] = value_label
+            layout.addWidget(context)
+
+        inspection_state = str(
+            _quality_value(quality_row, "inspection_state") or "uninspected"
+        ).casefold()
+        state_text = {
+            "legacy_inferred": (
+                "Legacy classification is conservative. Source codec and bitrate remain "
+                "unknown unless they were recorded during acquisition."
+            ),
+            "uninspected": (
+                "Detailed local quality inspection has not been recorded. Only known "
+                "inventory facts are shown."
+            ),
+            "failed": (
+                "The last read-only quality inspection did not complete. Only previously "
+                "recorded facts are shown."
+            ),
+        }.get(inspection_state)
+        if not rows:
+            state_text = (
+                "Quality details have not been recorded for this track. Unknown values are "
+                "left undisclosed rather than displayed as zero."
+            )
+        self.quality_state_label = QLabel(state_text or "Recorded quality inspection complete.")
+        self.quality_state_label.setObjectName("MutedLabel")
+        self.quality_state_label.setWordWrap(True)
+        self.quality_state_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.quality_state_label)
+        layout.addStretch(1)
+        return tab
 
     def _build_musicbrainz_tab(self) -> QWidget:
         tab = QWidget()
