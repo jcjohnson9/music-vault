@@ -53,6 +53,11 @@ is complete on the v1.1.0 development line and is not part of public v1.0.0.
 
 ## Install the portable release
 
+The approved V1.1 desktop milestone starts with a supported, explicitly bundled
+acquisition stack and truthful stage-specific failure reporting. See
+[acquisition capability and disposable verification](docs/ACQUISITION.md).
+This development work does not update the immutable public v1.0.0 release.
+
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
    [GitHub Releases page](https://github.com/jcjohnson9/music-vault/releases).
 2. Verify the published SHA-256 checksum, then extract the complete folder to a

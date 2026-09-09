@@ -92,6 +92,7 @@ _BOOTSTRAP_ACCEPTANCE_NETWORK_GUARD = install_acceptance_network_guard()
 from music_vault.core.db import MusicVaultDB
 from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
 from music_vault.core.ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
+from music_vault.core.acquisition_runtime import acquisition_readiness
 from music_vault.core.app_status import write_app_status as export_app_status
 from music_vault.core.audio_quality import profile_description
 from music_vault.core.audio_quality_config import (
@@ -155,7 +156,7 @@ from music_vault.core.sync_sources import (
     normalize_youtube_playlist_source,
 )
 from music_vault.core.sync_result import SyncFailure, SyncResult, sync_ui_values
-from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer
+from music_vault.core.youtube_sync import YouTubeSyncConfig, AuthorizedYouTubePlaylistSyncer, write_imported_archive
 from music_vault.metadata.service import MetadataChangeResult, MetadataService
 from music_vault.metadata.intelligence_settings import (
     DISCOGS_CONSENT_VERSION,
@@ -786,10 +787,11 @@ class MusicVaultWindow(QMainWindow):
             track = self.db.get_track(self.current_track_id) if self.current_track_id else None
             api_ready = bool(self.read_saved_api_key())
             ffmpeg_ready = bool(self.find_ffmpeg_bin())
+            acquisition = acquisition_readiness()
 
             status_extra = {
                 "health": {
-                    "ok": api_ready and ffmpeg_ready,
+                    "ok": api_ready and ffmpeg_ready and acquisition.ready,
                     "api_ready": api_ready,
                     "ffmpeg_ready": ffmpeg_ready,
                 },
@@ -3796,6 +3798,7 @@ class MusicVaultWindow(QMainWindow):
         self._record_legacy_youtube_reused_quality_facts(result)
 
         result.finish_imports(imported_count)
+        self._archive_legacy_youtube_imports(result)
         if imported_count:
             self.invalidate_browser_data(BrowserInvalidationReason.YOUTUBE_IMPORT)
             self.wake_metadata_intelligence()
@@ -3935,6 +3938,21 @@ class MusicVaultWindow(QMainWindow):
                 )
         return imported_count
 
+    def _archive_legacy_youtube_imports(self, result: SyncResult) -> None:
+        """Compatibility archive follows committed canonical imports, never download alone."""
+        try:
+            if self.db.conn.in_transaction:
+                raise RuntimeError("Uncommitted library transaction")
+            identities = self.db.existing_youtube_video_ids()
+            identities.difference_update(
+                failure.video_id for failure in result.failures if failure.video_id
+            )
+            write_imported_archive(youtube_download_archive_path(), identities)
+        except Exception:
+            # Archive is reconstructible compatibility state, not the source
+            # of truth. Never relabel committed imports as rolled back.
+            self.log_youtube("Compatibility archive was not updated; committed library imports remain available.")
+
     def _record_legacy_youtube_reused_quality_facts(
         self,
         result: SyncResult,
@@ -3989,6 +4007,11 @@ class MusicVaultWindow(QMainWindow):
             ),
             "last_sync_quality_failure_count": result.quality_failure_count,
             "last_sync_total_stored_bytes": result.total_stored_bytes,
+            "last_sync_acquisition_circuit_open": result.acquisition_circuit_open,
+            "last_sync_acquisition_deferred_count": result.acquisition_deferred_count,
+            "last_sync_acquisition_diagnostic": (
+                result.acquisition_diagnostic.to_dict() if result.acquisition_diagnostic else None
+            ),
         }
 
     def selected_track_id(self) -> int | None:
@@ -5857,13 +5880,14 @@ class MusicVaultWindow(QMainWindow):
 
         if api_ready:
             self.api_key_status.setText("YouTube API Key: Found")
-            self.api_status_card.value_label.setText("Ready")
+            self.api_status_card.value_label.setText("Key found")
         else:
             self.api_key_status.setText("YouTube API Key: Missing")
             self.api_status_card.value_label.setText("Missing")
 
         ffmpeg_bin = self.find_ffmpeg_bin()
         ffmpeg = getattr(self, "_last_ffmpeg_discovery", None)
+        acquisition = acquisition_readiness()
 
         if ffmpeg_bin:
             self.ffmpeg_status.setText(
@@ -5880,6 +5904,20 @@ class MusicVaultWindow(QMainWindow):
                     else "Configure both tools before using conversion features."
                 )
             )
+
+        components = acquisition.public_summary()
+        acquisition_line = (
+            "Acquisition components: Ready (network success not yet verified)"
+            if acquisition.ready else
+            "Acquisition components: Not ready — " + str(components["error_code"])
+        )
+        self.ffmpeg_status.setText(
+            self.ffmpeg_status.text() + "\n\n" + acquisition_line
+            + "\nyt-dlp " + str(components["extractor_version"] or "missing")
+            + " • EJS " + str(components["solver_version"] or "missing")
+            + " • Deno " + str(components["runtime_version"] or "missing")
+            + "\nLocal playback does not require YouTube or an API key."
+        )
 
         download_folder = Path(
             self.config.get(

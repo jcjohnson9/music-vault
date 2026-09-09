@@ -7,10 +7,17 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Project venv interpreter not found: $python"
 }
 
+if (Get-Process -Name MusicVault -ErrorAction SilentlyContinue) {
+    throw "Close Music Vault before rebuilding the official desktop target."
+}
+Set-Location $projectRoot
+& $python -B -c "from music_vault.core.acquisition_runtime import acquisition_readiness; r = acquisition_readiness(); print(r.public_summary()); raise SystemExit(0 if r.ready else 1)"
+if ($LASTEXITCODE -ne 0) { throw "Acquisition components are incomplete; existing build output was preserved." }
+
 foreach ($relativePath in @("build", "dist")) {
     $target = [IO.Path]::GetFullPath((Join-Path $projectRoot $relativePath))
 
-    if (-not $target.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $target.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to remove a path outside the project root: $target"
     }
 

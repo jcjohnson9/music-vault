@@ -1,4 +1,4 @@
-# Exact environment used to build and verify Music Vault v1.0.0.
+# Exact V1.1 development build environment. Immutable v1.0.0 keeps its tagged pins.
 # Runtime dependencies
 PySide6==6.11.1
 PySide6_Addons==6.11.1
@@ -11,7 +11,12 @@ certifi==2026.6.17
 charset-normalizer==3.4.7
 idna==3.18
 urllib3==2.7.0
-yt-dlp==2026.6.9
+yt-dlp==2026.8.19
+yt-dlp-ejs==0.8.0
+deno==2.9.5
+brotli==1.2.0
+pycryptodomex==3.23.0
+websockets==17.1
 
 # Release build and verification tooling
 pyinstaller==6.21.0

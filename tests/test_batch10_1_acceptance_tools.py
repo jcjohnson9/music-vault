@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from music_vault.core.app_status import write_app_status
+from music_vault.core.acquisition_runtime import AcquisitionReadiness
 from music_vault.core.db import CURRENT_SCHEMA_VERSION, MusicVaultDB
 from music_vault.core import paths as runtime_paths
 from music_vault.ui import review as ui_review
@@ -35,6 +36,77 @@ def _reset_runtime_path_cache():
     runtime_paths._resolved_project_root.cache_clear()
     yield
     runtime_paths._resolved_project_root.cache_clear()
+
+
+def _safe_acquisition_status() -> dict:
+    return {
+        "acquisition": AcquisitionReadiness(
+            True, "2026.8.19", "0.8.0", "2.9.5",
+        ).public_summary(),
+        "health": {
+            "acquisition_components_ready": True,
+            "local_playback_requires_network": False,
+        },
+        "sync": {
+            "last_sync_acquisition_circuit_open": True,
+            "last_sync_acquisition_deferred_count": 3,
+            "last_sync_acquisition_diagnostic": {
+                "stage": "media_transfer", "reason": "http_forbidden",
+                "http_status": 403, "retry_recommendation": "check_acquisition_health",
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("state", ["legacy", "neutral", "diagnostic"])
+def test_live_gate_accepts_only_typed_additive_acquisition_state(
+    tmp_path: Path, state: str,
+) -> None:
+    payload = _safe_acquisition_status() if state != "legacy" else {}
+    if state == "neutral":
+        payload["sync"] = {key: None for key in payload["sync"]}
+    status = tmp_path / "status.json"
+    status.write_text(json.dumps(payload), encoding="utf-8")
+    assert live_gate._status_is_safe(status) == (True, True)
+
+
+@pytest.mark.parametrize(("section", "key", "value"), [
+    ("acquisition", "runtime_path", "C:/synthetic/private/runtime.exe"),
+    ("acquisition", "extractor_version", "https://synthetic.invalid/private"),
+    ("acquisition", "solver_version", ["0.8.0"]),
+    ("acquisition", "error_code", "synthetic private provider error"),
+    ("acquisition", "error_code", {"private": "synthetic"}),
+    ("acquisition", "ready", 1),
+    ("acquisition", "authentication", "browser_cookie"),
+    ("acquisition", "remote_components_enabled", True),
+    ("acquisition", "network_verified", True),
+    ("health", "acquisition_components_ready", "synthetic private state"),
+    ("health", "local_playback_requires_network", True),
+    ("sync", "last_sync_acquisition_raw_error", "synthetic private error"),
+    ("sync", "last_sync_acquisition_circuit_open", "synthetic private state"),
+    ("sync", "last_sync_acquisition_deferred_count", -1),
+    ("sync", "last_sync_acquisition_deferred_count", True),
+    ("sync", "last_sync_acquisition_diagnostic", {"raw_error": "synthetic private error"}),
+    ("diagnostic", "private_path", "C:/synthetic/private/audio.opus"),
+    ("diagnostic", "stage", "synthetic private provider text"),
+    ("diagnostic", "reason", "synthetic private provider text"),
+    ("diagnostic", "http_status", "https://synthetic.invalid/private"),
+    ("diagnostic", "http_status", True),
+    ("diagnostic", "http_status", 200),
+    ("diagnostic", "retry_recommendation", "synthetic private provider text"),
+])
+def test_live_gate_rejects_private_or_untyped_acquisition_state(
+    tmp_path: Path, section: str, key: str, value: object,
+) -> None:
+    payload = _safe_acquisition_status()
+    target = (
+        payload["sync"]["last_sync_acquisition_diagnostic"]
+        if section == "diagnostic" else payload[section]
+    )
+    target[key] = value
+    status = tmp_path / "status.json"
+    status.write_text(json.dumps(payload), encoding="utf-8")
+    assert live_gate._status_is_safe(status) == (False, False)
 
 
 def test_synthetic_provider_matrix_is_complete_normalized_and_not_bundled() -> None:

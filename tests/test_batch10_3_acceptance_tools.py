@@ -63,6 +63,12 @@ def _schema6_runtime(root: Path) -> tuple[Path, Path, dict[str, object]]:
     backups = data / "backups"
     database = data / "music_vault.sqlite3"
     data.mkdir(parents=True)
+    # The resolver intentionally rejects an unmarked environment override.
+    # Every synthetic runtime must be valid before any app status writer runs.
+    (root / runtime_paths.PORTABLE_MARKER_NAME).write_text(
+        json.dumps({"schema_version": 1, "product": "Music Vault", "portable": True}),
+        encoding="utf-8",
+    )
     source_proof._create_synthetic_schema6(database, backups, root)
     baseline = acceptance.capture_database_baseline(
         project_root=root,
@@ -78,14 +84,21 @@ def _migrate_source_mode(root: Path, database: Path) -> None:
     os.environ["MUSIC_VAULT_PROJECT_ROOT"] = str(root)
     runtime_paths._resolved_project_root.cache_clear()
     try:
+        assert runtime_paths.project_root().resolve() == root.resolve()
+        assert runtime_paths.database_path().resolve() == database.resolve()
+        assert runtime_paths.data_dir().resolve() == (root / "data").resolve()
+        assert runtime_paths.app_status_path().resolve() == (root / "data" / "music_vault_status.json").resolve()
         with _schema7_database_runtime():
             db = MusicVaultDB(
                 database,
                 backup_dir=root / "data" / "backups",
                 legacy_failure_file=root / "data" / "youtube_failed_ids.txt",
             )
-            write_app_status(db, {"onboarding_completed": True})
-            db.close()
+            try:
+                status = write_app_status(db, {"onboarding_completed": True})
+                assert status.resolve() == runtime_paths.app_status_path().resolve()
+            finally:
+                db.close()
     finally:
         if previous is None:
             os.environ.pop("MUSIC_VAULT_PROJECT_ROOT", None)

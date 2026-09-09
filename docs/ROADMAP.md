@@ -6,8 +6,24 @@ dependency and no planned Watchtower integration. Android is a separate future
 application, Prime interoperability is optional, and personal radio is a major
 future branch rather than a V1 requirement.
 
-The roadmap uses implementation batches. A batch is complete only when its own
-acceptance checks pass; a label does not imply that later batches have begun.
+The historical batches below record delivered work. Current V1.1 development
+uses milestone-level outcome ownership with bounded internal engineering gates;
+a label does not imply acceptance has passed or later work has begun.
+
+## Current V1.1 outcome sequence
+
+1. Restore reliable authorized acquisition and truthful degraded/offline health.
+2. Deliver a listening-first desktop: universal search/actions, preserved
+   navigation, an understandable editable queue and native Windows media controls.
+3. Improve trustworthy metadata/art identity, favorites/history and local
+   genre/style/decade discovery while preserving manual authority and provenance.
+4. Refine premium presentation and Party Mode, with a concrete user taste
+   checkpoint, then measured packaged release-candidate acceptance.
+
+Mobile implementation is deferred. Batch 12 was proposed, never implemented;
+the numbered future sections are advisory history, not an active execution
+sequence. Bulk personal-library corrections, destructive cleanup, new
+authentication and public V1.1 publication require separate bounded approval.
 
 **Latest public product status:** Music Vault v1.0.0 Stable.
 

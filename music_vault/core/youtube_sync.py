@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +12,15 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 import yt_dlp
+
+from .acquisition_diagnostics import (
+    AcquisitionCircuitBreaker,
+    AcquisitionDiagnostic,
+    AcquisitionError,
+    AcquisitionReason,
+    AcquisitionStage,
+    classify_acquisition_error,
+)
 
 from .audio_inspection import (
     AudioInspectionError,
@@ -53,8 +64,73 @@ ProgressCallback = Callable[[str], None]
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
+def write_imported_archive(archive_file: Path, imported_video_ids: set[str]) -> None:
+    """Compatibility history only, called with verified committed identities."""
+    target = Path(archive_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp")
+    body = "".join(
+        f"youtube {video_id}\n" for video_id in sorted(imported_video_ids)
+        if _VIDEO_ID_RE.fullmatch(video_id)
+    )
+    temporary.write_text(body, encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def _public_diagnostic_destination(destination: str | Path) -> Path:
+    root = Path(destination).expanduser().resolve()
+    temporary = Path(tempfile.gettempdir()).resolve()
+    if not root.is_relative_to(temporary) or root == temporary:
+        raise ValueError("Anonymous diagnostics require a disposable temporary root.")
+    if not any(
+        part.casefold().startswith("musicvault_acquisition_")
+        for part in root.relative_to(temporary).parts
+    ):
+        raise ValueError("Anonymous diagnostics require a MusicVault_Acquisition_ temporary root.")
+    return root
+
+
+def acquire_public_audio(
+    video_id: str,
+    destination: str | Path,
+    *,
+    ffmpeg_location: str | Path | None = None,
+    max_download_bytes: int = 16 * 1024 * 1024,
+    timeout_seconds: float = 120,
+    progress: ProgressCallback | None = None,
+) -> SyncImportItem:
+    """Bounded no-secret acceptance of the real single-item media pipeline.
+
+    No playlist enumeration, archive, database, import, artwork or account
+    access is performed. The caller owns cleanup and an outer wall-clock
+    watchdog; socket/progress limits cannot interrupt an arbitrary OS stall.
+    """
+    if not _VIDEO_ID_RE.fullmatch(str(video_id)):
+        raise ValueError("A valid public video identity is required.")
+    if not 1 <= max_download_bytes <= 64 * 1024 * 1024 or not 1 <= timeout_seconds <= 300:
+        raise ValueError("Anonymous acquisition requires bounded byte/time limits.")
+    root = _public_diagnostic_destination(destination)
+    syncer = AuthorizedYouTubePlaylistSyncer(
+        YouTubeSyncConfig(
+            "", root, root / "unused-archive.txt",
+            ffmpeg_location=ffmpeg_location,
+            source_destination_dir=root,
+        ),
+        progress,
+        anonymous_media_only=True,
+    )
+    syncer._diagnostic_limits = (max_download_bytes, timeout_seconds)
+    return syncer._download_one(video_id, "anonymous", "Anonymous diagnostic")
+
+
 class AudioQualityDownloadError(RuntimeError):
     """A sanitized acquisition failure that must not be archived as success."""
+
+    def __init__(self, message: str, diagnostic: AcquisitionDiagnostic | None = None):
+        self.diagnostic = diagnostic or AcquisitionDiagnostic(
+            AcquisitionStage.VERIFICATION, AcquisitionReason.VERIFICATION
+        )
+        super().__init__(message)
 
 
 class _SanitizedYDLLogger:
@@ -62,15 +138,17 @@ class _SanitizedYDLLogger:
         self.report = report
 
     def debug(self, message: str) -> None:
-        # yt-dlp sends ordinary informational messages through debug().
-        if not str(message).startswith("[debug]"):
-            self.report(sanitize_error_text(message))
+        # Raw backend output can include signed CDN URLs, private paths and
+        # titles. Our own progress hooks supply the useful transfer updates.
+        pass
 
     def warning(self, message: str) -> None:
-        self.report(f"Warning: {sanitize_error_text(message)}")
+        diagnostic = classify_acquisition_error(message, AcquisitionStage.METADATA)
+        if diagnostic.reason != AcquisitionReason.UNKNOWN:
+            self.report(f"Warning: {diagnostic.message}")
 
     def error(self, message: str) -> None:
-        self.report(f"Error: {sanitize_error_text(message)}")
+        self.report(classify_acquisition_error(message, AcquisitionStage.METADATA).message)
 
 
 @dataclass(frozen=True)
@@ -99,6 +177,9 @@ class YouTubeSyncConfig:
     )
     download_quality_profile: str = DEFAULT_DOWNLOAD_QUALITY_PROFILE
     compatibility_mp3_bitrate_kbps: int = DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS
+    acquisition_circuit: AcquisitionCircuitBreaker | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 def scan_existing_downloads(
@@ -162,14 +243,24 @@ class AuthorizedYouTubePlaylistSyncer:
         self,
         config: YouTubeSyncConfig,
         progress: Optional[ProgressCallback] = None,
+        *,
+        anonymous_media_only: bool = False,
     ) -> None:
         policy = runtime_policy_for()
         if not policy.network_allowed:
             raise RuntimeError("youtube_sync_deferred_acceptance_no_network")
-        if not policy.secrets_allowed:
+        if not policy.secrets_allowed and not anonymous_media_only:
             raise RuntimeError("youtube_sync_deferred_acceptance_no_secrets")
+        if anonymous_media_only:
+            root = _public_diagnostic_destination(config.output_dir)
+            if (config.source_destination_dir is None
+                    or Path(config.source_destination_dir).resolve() != root
+                    or config.archive_file.parent.resolve() != root):
+                raise ValueError("Anonymous media writes must stay in their disposable root.")
         self.config = config
         self.progress = progress or (lambda message: None)
+        self._anonymous_media_only = anonymous_media_only
+        self._diagnostic_limits: tuple[int, float] | None = None
         self._ffmpeg_discovery: FFmpegDiscoveryResult | None = None
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.config.archive_file.parent.mkdir(parents=True, exist_ok=True)
@@ -224,11 +315,7 @@ class AuthorizedYouTubePlaylistSyncer:
         return ids
 
     def _write_archive_ids_atomic(self, ids: set[str]) -> None:
-        target = self.config.archive_file
-        temporary = target.with_name(f"{target.name}.tmp")
-        body = "".join(f"youtube {video_id}\n" for video_id in sorted(ids))
-        temporary.write_text(body, encoding="utf-8")
-        os.replace(temporary, target)
+        write_imported_archive(self.config.archive_file, ids)
 
     def _existing_downloads(self) -> Mapping[str, Path]:
         if self.config.shared_download_index is not None:
@@ -270,14 +357,17 @@ class AuthorizedYouTubePlaylistSyncer:
         try:
             response = requests.get(endpoint, params=params, timeout=30)
         except Exception as exc:
-            raise RuntimeError(sanitize_error_text(exc)) from None
+            raise AcquisitionError(classify_acquisition_error(exc, AcquisitionStage.ENUMERATION)) from None
         if response.status_code != 200:
-            detail = sanitize_error_text(response.text[:800])
-            raise RuntimeError(f"YouTube Data API error {response.status_code}: {detail}")
+            # Retain only the reason class, never API response text or URLs.
+            raise AcquisitionError(classify_acquisition_error(
+                f"HTTP {response.status_code}: {response.text[:800]}",
+                AcquisitionStage.ENUMERATION,
+            )) from None
         try:
             return response.json()
         except Exception as exc:
-            raise RuntimeError(f"YouTube Data API returned invalid JSON: {sanitize_error_text(exc)}") from None
+            raise AcquisitionError(classify_acquisition_error(exc, AcquisitionStage.ENUMERATION)) from None
 
     def _get_playlist_title(self, playlist_id: str, api_key: str) -> str:
         data = self._api_json(
@@ -360,13 +450,21 @@ class AuthorizedYouTubePlaylistSyncer:
         compatibility_bitrate = normalize_compatibility_mp3_bitrate_kbps(
             self.config.compatibility_mp3_bitrate_kbps
         )
+        # Capability discovery is lazy: browsing/snapshot reuse does not need
+        # an extractor runtime and never reads credentials.
+        from .acquisition_runtime import acquisition_ydl_options
+
+        try:
+            runtime_options = acquisition_ydl_options()
+        except Exception as exc:
+            raise AcquisitionError(classify_acquisition_error(exc, AcquisitionStage.READINESS)) from None
         common_opts = {
             "ignoreerrors": False,
             "noplaylist": True,
-            "retries": 10,
-            "fragment_retries": 10,
-            "extractor_retries": 10,
-            "socket_timeout": 30,
+            "retries": 2,
+            "fragment_retries": 2,
+            "extractor_retries": 1,
+            "socket_timeout": 20,
             "continuedl": True,
             "overwrites": False,
             "outtmpl": str(destination / "%(title).180s [%(id)s].%(ext)s"),
@@ -374,8 +472,36 @@ class AuthorizedYouTubePlaylistSyncer:
             "quiet": True,
             "no_warnings": False,
             "restrictfilenames": False,
+            "cachedir": False,
+            **runtime_options,
         }
-        ffmpeg_location = self._ffmpeg_location()
+        started = time.monotonic()
+        stage = AcquisitionStage.METADATA
+
+        def transfer_hook(status: dict) -> None:
+            nonlocal stage
+            stage = AcquisitionStage.TRANSFER
+            if self._diagnostic_limits is not None:
+                byte_limit, seconds_limit = self._diagnostic_limits
+                if (int(status.get("downloaded_bytes") or 0) > byte_limit
+                        or time.monotonic() - started > seconds_limit):
+                    raise AcquisitionError(AcquisitionDiagnostic(stage, AcquisitionReason.LIMIT))
+            self._hook(status)
+
+        def transform_hook(status: dict) -> None:
+            nonlocal stage
+            stage = AcquisitionStage.TRANSFORM
+
+        if self._diagnostic_limits is not None:
+            common_opts["max_filesize"] = self._diagnostic_limits[0]
+            common_opts["retries"] = 0
+            common_opts["fragment_retries"] = 0
+            common_opts["extractor_retries"] = 0
+            common_opts["socket_timeout"] = min(15, self._diagnostic_limits[1])
+        try:
+            ffmpeg_location = self._ffmpeg_location()
+        except Exception as exc:
+            raise AcquisitionError(classify_acquisition_error(exc, AcquisitionStage.READINESS)) from None
         if ffmpeg_location:
             common_opts["ffmpeg_location"] = ffmpeg_location
 
@@ -407,7 +533,8 @@ class AuthorizedYouTubePlaylistSyncer:
                 )
             if not isinstance(metadata, Mapping):
                 raise AudioQualityDownloadError(
-                    "The source did not provide usable audio format information."
+                    "The source did not provide usable audio format information.",
+                    AcquisitionDiagnostic(AcquisitionStage.METADATA, AcquisitionReason.NO_AUDIO),
                 )
             raw_formats = metadata.get("formats")
             formats = list(raw_formats) if isinstance(raw_formats, list) else [metadata]
@@ -430,15 +557,15 @@ class AuthorizedYouTubePlaylistSyncer:
             # its native container cannot accept the thumbnail safely.
             plan_opts = build_yt_dlp_audio_options(
                 plan,
-                embed_thumbnail=profile == MP3_320_COMPATIBILITY_PROFILE,
-                retain_thumbnail=profile != MP3_320_COMPATIBILITY_PROFILE,
+                embed_thumbnail=profile == MP3_320_COMPATIBILITY_PROFILE and not self._anonymous_media_only,
+                retain_thumbnail=profile != MP3_320_COMPATIBILITY_PROFILE and not self._anonymous_media_only,
             )
             tracker = DeterministicFinalPathTracker(destination, video_id)
             opts = {
                 **common_opts,
                 **plan_opts,
-                "progress_hooks": [self._hook, tracker.progress_hook],
-                "postprocessor_hooks": [tracker.postprocessor_hook],
+                "progress_hooks": [transfer_hook, tracker.progress_hook],
+                "postprocessor_hooks": [transform_hook, tracker.postprocessor_hook],
             }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(
@@ -449,6 +576,7 @@ class AuthorizedYouTubePlaylistSyncer:
                     "The item is unavailable through the supported public/unlisted workflow."
                 )
             tracker.record_result(info)
+            stage = AcquisitionStage.VERIFICATION
             final_path = tracker.resolve_final_path(
                 expected_extension=plan.output_extension
             )
@@ -474,7 +602,12 @@ class AuthorizedYouTubePlaylistSyncer:
                 video_id,
                 preexisting_attempt_paths,
             )
-            raise AudioQualityDownloadError(sanitize_error_text(exc)) from None
+            diagnostic = (
+                AcquisitionDiagnostic(AcquisitionStage.METADATA, AcquisitionReason.NO_AUDIO)
+                if isinstance(exc, SourceFormatSelectionError)
+                else classify_acquisition_error(exc, AcquisitionStage.VERIFICATION)
+            )
+            raise AudioQualityDownloadError(diagnostic.message, diagnostic) from None
         except AudioQualityDownloadError:
             self._discard_rejected_attempt(
                 tracker,
@@ -490,7 +623,7 @@ class AuthorizedYouTubePlaylistSyncer:
                 video_id,
                 preexisting_attempt_paths,
             )
-            raise RuntimeError(sanitize_error_text(exc)) from None
+            raise AcquisitionError(classify_acquisition_error(exc, stage)) from None
         quality_facts = {
             "acquisition_profile": plan.profile,
             "source_format_id": plan.source.format_id,
@@ -639,7 +772,7 @@ class AuthorizedYouTubePlaylistSyncer:
     def _hook(self, status: dict) -> None:
         state = status.get("status")
         if state == "downloading":
-            filename = Path(status.get("filename", "")).name
+            filename = "audio" if self._anonymous_media_only else Path(status.get("filename", "")).name
             percent = status.get("_percent_str", "").strip()
             self._report(f"Downloading {filename} {percent}".strip())
         elif state == "finished":
@@ -682,25 +815,33 @@ class AuthorizedYouTubePlaylistSyncer:
         return PlaylistSnapshot.completed(playlist_id, playlist_title, items)
 
     def sync(self) -> SyncResult:
+        if self._anonymous_media_only:
+            raise RuntimeError("Anonymous media diagnostics cannot enumerate or synchronize playlists.")
         started_at = utc_now()
         playlist_id: str | None = None
+        stage = AcquisitionStage.READINESS
         try:
             # Resolve once for the whole worker. In particular, a configured
             # but invalid location must fail before yt-dlp can search elsewhere.
             self._resolve_ffmpeg_once()
+            stage = AcquisitionStage.ENUMERATION
             playlist_id = self._playlist_id()
             playlist_id, playlist_title, entries = self._extract_playlist_entries_via_api()
             snapshot = self._snapshot_from_entries(playlist_id, playlist_title, entries)
         except Exception as exc:
-            failed_snapshot = PlaylistSnapshot.failed(exc, playlist_id=playlist_id)
-            return SyncResult.failed_result(
-                exc,
+            diagnostic = classify_acquisition_error(exc, stage)
+            failed_snapshot = PlaylistSnapshot.failed(diagnostic.message, playlist_id=playlist_id)
+            failed = SyncResult.failed_result(
+                diagnostic.message,
                 playlist_id=playlist_id,
                 started_at=started_at,
                 saved_source_id=self.config.saved_source_id,
                 source_label=self.config.source_label,
                 snapshot=failed_snapshot,
             )
+            failed.acquisition_diagnostic = diagnostic
+            failed.failures[0].acquisition = diagnostic
+            return failed
 
         result = SyncResult(
             status="complete",
@@ -716,19 +857,11 @@ class AuthorizedYouTubePlaylistSyncer:
         local_files = self._existing_downloads()
         database_ids = set(self.config.existing_video_ids)
         archive_ids = self._archive_ids()
-        if self.config.shared_download_index is None:
-            # Preserve the legacy standalone/tuple behavior exactly. Those
-            # paths were already materialized locally, so collecting their IDs
-            # for the compatibility archive adds no new batch-wide cost.
-            reliable_archive_ids = database_ids | set(local_files)
-            stale_archive_ids = archive_ids - reliable_archive_ids
-        else:
-            stale_archive_ids = {
-                video_id
-                for video_id in archive_ids
-                if video_id not in database_ids and local_files.get(video_id) is None
-            }
-            reliable_archive_ids = archive_ids - stale_archive_ids
+        stale_archive_ids = {
+            video_id
+            for video_id in archive_ids
+            if video_id not in database_ids and local_files.get(video_id) is None
+        }
         if stale_archive_ids:
             self._report(
                 f"Archive reconciliation found {len(stale_archive_ids)} stale entr"
@@ -736,6 +869,7 @@ class AuthorizedYouTubePlaylistSyncer:
             )
 
         processed_video_ids: set[str] = set()
+        circuit = self.config.acquisition_circuit or AcquisitionCircuitBreaker()
         occurrence_ids: dict[str, list[str]] = {}
         for item in snapshot.items:
             if item.video_id:
@@ -773,7 +907,6 @@ class AuthorizedYouTubePlaylistSyncer:
             if video_id in database_ids or local_path is not None:
                 result.existing_count += 1
                 result.successful_video_ids.add(video_id)
-                reliable_archive_ids.add(video_id)
                 if local_path is not None and video_id not in database_ids:
                     private_cover_path = self._existing_private_cover_path(
                         local_path,
@@ -794,10 +927,17 @@ class AuthorizedYouTubePlaylistSyncer:
                 continue
 
             result.new_item_count += 1
+            if circuit.open:
+                result.acquisition_circuit_open = True
+                result.acquisition_diagnostic = circuit.last_diagnostic
+                result.acquisition_deferred_count += 1
+                continue
             self._report(f"Downloading: {title}")
             try:
                 import_item = self._download_one(video_id, playlist_id, playlist_title)
             except AudioQualityDownloadError as exc:
+                diagnostic = classify_acquisition_error(exc, AcquisitionStage.VERIFICATION)
+                circuit.failure(video_id, diagnostic)
                 result.add_failure(
                     SyncFailure(
                         video_id,
@@ -805,20 +945,30 @@ class AuthorizedYouTubePlaylistSyncer:
                         sanitize_error_text(exc),
                         "quality",
                         item.source_item_id,
+                        diagnostic,
                     )
                 )
                 continue
             except Exception as exc:
+                diagnostic = classify_acquisition_error(exc, AcquisitionStage.METADATA)
+                if circuit.failure(video_id, diagnostic):
+                    result.acquisition_circuit_open = True
+                    self._report(
+                        "Acquisition paused after repeated systemic failures. Remaining new items "
+                        "are deferred, not marked unavailable. Check acquisition health before retrying."
+                    )
                 result.add_failure(
                     SyncFailure(
                         video_id,
                         title,
-                        sanitize_error_text(exc),
+                        diagnostic.message,
                         "download",
                         item.source_item_id,
+                        diagnostic,
                     )
                 )
                 continue
+            circuit.success()
             import_item = SyncImportItem(
                 import_item.path,
                 import_item.video_id,
@@ -831,17 +981,22 @@ class AuthorizedYouTubePlaylistSyncer:
             result.downloaded_paths.append(import_item.path)
             result.import_items.append(import_item)
             result.successful_video_ids.add(video_id)
-            reliable_archive_ids.add(video_id)
 
-        # The archive is compatibility history only. Rewrite it atomically from
-        # prior entries still backed by a DB/file source ID plus this source's
-        # observed successes. The shared media index is intentionally not
-        # copied or traversed in full for each source.
-        self._write_archive_ids_atomic(reliable_archive_ids)
+        # A verified file is reusable evidence, not an imported success. The
+        # importer/orchestrator updates history only after the DB and source
+        # membership commit. Failed imports cannot leave false archive entries.
+        try:
+            self._write_archive_ids_atomic(database_ids)
+        except OSError:
+            self._report(
+                "Compatibility history could not be updated. Verified files remain "
+                "available for import; history does not control item availability."
+            )
         result.finished_at = utc_now()
         result.refresh_status()
         self._report(
             f"Sync {result.status}: {result.downloaded_count} downloaded, "
-            f"{result.existing_count} existing, {result.failed_count} failed."
+            f"{result.existing_count} existing, {result.failed_count} failed, "
+            f"{result.acquisition_deferred_count} deferred."
         )
         return result
