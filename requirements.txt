@@ -2,4 +2,10 @@ PySide6>=6.8
 mutagen>=1.47
 musicbrainzngs>=0.7.1
 requests>=2.32
-yt-dlp>=2026.1.1
+# Treat the extractor, challenge solver and sandboxed JS runtime as one tested capability.
+yt-dlp[default]==2026.8.19
+yt-dlp-ejs==0.8.0
+deno==2.9.5
+brotli==1.2.0
+pycryptodomex==3.23.0
+websockets==17.1

@@ -21,6 +21,16 @@ from music_vault.core.youtube_sync import (
 VIDEO_ID = "abcdefghijk"
 
 
+@pytest.fixture(autouse=True)
+def synthetic_acquisition_runtime(monkeypatch):
+    # These tests replace the extractor itself. Production readiness, pins and
+    # bundled resources are exercised by the separate capability tests.
+    monkeypatch.setattr(
+        "music_vault.core.acquisition_runtime.acquisition_ydl_options",
+        lambda: {"js_runtimes": {}, "remote_components": set()},
+    )
+
+
 def _ready_discovery(root: Path) -> FFmpegDiscoveryResult:
     return FFmpegDiscoveryResult(
         True,
@@ -420,7 +430,9 @@ def test_preexisting_thumbnail_does_not_block_missing_media_acquisition(
     artwork.write_bytes(b"preexisting personal artwork")
     before = (artwork.read_bytes(), artwork.stat().st_mtime_ns)
 
-    with pytest.raises(RuntimeError, match="acquisition reached"):
+    # Provider exception text is intentionally no longer public diagnostic
+    # text; the download-call assertion below proves the same control flow.
+    with pytest.raises(RuntimeError, match="metadata_extraction"):
         syncer._download_one(VIDEO_ID, "PLbatch11", "Synthetic")
 
     assert download_calls == 1

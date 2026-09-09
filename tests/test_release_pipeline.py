@@ -131,7 +131,12 @@ def test_central_release_version_and_lock_are_exact() -> None:
         "mutagen": "1.47.0",
         "musicbrainzngs": "0.7.1",
         "requests": "2.34.2",
-        "yt-dlp": "2026.6.9",
+        "yt-dlp": "2026.8.19",
+        "yt-dlp-ejs": "0.8.0",
+        "deno": "2.9.5",
+        "brotli": "1.2.0",
+        "pycryptodomex": "3.23.0",
+        "websockets": "17.1",
         "pyinstaller": "6.21.0",
         "pytest": "8.4.2",
     }.items() <= requirements.items()

@@ -180,7 +180,15 @@ def test_invalid_configured_ffmpeg_fails_before_api_or_ytdlp(
 
     assert result.status == "failed"
     assert result.failures
-    assert "Configured FFmpeg is not ready" in result.failures[0].reason
+    assert result.acquisition_diagnostic is not None
+    assert result.acquisition_diagnostic.to_dict() == {
+        "stage": "readiness",
+        "reason": "stack_not_ready",
+        "http_status": None,
+        "retry_recommendation": "check_acquisition_health",
+    }
+    assert result.failures[0].reason == result.acquisition_diagnostic.message
+    assert result.failures[0].acquisition is result.acquisition_diagnostic
     assert discovery_calls == [selected]
     assert api_calls == []
     assert ytdlp_calls == []

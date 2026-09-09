@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Literal
 
 from .safety import sanitize_error_text
+from .acquisition_diagnostics import AcquisitionDiagnostic
 
 
 SyncStatus = Literal["complete", "complete_with_issues", "failed"]
@@ -22,17 +23,21 @@ class SyncFailure:
     reason: str
     error_category: str
     source_item_id: str | None = None
+    acquisition: AcquisitionDiagnostic | None = None
 
     def __post_init__(self) -> None:
         self.reason = sanitize_error_text(self.reason)
 
     def to_dict(self) -> dict:
-        return {
+        values = {
             "video_id": self.video_id,
             "title": self.title,
             "reason": self.reason,
             "error_category": self.error_category,
         }
+        if self.acquisition is not None:
+            values["acquisition"] = self.acquisition.to_dict()
+        return values
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,9 @@ class SyncResult:
     total_stored_bytes: int = 0
     reused_quality_profile_counts: dict[str, int] = field(default_factory=dict)
     reused_stored_codec_counts: dict[str, int] = field(default_factory=dict)
+    acquisition_circuit_open: bool = False
+    acquisition_deferred_count: int = 0
+    acquisition_diagnostic: AcquisitionDiagnostic | None = None
 
     @property
     def failed_count(self) -> int:
@@ -159,10 +167,14 @@ class SyncResult:
 
     def refresh_status(self) -> None:
         if self.status != "failed":
-            self.status = "complete_with_issues" if self.failures else "complete"
+            self.status = "complete_with_issues" if (
+                self.failures or self.acquisition_deferred_count or self.acquisition_circuit_open
+            ) else "complete"
 
     def add_failure(self, failure: SyncFailure) -> None:
         self.failures.append(failure)
+        if failure.acquisition is not None:
+            self.acquisition_diagnostic = failure.acquisition
         if failure.error_category == "quality":
             self.quality_failure_count += 1
         if failure.video_id:
@@ -270,6 +282,11 @@ class SyncResult:
             "last_sync_quality_failure_count": self.quality_failure_count,
             "last_sync_total_stored_bytes": self.total_stored_bytes,
             "last_sync_failures": [failure.to_dict() for failure in self.failures[:25]],
+            "last_sync_acquisition_circuit_open": self.acquisition_circuit_open,
+            "last_sync_acquisition_deferred_count": self.acquisition_deferred_count,
+            "last_sync_acquisition_diagnostic": (
+                self.acquisition_diagnostic.to_dict() if self.acquisition_diagnostic else None
+            ),
         }
 
 

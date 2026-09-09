@@ -632,7 +632,13 @@ def test_database_only_apply_is_audited_and_never_writes_media(harness_factory):
     assert harness.service.verify_job(job.id)["ok"] is True
 
 
-def test_artwork_preparation_issue_keeps_applied_item_truthful(harness_factory):
+def test_artwork_preparation_issue_keeps_applied_item_truthful(
+    harness_factory, monkeypatch, tmp_path
+):
+    artwork_root = tmp_path / "cover-art-archive"
+    monkeypatch.setattr(
+        "music_vault.metadata.remediation.cover_art_archive_dir", lambda: artwork_root
+    )
     title = "Artwork Unavailable (Official Video)"
     candidate = _candidate(title, 200.0, artwork_available=True)
     harness = harness_factory(provider=FakeProvider({title: [candidate]}))
@@ -646,6 +652,7 @@ def test_artwork_preparation_issue_keeps_applied_item_truthful(harness_factory):
 
     assert summary.status == "complete_with_issues"
     assert summary.applied == 1 and summary.failed == 0
+    assert artwork_root.is_dir()
     item = _item(harness, job.id, track_id)
     assert item["status"] == "applied"
     assert item["file_write_status"] == "not_requested"

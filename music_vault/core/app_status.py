@@ -7,6 +7,8 @@ from pathlib import Path
 from music_vault.version import APP_VERSION, RELEASE_CHANNEL
 
 from .ffmpeg import discover_ffmpeg
+from .acquisition_runtime import acquisition_readiness
+from .acquisition_diagnostics import AcquisitionDiagnostic, AcquisitionReason, AcquisitionStage
 from .paths import (
     app_status_path,
     config_path,
@@ -60,11 +62,17 @@ QUALITY_SYNC_FIELDS = (
     "last_sync_quality_failure_count",
     "last_sync_total_stored_bytes",
 )
+ACQUISITION_SYNC_FIELDS = (
+    "last_sync_acquisition_circuit_open",
+    "last_sync_acquisition_deferred_count",
+    "last_sync_acquisition_diagnostic",
+)
 SYNC_FIELDS = (
     LEGACY_SYNC_FIELDS
     + OPTIONAL_SYNC_FIELDS
     + MULTI_SOURCE_SYNC_FIELDS
     + QUALITY_SYNC_FIELDS
+    + ACQUISITION_SYNC_FIELDS
 )
 PLAYBACK_FIELDS = (
     "currently_playing",
@@ -282,6 +290,24 @@ def _sanitize_sync_values(values: dict) -> dict:
     sanitized["last_sync_playlist_id"] = None
     sanitized["last_sync_error"] = None
     sanitized["last_sync_failures"] = []
+    if "last_sync_acquisition_circuit_open" in sanitized:
+        sanitized["last_sync_acquisition_circuit_open"] = sanitized["last_sync_acquisition_circuit_open"] is True
+    if "last_sync_acquisition_deferred_count" in sanitized:
+        try:
+            sanitized["last_sync_acquisition_deferred_count"] = max(0, int(sanitized["last_sync_acquisition_deferred_count"]))
+        except (TypeError, ValueError, OverflowError):
+            sanitized["last_sync_acquisition_deferred_count"] = 0
+    if "last_sync_acquisition_diagnostic" in sanitized:
+        diagnostic = sanitized["last_sync_acquisition_diagnostic"]
+        try:
+            status = diagnostic.get("http_status")
+            if type(status) is not int or not 400 <= status <= 599:
+                status = None
+            sanitized["last_sync_acquisition_diagnostic"] = AcquisitionDiagnostic(
+                AcquisitionStage(diagnostic["stage"]), AcquisitionReason(diagnostic["reason"]), status,
+            ).to_dict()
+        except (AttributeError, KeyError, TypeError, ValueError):
+            sanitized["last_sync_acquisition_diagnostic"] = None
     for field in QUALITY_SYNC_FIELDS:
         if field not in sanitized or sanitized[field] is None:
             continue
@@ -303,6 +329,7 @@ def write_app_status(db, config, extra=None) -> Path:
     ) or default_downloads_dir()
     api_ready = _api_ready()
     ffmpeg_ready = _ffmpeg_ready(config)
+    acquisition = acquisition_readiness()
     runtime_policy = runtime_policy_for(db)
 
     payload = {
@@ -312,10 +339,13 @@ def write_app_status(db, config, extra=None) -> Path:
         "release_channel": RELEASE_CHANNEL,
         "updated_at": _utc_now(),
         "health": {
-            "ok": api_ready and ffmpeg_ready,
+            "ok": api_ready and ffmpeg_ready and acquisition.ready,
             "api_ready": api_ready,
             "ffmpeg_ready": ffmpeg_ready,
+            "acquisition_components_ready": acquisition.ready,
+            "local_playback_requires_network": False,
         },
+        "acquisition": acquisition.public_summary(),
         "library": {
             "track_count": _count(db, "SELECT COUNT(*) FROM tracks"),
             "playlist_count": _count(db, "SELECT COUNT(*) FROM playlists"),

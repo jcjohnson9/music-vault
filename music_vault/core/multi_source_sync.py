@@ -9,6 +9,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Iterable
 
+from .acquisition_diagnostics import AcquisitionCircuitBreaker, AcquisitionStage, classify_acquisition_error
+
 from .audio_quality_config import (
     DEFAULT_COMPATIBILITY_MP3_BITRATE_KBPS,
     DEFAULT_DOWNLOAD_QUALITY_PROFILE,
@@ -34,6 +36,7 @@ from .youtube_sync import (
     AuthorizedYouTubePlaylistSyncer,
     YouTubeSyncConfig,
     scan_existing_downloads,
+    write_imported_archive,
 )
 
 
@@ -192,6 +195,7 @@ class MultiSourceSyncOrchestrator:
             raise SyncBatchActiveError("Another synchronization batch is already active.")
 
         self._active = True
+        self._acquisition_circuit = AcquisitionCircuitBreaker()
         self._stop_after_current.clear()
         started_at = utc_now()
         batch_token = str(uuid.uuid4())
@@ -248,6 +252,13 @@ class MultiSourceSyncOrchestrator:
                     source,
                     result=outcome,
                 )
+                if outcome.acquisition_circuit_open and index < selected_count:
+                    stopped = True
+                    self._emit(
+                        "acquisition_paused", index, selected_count, source,
+                        message="Repeated acquisition failures paused the batch. Remaining sources were not attempted.",
+                    )
+                    break
                 if self._stop_after_current.is_set() and index < selected_count:
                     stopped = True
                     self._emit("stopped_after_current", index, selected_count, source)
@@ -289,6 +300,12 @@ class MultiSourceSyncOrchestrator:
                     aggregate.total_quality_failures
                 ),
                 "last_sync_total_stored_bytes": aggregate.total_stored_bytes,
+                "last_sync_acquisition_circuit_open": any(item.acquisition_circuit_open for item in outcomes),
+                "last_sync_acquisition_deferred_count": sum(item.acquisition_deferred_count for item in outcomes),
+                "last_sync_acquisition_diagnostic": next((
+                    item.acquisition_diagnostic.to_dict() for item in reversed(outcomes)
+                    if item.acquisition_diagnostic is not None
+                ), None),
             }
         )
         self._emit("batch_finished", len(outcomes), selected_count, result=None)
@@ -334,6 +351,7 @@ class MultiSourceSyncOrchestrator:
             compatibility_mp3_bitrate_kbps=(
                 self.compatibility_mp3_bitrate_kbps
             ),
+            acquisition_circuit=self._acquisition_circuit,
         )
 
         def report(message: str) -> None:
@@ -381,9 +399,6 @@ class MultiSourceSyncOrchestrator:
             )
             self._record_reused_quality_facts(result)
             result.finish_imports(imported_count)
-            self._extend_valid_database_video_ids(
-                valid_database_ids, result.successful_video_ids
-            )
             self._persist_source_outcome(source, batch_token, result)
         except Exception as exc:
             # A provider may have produced useful files before a local
@@ -406,6 +421,23 @@ class MultiSourceSyncOrchestrator:
             # Persist the truthful failed outcome in a fresh transaction. It
             # intentionally has no authoritative snapshot to reconcile.
             self._persist_source_outcome(source, batch_token, result)
+        else:
+            # Compatibility history is not part of the authoritative SQLite
+            # transaction. A filesystem failure here cannot undo committed
+            # membership changes or turn a good snapshot into a failed one.
+            try:
+                self._extend_valid_database_video_ids(
+                    valid_database_ids, result.successful_video_ids
+                )
+                write_imported_archive(self.archive_file, valid_database_ids)
+            except Exception:
+                self._emit(
+                    "source_progress", source_index, source_count, source,
+                    message=(
+                        "Library and source changes were saved, but compatibility "
+                        "history could not be updated. It will reconcile on the next sync."
+                    ),
+                )
         return result
 
     def _persist_source_outcome(
@@ -538,13 +570,15 @@ class MultiSourceSyncOrchestrator:
                 result.successful_video_ids.add(item.video_id)
                 imported_count += 1
             except Exception as exc:
+                diagnostic = classify_acquisition_error(exc, AcquisitionStage.IMPORT)
                 result.add_failure(
                     SyncFailure(
                         item.video_id,
                         Path(item.path).stem,
-                        sanitize_error_text(exc),
+                        diagnostic.message,
                         "import",
                         item.source_item_ids[0] if item.source_item_ids else None,
+                        diagnostic,
                     )
                 )
         return imported_count

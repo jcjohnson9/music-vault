@@ -28,6 +28,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from music_vault.core.sync_schema import required_sync_indexes  # noqa: E402
 from music_vault.core.db import CURRENT_SCHEMA_VERSION  # noqa: E402
+from music_vault.core.acquisition_diagnostics import (  # noqa: E402
+    AcquisitionDiagnostic,
+    AcquisitionReason,
+    AcquisitionStage,
+)
 from music_vault.metadata.artist_credits import normalize_artist_name  # noqa: E402
 from music_vault.metadata.intelligence_schema import (  # noqa: E402
     required_intelligence_indexes,
@@ -101,6 +106,7 @@ SAFE_STATUS_TOP_LEVEL = frozenset(
         "release_channel",
         "updated_at",
         "health",
+        "acquisition",
         "library",
         "playback",
         "sync",
@@ -135,6 +141,92 @@ FORBIDDEN_STATUS_KEY_PARTS = (
     "source_item",
     "playlist_title",
 )
+SAFE_ACQUISITION_FIELDS = frozenset({
+    "ready", "extractor", "extractor_version", "solver", "solver_version",
+    "runtime", "runtime_version", "runtime_source", "error_code",
+    "authentication", "remote_components_enabled", "network_verified",
+})
+SAFE_ACQUISITION_ERROR_CODES = frozenset({
+    "runtime_integrity_mismatch", "runtime_probe_failed", "runtime_probe_timeout",
+    "runtime_version_mismatch", "dependency_version_mismatch", "solver_version_mismatch",
+    "solver_integrity_mismatch", "dependencies_incomplete", "runtime_missing",
+})
+
+
+def _acquisition_status_is_safe(payload: Mapping[str, Any]) -> bool:
+    """Accept only the additive, typed capability contract, never provider text."""
+
+    if "acquisition" in payload:
+        capability = payload["acquisition"]
+        if not isinstance(capability, dict) or set(capability) != SAFE_ACQUISITION_FIELDS:
+            return False
+        if type(capability["ready"]) is not bool:
+            return False
+        if any(capability[key] != value for key, value in {
+            "extractor": "yt-dlp", "solver": "yt-dlp-ejs", "runtime": "deno",
+            "authentication": "anonymous",
+        }.items()):
+            return False
+        if capability["runtime_source"] not in ("bundled", "project_environment"):
+            return False
+        if (capability["remote_components_enabled"] is not False
+                or capability["network_verified"] is not False):
+            return False
+        error = capability["error_code"]
+        if error is not None and (not isinstance(error, str) or error not in SAFE_ACQUISITION_ERROR_CODES):
+            return False
+        for key in ("extractor_version", "solver_version", "runtime_version"):
+            version = capability[key]
+            if version is not None and (
+                not isinstance(version, str)
+                or re.fullmatch(r"\d{1,4}(?:\.\d{1,4}){1,3}", version) is None
+            ):
+                return False
+
+    health = payload.get("health", {})
+    if not isinstance(health, dict):
+        return False
+    for key in ("acquisition_components_ready", "local_playback_requires_network"):
+        if key in health and type(health[key]) is not bool:
+            return False
+    if health.get("local_playback_requires_network", False) is not False:
+        return False
+
+    sync = payload.get("sync", {})
+    if not isinstance(sync, dict):
+        return False
+    circuit = "last_sync_acquisition_circuit_open"
+    count = "last_sync_acquisition_deferred_count"
+    if any(
+        key.startswith("last_sync_acquisition_")
+        and key not in {circuit, count, "last_sync_acquisition_diagnostic"}
+        for key in sync
+    ):
+        return False
+    if sync.get(circuit) is not None and type(sync[circuit]) is not bool:
+        return False
+    if sync.get(count) is not None and (type(sync[count]) is not int or sync[count] < 0):
+        return False
+    diagnostic = sync.get("last_sync_acquisition_diagnostic")
+    if diagnostic is not None:
+        if not isinstance(diagnostic, dict) or set(diagnostic) != {
+            "stage", "reason", "http_status", "retry_recommendation",
+        }:
+            return False
+        status = diagnostic["http_status"]
+        if status is not None and (type(status) is not int or not 400 <= status <= 599):
+            return False
+        try:
+            expected = AcquisitionDiagnostic(
+                AcquisitionStage(diagnostic["stage"]),
+                AcquisitionReason(diagnostic["reason"]),
+                status,
+            ).to_dict()
+        except (TypeError, ValueError):
+            return False
+        if diagnostic != expected:
+            return False
+    return True
 
 
 class GateFailure(RuntimeError):
@@ -419,6 +511,8 @@ def _status_is_safe(path: Path) -> tuple[bool, bool]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False, False
     if not isinstance(payload, dict) or not set(payload) <= SAFE_STATUS_TOP_LEVEL:
+        return False, False
+    if not _acquisition_status_is_safe(payload):
         return False, False
 
     def unsafe(value: object) -> bool:

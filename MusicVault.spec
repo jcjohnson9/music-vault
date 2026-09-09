@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 from PyInstaller.utils.win32.versioninfo import (
     FixedFileInfo,
     StringFileInfo,
@@ -17,6 +18,16 @@ from music_vault.version import (
     PUBLISHER,
     WINDOWS_VERSION,
 )
+from music_vault.core.acquisition_runtime import ACQUISITION_PINS, acquisition_readiness
+
+
+acquisition = acquisition_readiness(verify_integrity=True)
+if not acquisition.ready:
+    raise RuntimeError(f"Acquisition build preflight failed: {acquisition.error_code}")
+acquisition_datas = collect_data_files('yt_dlp_ejs', includes=['**/*.js'])
+for dependency in ACQUISITION_PINS:
+    # Distribution versions and license files remain inspectable when frozen.
+    acquisition_datas += copy_metadata(dependency)
 
 
 windows_version_info = VSVersionInfo(
@@ -55,8 +66,8 @@ windows_version_info = VSVersionInfo(
 a = Analysis(
     ['run.py'],
     pathex=[],
-    binaries=[],
-    datas=[('assets', 'assets')],
+    binaries=[(str(acquisition.runtime_path), 'acquisition')],
+    datas=[('assets', 'assets'), *acquisition_datas],
     hiddenimports=[
         'yt_dlp',
         'mutagen.id3',
@@ -64,7 +75,8 @@ a = Analysis(
         'musicbrainzngs',
         'music_vault.metadata.providers.discogs',
         'music_vault.metadata.discogs_artwork',
-    ],
+        'tools.dev.verify_acquisition',
+    ] + collect_submodules('yt_dlp_ejs'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -138,6 +150,6 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=['deno.exe'],
     name='MusicVault',
 )

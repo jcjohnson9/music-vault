@@ -2,9 +2,40 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
+
+from _runtime_data_guard import RuntimeDataGuard
+
+
+# Install before test-module collection. An audit hook survives monkeypatching
+# open()/connect(), and its records still fail the suite if application code
+# catches PermissionError (for example, a best-effort status writer).
+_runtime_data_guard = RuntimeDataGuard(Path(__file__).resolve().parents[1])
+sys.addaudithook(_runtime_data_guard.audit)
+
+
+@pytest.fixture(autouse=True)
+def _deny_personal_runtime_access():
+    before = len(_runtime_data_guard.violations)
+    yield
+    new = _runtime_data_guard.violations[before:]
+    if new:
+        events = ", ".join(sorted({record["event"] for record in new}))
+        pytest.fail(f"Personal runtime access was blocked during this test: {events}", pytrace=False)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _runtime_data_guard.violations:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def pytest_terminal_summary(terminalreporter):
+    count = len(_runtime_data_guard.violations)
+    if count:
+        terminalreporter.write_sep("!", f"Runtime isolation: {count} denied personal-data access attempt(s)")
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
