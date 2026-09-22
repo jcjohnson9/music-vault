@@ -3344,7 +3344,7 @@ def validate_batch10_3_review_behaviors(
         summary.browser_key: summary for summary in album_summaries
     }
     window.open_album(edition_cards[0].browser_key if edition_cards else "")
-    album_handler_rows = int(window.library_table.rowCount())
+    album_handler_rows = int(window.library_table.total_track_count())
     window._browser_summary_maps["artists"] = {
         summary.browser_key: summary for summary in artist_summaries
     }
@@ -3367,7 +3367,7 @@ def validate_batch10_3_review_behaviors(
             continue
         selector.setCurrentIndex(index)
         window.on_artist_section_changed(index)
-        selector_row_counts[section] = int(window.library_table.rowCount())
+        selector_row_counts[section] = int(window.library_table.total_track_count())
     real_artist_handlers = bool(
         album_handler_rows == edition_cards[0].track_count
         if edition_cards
@@ -3706,7 +3706,7 @@ def validate_batch10_5_review_behaviors(
             continue
         selector.setCurrentIndex(index)
         window.on_artist_section_changed(index)
-        section_handler_rows[section] = int(window.library_table.rowCount())
+        section_handler_rows[section] = int(window.library_table.total_track_count())
 
     identity = window.artist_image_identity(target)
     cached = window.artist_image_cache.lookup(identity, repair=False)
@@ -5433,7 +5433,7 @@ def multi_source_review_metrics(
                 and "managed" in str(badge.text()).casefold()
                 and "source" in rendered.casefold()
             ),
-            "playlist_track_count": int(table.rowCount()) if table is not None else 0,
+            "playlist_track_count": int(table.total_track_count()) if table is not None else 0,
             "preservation_message_present": True,
         }
 

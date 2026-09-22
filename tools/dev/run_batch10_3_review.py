@@ -934,11 +934,12 @@ def _prepare_scene(runtime: ReviewRuntime, scene: ReviewScene, app):
 
 
 def _widget_texts(widget) -> list[str]:
+    from PySide6.QtCore import Qt
     from PySide6.QtWidgets import (
         QAbstractButton,
         QComboBox,
         QLabel,
-        QTableWidget,
+        QTableView,
     )
 
     texts = [
@@ -956,19 +957,26 @@ def _widget_texts(widget) -> list[str]:
             continue
         texts.append(str(combo.currentText()))
         texts.extend(str(combo.itemText(index)) for index in range(combo.count()))
-    for table in widget.findChildren(QTableWidget):
+    for table in widget.findChildren(QTableView):
         if not table.isVisibleTo(widget):
             continue
-        for column in range(table.columnCount()):
+        model = table.model()
+        if model is None:
+            continue
+        # Inspect the actual display/proxy model, not source records or hidden
+        # path columns. This covers both model-based tracks and widget dialogs.
+        for column in range(model.columnCount()):
             if table.isColumnHidden(column):
                 continue
-            header = table.horizontalHeaderItem(column)
+            header = model.headerData(column, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
             if header is not None:
-                texts.append(str(header.text()))
-            for row in range(table.rowCount()):
-                item = table.item(row, column)
-                if item is not None:
-                    texts.append(str(item.text()))
+                texts.append(str(header))
+            for row in range(model.rowCount()):
+                if table.isRowHidden(row):
+                    continue
+                value = model.index(row, column).data(Qt.ItemDataRole.DisplayRole)
+                if value is not None:
+                    texts.append(str(value))
     return texts
 
 
@@ -1007,7 +1015,7 @@ def _validate_scene(target, runtime: ReviewRuntime, scene: ReviewScene) -> dict[
             raise RuntimeError("Canonical album grid did not render one three-edition card.")
         semantic_checks += 1
     elif scene.name == "canonical_album_editions":
-        if window.current_view_kind != "album_tracks" or window.library_table.rowCount() != 3:
+        if window.current_view_kind != "album_tracks" or window.library_table.total_track_count() != 3:
             raise RuntimeError("Canonical album detail did not retain all three editions.")
         semantic_checks += 1
     elif scene.name in {
@@ -1025,7 +1033,7 @@ def _validate_scene(target, runtime: ReviewRuntime, scene: ReviewScene) -> dict[
         if (
             window.current_view_kind != "artist_tracks"
             or str(window.artist_section_selector.currentData()) != expected
-            or window.library_table.rowCount() < 1
+            or window.library_table.total_track_count() < 1
         ):
             raise RuntimeError("Production artist detail section did not render correctly.")
         if scene.name == "artist_group_appearances":

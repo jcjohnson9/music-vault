@@ -51,12 +51,23 @@ Compatibility** remains available for device/software compatibility and is
 explicitly described as a lossy transcode, not a fidelity improvement. Batch 11
 is complete on the v1.1.0 development line and is not part of public v1.0.0.
 
-## Install the portable release
+## V1.1 development
 
 The approved V1.1 desktop milestone starts with a supported, explicitly bundled
 acquisition stack and truthful stage-specific failure reporting. See
 [acquisition capability and disposable verification](docs/ACQUISITION.md).
 This development work does not update the immutable public v1.0.0 release.
+
+The V1.1 listening workspace adds local global search (`Ctrl+K`), Back/Forward
+navigation (`Alt+Left` / `Alt+Right`), and a visible queue (`Ctrl+Shift+Q`).
+Tracks use a stable-ID, model-backed list with visible-only artwork. Click a
+column header to cycle ascending, descending, then original context order.
+Queue edits support remove, move up/down, clear and one-level Undo; playback
+or a new addition expires Undo. “Add to queue” appends in FIFO order, and the
+original playback context resumes after queued tracks finish. Search and
+navigation do not start synchronization or metadata-provider work.
+
+## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
    [GitHub Releases page](https://github.com/jcjohnson9/music-vault/releases).

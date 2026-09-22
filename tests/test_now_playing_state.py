@@ -5,11 +5,26 @@ import random
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtMultimedia import QMediaPlayer
-from PySide6.QtWidgets import QLabel, QTableWidget, QTableWidgetItem
+from PySide6.QtWidgets import QLabel
 
 from music_vault.app import MusicVaultWindow, NOW_PLAYING_ROLE
 from music_vault.core.playback_state import build_track_row_map, locate_track_row
+from music_vault.ui.track_list import TrackTableView
+
+
+def synthetic_tracks(track_ids):
+    return [{"id": track_id, "title": f"Synthetic {row}"} for row, track_id in enumerate(track_ids)]
+
+
+def row_index(table, row):
+    return table.model().index(row, 0)
+
+
+def row_is_emphasized(table, row):
+    font = row_index(table, row).data(Qt.FontRole)
+    return font is not None and font.weight() >= QFont.Weight.DemiBold
 
 
 class IndicatorHarness:
@@ -23,7 +38,7 @@ class IndicatorHarness:
     update_now_playing_indicator = MusicVaultWindow.update_now_playing_indicator
 
     def __init__(self):
-        self.library_table = QTableWidget(0, 1)
+        self.library_table = TrackTableView()
         self.current_track_id = None
         self.track_row_map = {}
         self._playing_row = None
@@ -32,12 +47,7 @@ class IndicatorHarness:
         self.base_playback_context = None
 
     def populate(self, track_ids):
-        self.library_table.clearContents()
-        self.library_table.setRowCount(len(track_ids))
-        for row, track_id in enumerate(track_ids):
-            item = QTableWidgetItem(f"Synthetic {row}")
-            item.setData(Qt.UserRole, track_id)
-            self.library_table.setItem(row, 0, item)
+        self.library_table.set_tracks(synthetic_tracks(track_ids))
         self.rebuild_track_row_map()
 
 
@@ -52,12 +62,12 @@ def test_direct_now_playing_update_sets_identity_selection_and_treatment(qapp):
     harness = IndicatorHarness()
     harness.populate([10, 20, 30])
     row = harness.update_now_playing_indicator(20)
-    title = harness.library_table.item(1, 0)
+    title = row_index(harness.library_table, 1)
     assert row == 1
     assert harness.current_track_id == 20
-    assert harness.library_table.currentRow() == 1
+    assert harness.library_table.currentIndex().row() == 1
     assert title.data(NOW_PLAYING_ROLE) is True
-    assert title.font().bold()
+    assert row_is_emphasized(harness.library_table, 1)
 
 
 class FakeDB:
@@ -117,7 +127,7 @@ def test_play_track_by_id_routes_direct_play_through_central_indicator(tmp_path,
     harness.populate([4, 7, 9])
     assert harness.play_track_by_id(7, capture_base_context=False)
     assert harness.current_track_id == 7
-    assert harness.library_table.currentRow() == 1
+    assert harness.library_table.currentIndex().row() == 1
     assert harness.player.play_count == 1
 
 
@@ -127,24 +137,27 @@ def test_ordinary_selection_can_differ_from_now_playing(qapp):
     harness.update_now_playing_indicator(1)
     harness.library_table.selectRow(2)
     assert harness.current_track_id == 1
-    assert harness.library_table.currentRow() == 2
-    assert harness.library_table.item(0, 0).data(NOW_PLAYING_ROLE) is True
-    assert harness.library_table.item(2, 0).data(NOW_PLAYING_ROLE) is not True
+    assert harness.library_table.currentIndex().row() == 2
+    assert row_index(harness.library_table, 0).data(NOW_PLAYING_ROLE) is True
+    assert row_index(harness.library_table, 2).data(NOW_PLAYING_ROLE) is not True
 
 
 def test_hidden_or_absent_playing_track_does_not_steal_selection(qapp):
     harness = IndicatorHarness()
     harness.populate([1, 2, 3])
     harness.library_table.selectRow(0)
-    harness.library_table.setRowHidden(1, True)
+    harness.library_table.set_filter("Synthetic 0")
     harness.update_now_playing_indicator(2)
     assert harness.current_track_id == 2
-    assert harness.library_table.currentRow() == 0
-    assert harness.library_table.item(1, 0).data(NOW_PLAYING_ROLE) is True
+    assert harness.library_table.currentIndex().row() == 0
+    assert harness.library_table.current_track_id() == 1
+    assert harness.library_table.row_for_track_id(2) is None
+    assert harness.library_table.track_model.index(1, 0).data(NOW_PLAYING_ROLE) is True
 
     harness.update_now_playing_indicator(99)
     assert harness.current_track_id == 99
-    assert harness.library_table.currentRow() == 0
+    assert harness.library_table.currentIndex().row() == 0
+    assert harness.library_table.current_track_id() == 1
 
 
 def test_hidden_library_page_does_not_change_browsing_selection(qapp):
@@ -159,8 +172,8 @@ def test_hidden_library_page_does_not_change_browsing_selection(qapp):
     harness.library_page = object()
     harness.update_now_playing_indicator(2)
     assert harness.current_track_id == 2
-    assert harness.library_table.currentRow() == 0
-    assert harness.library_table.item(1, 0).font().bold()
+    assert harness.library_table.currentIndex().row() == 0
+    assert row_is_emphasized(harness.library_table, 1)
 
 
 def test_returning_to_containing_view_restores_indicator_without_state_changes(qapp):
@@ -177,24 +190,24 @@ def test_returning_to_containing_view_restores_indicator_without_state_changes(q
     row = harness.apply_now_playing_row_state()
 
     assert row == 1
-    assert harness.library_table.item(1, 0).data(NOW_PLAYING_ROLE) is True
+    assert row_index(harness.library_table, 1).data(NOW_PLAYING_ROLE) is True
     assert harness.current_track_id == 1
     assert harness.manual_queue == queue_before
     assert harness.base_playback_context == context_before
 
 
-def test_stale_row_map_self_heals_after_row_reorder(qapp):
+def test_stale_row_map_does_not_override_model_identity_after_reorder(qapp):
     harness = IndicatorHarness()
     harness.populate([1, 2])
-    first = harness.library_table.takeItem(0, 0)
-    second = harness.library_table.takeItem(1, 0)
-    harness.library_table.setItem(0, 0, second)
-    harness.library_table.setItem(1, 0, first)
+    harness.library_table.set_tracks(synthetic_tracks([2, 1]))
+    assert harness.track_row_map == {1: 0, 2: 1}
 
     row = harness.update_now_playing_indicator(1)
     assert row == 1
-    assert harness.track_row_map == {2: 0, 1: 1}
-    assert harness.library_table.item(1, 0).data(NOW_PLAYING_ROLE) is True
+    assert harness.library_table.current_track_id() == 1
+    assert harness.locate_track_row_in_table(1) == 1
+    assert harness.rebuild_track_row_map() == {2: 0, 1: 1}
+    assert row_index(harness.library_table, 1).data(NOW_PLAYING_ROLE) is True
 
 
 def test_same_size_table_reload_never_selects_an_unrelated_row(qapp):
@@ -203,17 +216,14 @@ def test_same_size_table_reload_never_selects_an_unrelated_row(qapp):
     harness.library_table.selectRow(1)
     selected_track_id = 2
 
-    # Qt keeps row 1 selected when the same row count is reused.
-    harness.library_table.setRowCount(3)
-    for row, track_id in enumerate([10, 20, 30]):
-        item = QTableWidgetItem(f"Replacement {row}")
-        item.setData(Qt.UserRole, track_id)
-        harness.library_table.setItem(row, 0, item)
+    # Reusing a row count must never transfer a selected identity to new data.
+    harness.library_table.set_tracks(synthetic_tracks([10, 20, 30]))
     harness.rebuild_track_row_map()
-    assert harness.library_table.currentRow() == 1
+    assert harness.library_table.current_track_id() is None
+    assert harness.library_table.selected_track_ids() == []
     assert harness.restore_table_selection(selected_track_id) is None
-    assert harness.library_table.currentRow() == -1
-    assert harness.library_table.selectedItems() == []
+    assert harness.library_table.currentIndex().row() == -1
+    assert harness.library_table.selected_track_ids() == []
 
 
 def test_reordered_table_restores_selection_by_track_id(qapp):
@@ -222,22 +232,20 @@ def test_reordered_table_restores_selection_by_track_id(qapp):
     harness.library_table.selectRow(1)
     harness.populate([2, 3, 1])
     assert harness.restore_table_selection(2) == 0
-    assert harness.library_table.currentRow() == 0
+    assert harness.library_table.currentIndex().row() == 0
+    assert harness.library_table.current_track_id() == 2
 
 
 def test_reorder_then_track_change_clears_the_previous_track_treatment(qapp):
     harness = IndicatorHarness()
     harness.populate([1, 2])
     harness.update_now_playing_indicator(1)
-    first = harness.library_table.takeItem(0, 0)
-    second = harness.library_table.takeItem(1, 0)
-    harness.library_table.setItem(0, 0, second)
-    harness.library_table.setItem(1, 0, first)
+    harness.library_table.set_tracks(synthetic_tracks([2, 1]))
 
     harness.update_now_playing_indicator(2)
-    assert harness.library_table.item(0, 0).data(NOW_PLAYING_ROLE) is True
-    assert harness.library_table.item(1, 0).data(NOW_PLAYING_ROLE) is False
-    assert not harness.library_table.item(1, 0).font().bold()
+    assert row_index(harness.library_table, 0).data(NOW_PLAYING_ROLE) is True
+    assert row_index(harness.library_table, 1).data(NOW_PLAYING_ROLE) is False
+    assert not row_is_emphasized(harness.library_table, 1)
 
 
 def test_moving_now_playing_clears_previous_treatment(qapp):
@@ -245,12 +253,13 @@ def test_moving_now_playing_clears_previous_treatment(qapp):
     harness.populate([1, 2])
     harness.update_now_playing_indicator(1)
     harness.update_now_playing_indicator(2)
-    assert harness.library_table.item(0, 0).data(NOW_PLAYING_ROLE) is False
-    assert not harness.library_table.item(0, 0).font().bold()
-    assert harness.library_table.item(1, 0).data(NOW_PLAYING_ROLE) is True
+    assert row_index(harness.library_table, 0).data(NOW_PLAYING_ROLE) is False
+    assert not row_is_emphasized(harness.library_table, 0)
+    assert row_index(harness.library_table, 1).data(NOW_PLAYING_ROLE) is True
 
 
 class FlowHarness:
+    _manual_queue_editor = MusicVaultWindow._manual_queue_editor
     play_next = MusicVaultWindow.play_next
     play_next_from_manual_queue = MusicVaultWindow.play_next_from_manual_queue
     play_next_from_base_context = MusicVaultWindow.play_next_from_base_context
@@ -313,14 +322,11 @@ class VisibleFlowHarness(FlowHarness):
 
     def __init__(self):
         super().__init__()
-        self.library_table = QTableWidget(4, 1)
+        self.library_table = TrackTableView()
         self.track_row_map = {}
         self._playing_row = None
         self._styled_now_playing_track_id = None
-        for row, track_id in enumerate([1, 2, 8, 9]):
-            item = QTableWidgetItem(f"Synthetic {row}")
-            item.setData(Qt.UserRole, track_id)
-            self.library_table.setItem(row, 0, item)
+        self.library_table.set_tracks(synthetic_tracks([1, 2, 8, 9]))
         self.rebuild_track_row_map()
         self.update_now_playing_indicator(1)
 
@@ -348,8 +354,8 @@ def test_auto_selects_the_new_visible_playing_row(qapp):
     flow = VisibleFlowHarness()
     flow.on_media_status_changed(QMediaPlayer.EndOfMedia)
     assert flow.current_track_id == 2
-    assert flow.library_table.currentRow() == 1
-    assert flow.library_table.item(1, 0).data(NOW_PLAYING_ROLE) is True
+    assert flow.library_table.currentIndex().row() == 1
+    assert row_index(flow.library_table, 1).data(NOW_PLAYING_ROLE) is True
 
 
 def test_shuffle_marks_actual_chosen_track(monkeypatch):
@@ -383,17 +389,46 @@ def test_queue_completion_resumes_next_base_track():
     assert flow.base_playback_context["current_track_id"] == 2
 
 
+def test_transport_consumption_expires_edit_undo_without_replaying_duplicate():
+    flow = FlowHarness()
+    flow.manual_queue[:] = [9, 8, 9]
+    authoritative_queue = flow.manual_queue
+    editor = flow._manual_queue_editor()
+    before = editor.snapshot()
+    assert editor.remove(before.entries[1].token, before.revision)
+    edited = editor.snapshot()
+    assert edited.can_undo
+    assert flow.manual_queue == [9, 9]
+
+    flow.play_next()
+
+    consumed = editor.snapshot()
+    assert flow._manual_queue_editor() is editor
+    assert flow.manual_queue is authoritative_queue
+    assert flow.manual_queue == [9]
+    assert consumed.entries == (edited.entries[1],)
+    assert not consumed.can_undo
+    assert not editor.undo(edited.revision)
+    assert not editor.undo(consumed.revision)
+    assert flow.base_playback_context["current_track_id"] == 1
+    flow.play_next()
+    flow.play_next()
+    assert flow.started == [9, 9, 2]
+    assert flow.manual_queue == []
+    assert flow.base_playback_context["current_track_id"] == 2
+
+
 def test_visible_queue_track_and_base_resume_each_move_active_row(qapp):
     flow = VisibleFlowHarness()
     flow.manual_queue = [9]
     flow.play_next()
     assert flow.current_track_id == 9
-    assert flow.library_table.currentRow() == 3
+    assert flow.library_table.currentIndex().row() == 3
     assert flow.base_playback_context["current_track_id"] == 1
 
     flow.play_next()
     assert flow.current_track_id == 2
-    assert flow.library_table.currentRow() == 1
+    assert flow.library_table.currentIndex().row() == 1
     assert flow.base_playback_context["current_track_id"] == 2
 
 
@@ -439,7 +474,7 @@ def test_pause_stop_and_selection_only_do_not_change_identity(qapp):
     harness.library_table.selectRow(1)
     # No playback-start method ran, so pause/stop/browsing retain identity.
     assert harness.current_track_id == 1
-    assert harness.library_table.item(0, 0).data(NOW_PLAYING_ROLE) is True
+    assert row_index(harness.library_table, 0).data(NOW_PLAYING_ROLE) is True
 
 
 def test_queue_right_click_and_add_to_playlist_paths_do_not_set_playing_state():

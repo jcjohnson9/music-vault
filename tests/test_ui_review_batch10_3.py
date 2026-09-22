@@ -81,6 +81,46 @@ def test_review_uses_production_surfaces_instead_of_bespoke_mock_builders():
     assert "def _shell(" not in tool_text
 
 
+def test_review_text_collector_reads_display_models_without_hidden_rows_or_columns(qapp):
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+    from music_vault.ui.track_list import TrackTableView
+
+    tool = _tool()
+    surface = QWidget()
+    layout = QVBoxLayout(surface)
+    tracks = TrackTableView()
+    tracks.set_tracks([
+        {"id": 1, "title": "Visible synthetic title", "artist": "Visible performer"},
+        {"id": 2, "title": "Filtered synthetic title", "artist": "Filtered performer"},
+    ])
+    tracks.set_filter("Visible")
+    layout.addWidget(tracks)
+    legacy = QTableWidget(2, 2)
+    legacy.setHorizontalHeaderLabels(["Visible header", "Hidden header"])
+    legacy.setItem(0, 0, QTableWidgetItem("Visible dialog value"))
+    legacy.setItem(0, 1, QTableWidgetItem("Hidden column value"))
+    legacy.setItem(1, 0, QTableWidgetItem("Hidden row value"))
+    legacy.setColumnHidden(1, True)
+    legacy.setRowHidden(1, True)
+    layout.addWidget(legacy)
+    surface.show()
+    try:
+        qapp.processEvents()
+        texts = tool._widget_texts(surface)
+        assert "Visible synthetic title" in texts
+        assert "Visible performer" in texts
+        assert "Title" in texts
+        assert "Visible header" in texts
+        assert "Visible dialog value" in texts
+        assert not any("Filtered" in text or "Hidden" in text for text in texts)
+        tracks.hide()
+        assert "Visible synthetic title" not in tool._widget_texts(surface)
+    finally:
+        surface.close()
+        surface.deleteLater()
+        qapp.processEvents()
+
+
 def test_offscreen_review_renders_production_window_and_dialog_then_cleans_temp():
     tool = _tool()
     temp = Path(tempfile.gettempdir())

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace, MethodType
 
 from music_vault.core import app_status
 from music_vault.core.db import MusicVaultDB
@@ -53,12 +54,27 @@ def test_playback_error_message_hides_paths_and_control_characters():
     assert "C:\\" not in message
 
 
-def test_queue_fifo_and_base_context_invariants_remain_in_source():
-    source = Path("music_vault/app.py").read_text(encoding="utf-8")
-    assert "self.manual_queue.append(track_id)" in source
-    assert "queued_track_id = self.manual_queue.pop(0)" in source
-    assert "capture_base_context=False" in source
-    assert 'self.base_playback_context["current_track_id"] = track_id' in source
+def test_queue_fifo_and_base_context_invariants_execute_through_host_editor():
+    context = {"track_ids": [10, 20], "current_track_id": 10}
+    played = []
+    host = SimpleNamespace(
+        manual_queue=[], base_playback_context=context,
+        db=SimpleNamespace(get_track=lambda track_id: {"id": track_id, "title": "Synthetic", "artist": "Example"}),
+        update_queue_label=lambda: None, write_app_status=lambda: None,
+        statusBar=lambda: SimpleNamespace(showMessage=lambda *_: None),
+        play_track_by_id=lambda track_id, **kwargs: played.append((track_id, kwargs)) or True,
+    )
+    host._manual_queue_editor = MethodType(MusicVaultWindow._manual_queue_editor, host)
+    queue = host.manual_queue
+    for track_id in (30, 40, 30):
+        MusicVaultWindow.queue_track_by_id(host, track_id)
+    assert host.manual_queue is queue and queue == [30, 40, 30]
+    for _ in range(3):
+        assert MusicVaultWindow.play_next_from_manual_queue(host)
+    assert [track_id for track_id, _ in played] == [30, 40, 30]
+    assert all(options == {"capture_base_context": False, "show_missing_warning": False} for _, options in played)
+    assert queue == [] and host.base_playback_context is context
+    assert context == {"track_ids": [10, 20], "current_track_id": 10}
 
 
 def test_acceptance_mode_skips_api_key_file_access(monkeypatch):

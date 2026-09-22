@@ -21,7 +21,6 @@ from PySide6.QtCore import (
     QObject,
 )
 from PySide6.QtGui import (
-    QBrush,
     QColor,
     QPixmap,
     QDesktopServices,
@@ -50,8 +49,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
     QLabel,
-    QTableWidget,
-    QTableWidgetItem,
     QAbstractItemView,
     QMessageBox,
     QInputDialog,
@@ -75,6 +72,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
     QSpinBox,
+    QSplitter,
 )
 
 from music_vault.version import DISPLAY_VERSION, RELEASE_CHANNEL
@@ -122,12 +120,15 @@ from music_vault.core.library_browser import (
     query_artist_track_sections,
 )
 from music_vault.core.playback_errors import playback_error_message
+from music_vault.core.navigation import Route
+from music_vault.core.queue_editor import ManualQueueEditor
+from music_vault.ui.track_list import TrackTableView
+from music_vault.ui.listening_controller import ListeningController
 from music_vault.core.runtime_policy import RuntimePolicy
 from music_vault.core.playback_state import (
     DEFAULT_VOLUME_PERCENT,
     build_track_row_map,
     config_for_persistence,
-    locate_track_row,
     normalize_volume_percent,
 )
 from music_vault.core.paths import (
@@ -557,6 +558,7 @@ class MusicVaultWindow(QMainWindow):
             self.global_play_pause_event_filter
         )
 
+        self.listening = ListeningController(self)
         self.build_ui()
         self.update_playback_mode_buttons()
         self.load_library()
@@ -1027,7 +1029,14 @@ class MusicVaultWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(12)
 
-        main_layout.addWidget(self.pages, 1)
+        main_layout.addWidget(self.listening.navigation_bar())
+        self.listening_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.listening_splitter.setChildrenCollapsible(False)
+        self.listening_splitter.addWidget(self.pages)
+        self.listening_splitter.addWidget(self.listening.queue_panel())
+        self.listening_splitter.setStretchFactor(0, 1)
+        self.listening_splitter.setStretchFactor(1, 0)
+        main_layout.addWidget(self.listening_splitter, 1)
         self.player_bar = self.build_player_bar()
         main_layout.addWidget(self.player_bar)
 
@@ -1035,6 +1044,8 @@ class MusicVaultWindow(QMainWindow):
         root_layout.addWidget(main_shell, 1)
 
         self.setCentralWidget(root)
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().setFixedHeight(24)
         self.apply_styles()
         self.update_sidebar_navigation_state()
 
@@ -1067,7 +1078,7 @@ class MusicVaultWindow(QMainWindow):
         brand_row.addWidget(logo)
         brand_row.addLayout(brand_col, 1)
 
-        self.library_btn = self.sidebar_button("Library", 0, "library")
+        self.library_btn = self.sidebar_button("Tracks", 0, "library")
         self.sync_btn_nav = self.sidebar_button("Sync Center", 1, "sync")
         self.settings_btn = self.sidebar_button("Settings", 2, "settings")
         self.sidebar_button_group = QButtonGroup(self)
@@ -1088,19 +1099,30 @@ class MusicVaultWindow(QMainWindow):
         self.playlists.setObjectName("PlaylistList")
         self.playlists.setTextElideMode(Qt.ElideRight)
         self.playlists.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.playlists.setAccessibleName("Library views and playlists")
+        self.playlists.setAccessibleName("Playlists")
         self.playlists.itemClicked.connect(self.on_playlist_clicked)
 
         layout.addLayout(brand_row)
         layout.addSpacing(18)
         layout.addWidget(self.library_btn)
-        layout.addWidget(self.sync_btn_nav)
-        layout.addWidget(self.settings_btn)
-        layout.addSpacing(18)
+        self.library_view_buttons = {"library": self.library_btn}
+        for kind, label, icon in (
+            ("albums", "Albums", "albums"), ("artists", "Artists", "artists"),
+            ("recent", "Recently Added", "recently-added"),
+            ("downloaded", "Downloaded", "downloaded"),
+        ):
+            button = self.make_action_button(label, icon, lambda checked=False, k=kind, title=label: self.listening.navigate(Route(k, label=title)), object_name="SidebarButton")
+            button.setCheckable(True)
+            self.sidebar_button_group.addButton(button)
+            self.library_view_buttons[kind] = button
+            layout.addWidget(button)
+        layout.addSpacing(10)
         layout.addWidget(divider)
         layout.addSpacing(10)
         layout.addWidget(section)
         layout.addWidget(self.playlists, 1)
+        layout.addWidget(self.sync_btn_nav)
+        layout.addWidget(self.settings_btn)
 
         return sidebar
 
@@ -1113,18 +1135,25 @@ class MusicVaultWindow(QMainWindow):
         btn.setIconSize(QSize(20, 20))
         btn.setToolTip(text)
         btn.setAccessibleName(text)
-        btn.clicked.connect(lambda: self.pages.setCurrentIndex(page_index))
+        kind = ("library", "sync", "settings")[page_index]
+        btn.clicked.connect(lambda: self.listening.navigate(Route(kind, label=("Library", "Sync Center", "Settings")[page_index])))
         return btn
 
     def update_sidebar_navigation_state(self, _index: int | None = None) -> None:
         if not hasattr(self, "pages"):
             return
         current = self.pages.currentIndex()
-        for index, button in enumerate(
-            (self.library_btn, self.sync_btn_nav, self.settings_btn)
-        ):
-            button.setChecked(index == current)
+        group = self.sidebar_button_group
+        group.setExclusive(False)
+        for kind, button in {**self.library_view_buttons, "sync": self.sync_btn_nav, "settings": self.settings_btn}.items():
+            active = (current == 1 and kind == "sync") or (current == 2 and kind == "settings") or (current == 0 and kind == self.current_view_kind)
+            button.setChecked(active)
             repolish(button)
+        group.setExclusive(True)
+        for row in range(self.playlists.count()):
+            item = self.playlists.item(row)
+            data = item.data(Qt.UserRole) or {}
+            item.setSelected(current == 0 and self.current_view_kind == "custom" and data.get("id") == self.current_playlist_id)
 
     def make_action_button(
         self,
@@ -1172,8 +1201,8 @@ class MusicVaultWindow(QMainWindow):
         hero = QFrame()
         hero.setObjectName("HeroHeader")
         hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(24, 22, 24, 22)
-        hero_layout.setSpacing(16)
+        hero_layout.setContentsMargins(20, 16, 20, 16)
+        hero_layout.setSpacing(10)
 
         title_row = QHBoxLayout()
         title_col = QVBoxLayout()
@@ -1214,7 +1243,8 @@ class MusicVaultWindow(QMainWindow):
             "Add to Playlist", "playlists", self.add_selected_to_playlist
         )
         self.queue_next_btn = self.make_action_button(
-            "Queue Next", "queue-next", self.queue_selected_next
+            "Add to queue", "queue-next", self.queue_selected_next,
+            tooltip="Append this track after anything already queued (FIFO)",
         )
         self.library_overflow = OverflowActionButton(self)
         self.library_overflow.setToolTip("More library actions")
@@ -1240,12 +1270,20 @@ class MusicVaultWindow(QMainWindow):
             "Refresh Art", "refresh", self.refresh_artwork
         )
 
-        action_row.addWidget(self.import_btn)
-        action_row.addWidget(self.create_playlist_btn)
-        action_row.addWidget(self.add_playlist_btn)
+        self.context_play_btn = self.make_action_button("Play", "play", self.play_current_view, object_name="PrimaryButton")
+        self.context_shuffle_btn = self.make_action_button("Shuffle", "shuffle", self.shuffle_current_view)
+        action_row.addWidget(self.context_play_btn)
+        action_row.addWidget(self.context_shuffle_btn)
         action_row.addWidget(self.queue_next_btn)
         action_row.addWidget(self.library_overflow)
         action_row.addStretch(1)
+        # Keep administration available without making it the listening header.
+        for button in (self.import_btn, self.create_playlist_btn, self.add_playlist_btn):
+            button.setParent(page)
+            button.hide()
+        self.library_overflow.add_action("Import Folder", "import", self.import_music_folder)
+        self.library_overflow.add_action("New Playlist", "add", self.create_playlist)
+        self.library_overflow.add_action("Add to Playlist", "playlists", self.add_selected_to_playlist)
 
         self.search_box = SearchField(
             placeholder="Search songs, artists, albums...",
@@ -1259,13 +1297,12 @@ class MusicVaultWindow(QMainWindow):
         hero_layout.addLayout(action_row)
         hero_layout.addWidget(self.search_box)
 
-        stats_row = QHBoxLayout()
         self.track_count_card = self.stat_card("Tracks", "0")
         self.download_folder_card = self.stat_card("Downloads", "Ready")
         self.api_status_card = self.stat_card("API", "Checking...")
-        stats_row.addWidget(self.track_count_card)
-        stats_row.addWidget(self.download_folder_card)
-        stats_row.addWidget(self.api_status_card)
+        for card in (self.track_count_card, self.download_folder_card, self.api_status_card):
+            card.setParent(page)
+            card.hide()
 
         table_card = QFrame()
         table_card.setObjectName("Card")
@@ -1275,6 +1312,7 @@ class MusicVaultWindow(QMainWindow):
 
         table_header = QHBoxLayout()
         table_title = QLabel("Songs")
+        self.track_count_label = table_title
         table_title.setObjectName("CardTitle")
         table_hint = QLabel("Double-click a track to play")
         table_hint.setObjectName("MutedLabel")
@@ -1291,15 +1329,12 @@ class MusicVaultWindow(QMainWindow):
         table_header.addStretch(1)
         table_header.addWidget(table_hint)
 
-        self.library_table = QTableWidget(0, 5)
+        self.library_table = TrackTableView(thumbnail_cache=self.thumbnail_cache)
         self.library_table.setObjectName("LibraryTable")
-        self.library_table.setHorizontalHeaderLabels(["Title", "Artist", "Album", "Year", "Path"])
-        self.library_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.library_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.library_table.doubleClicked.connect(self.play_selected)
         self.library_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.library_table.customContextMenuRequested.connect(self.open_song_context_menu)
-        self.library_table.itemSelectionChanged.connect(self.update_metadata_action_state)
+        self.library_table.selected_tracks_changed.connect(self.update_metadata_action_state)
         self.library_table.verticalHeader().setVisible(False)
         self.library_table.setAlternatingRowColors(False)
         self.library_table.setShowGrid(False)
@@ -1313,7 +1348,6 @@ class MusicVaultWindow(QMainWindow):
         self.library_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.library_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
         self.library_table.horizontalHeader().resizeSection(3, 68)
-        self.library_table.setColumnHidden(4, True)
 
         self.library_empty_state = EmptyState(
             "library",
@@ -1381,7 +1415,6 @@ class MusicVaultWindow(QMainWindow):
         self.library_content_stack.addWidget(browser_page)
 
         layout.addWidget(hero)
-        layout.addLayout(stats_row)
         layout.addWidget(self.library_content_stack, 1)
 
         return page
@@ -2461,31 +2494,14 @@ class MusicVaultWindow(QMainWindow):
 
 
     def rebuild_track_row_map(self) -> dict[int, int]:
-        track_ids = []
-        for row in range(self.library_table.rowCount()):
-            item = self.library_table.item(row, 0)
-            track_ids.append(item.data(Qt.UserRole) if item is not None else None)
-
-        self.track_row_map = build_track_row_map(track_ids)
+        self.track_row_map = build_track_row_map(self.library_table.visible_track_ids())
         return dict(self.track_row_map)
 
     def locate_visible_track_row(self, track_id: int | None) -> int | None:
-        row = self.locate_track_row_in_table(track_id)
-        if row is None or self.library_table.isRowHidden(row):
-            return None
-        return row
+        return self.library_table.row_for_track_id(track_id)
 
     def locate_track_row_in_table(self, track_id: int | None) -> int | None:
-        row = locate_track_row(track_id, self.track_row_map)
-        if row is not None and 0 <= row < self.library_table.rowCount():
-            item = self.library_table.item(row, 0)
-            if item is not None and item.data(Qt.UserRole) == track_id:
-                return row
-
-        if track_id is None:
-            return None
-        self.rebuild_track_row_map()
-        return locate_track_row(track_id, self.track_row_map)
+        return self.library_table.row_for_track_id(track_id)
 
     def library_table_is_currently_visible(self) -> bool:
         if hasattr(self, "pages") and hasattr(self, "library_page"):
@@ -2497,31 +2513,15 @@ class MusicVaultWindow(QMainWindow):
         return True
 
     def restore_table_selection(self, track_id: int | None) -> int | None:
-        self.library_table.clearSelection()
-        self.library_table.setCurrentCell(-1, -1)
-        if track_id is None:
-            return None
-
-        row = self.locate_track_row_in_table(track_id)
-        if row is None or self.library_table.isRowHidden(row):
-            return None
-        self.library_table.selectRow(row)
-        return row
+        self.library_table.restore_selection(
+            () if track_id is None else (track_id,), current_track_id=track_id
+        )
+        return self.library_table.row_for_track_id(track_id)
 
     def set_playing_row_treatment(self, row: int, playing: bool) -> None:
-        if row < 0 or row >= self.library_table.rowCount():
-            return
-        title_item = self.library_table.item(row, 0)
-        if title_item is None:
-            return
-
-        title_item.setData(NOW_PLAYING_ROLE, playing)
-        font = title_item.font()
-        font.setBold(playing)
-        title_item.setFont(font)
-        title_item.setForeground(
-            QBrush(QColor(COLORS["now_playing"])) if playing else QBrush()
-        )
+        track_id = self.library_table.track_id_at(row)
+        if track_id is not None:
+            self.library_table.set_now_playing(track_id if playing else None)
 
     def apply_now_playing_row_state(
         self,
@@ -2529,43 +2529,16 @@ class MusicVaultWindow(QMainWindow):
         select_if_visible: bool = False,
         scroll_if_visible: bool = False,
     ) -> int | None:
-        row = self.locate_track_row_in_table(self.current_track_id)
-
-        if (
-            self._styled_now_playing_track_id is not None
-            and self._styled_now_playing_track_id != self.current_track_id
-        ):
-            previous_row = locate_track_row(
-                self._styled_now_playing_track_id,
-                self.track_row_map,
-            )
-            if previous_row is not None:
-                self.set_playing_row_treatment(previous_row, False)
-
-        if row is None:
-            self._playing_row = None
-            self._styled_now_playing_track_id = None
-            return None
-
-        self.set_playing_row_treatment(row, True)
+        self.library_table.set_now_playing(self.current_track_id)
+        row = self.library_table.row_for_track_id(self.current_track_id)
         self._playing_row = row
         self._styled_now_playing_track_id = self.current_track_id
-
-        if (
-            self.library_table.isRowHidden(row)
-            or not self.library_table_is_currently_visible()
-        ):
+        if row is None or not self.library_table_is_currently_visible():
             return row
-
         if select_if_visible:
-            self.library_table.selectRow(row)
+            self.library_table.select_track(self.current_track_id)
         if scroll_if_visible:
-            item = self.library_table.item(row, 0)
-            if item is not None:
-                self.library_table.scrollToItem(
-                    item,
-                    QAbstractItemView.ScrollHint.PositionAtCenter,
-                )
+            self.library_table.scroll_to_track(self.current_track_id)
         return row
 
     def update_now_playing_indicator(
@@ -2594,40 +2567,13 @@ class MusicVaultWindow(QMainWindow):
 
         selected_track_id = self.selected_track_id()
 
-        self.library_table.setRowCount(len(tracks))
-        self.library_table.setIconSize(QSize(42, 42))
+        self.library_table.set_tracks(tracks)
         self.track_row_map = {}
         self._playing_row = None
         self._styled_now_playing_track_id = None
 
-        for row_idx, track in enumerate(tracks):
-            values = [
-                track["title"] or Path(track["path"]).stem,
-                track["artist"] or "",
-                track["album"] or "",
-                track["year"] or "",
-                track["path"],
-            ]
-
-            for col_idx, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setData(Qt.UserRole, track["id"])
-
-                if col_idx == 0:
-                    item.setToolTip(str(values[0]))
-
-                    cover_path = track["cover_path"] if "cover_path" in track.keys() else None
-
-                    if cover_path and Path(cover_path).exists():
-                        item.setIcon(QIcon(str(cover_path)))
-
-                self.library_table.setItem(row_idx, col_idx, item)
-
-            self.library_table.setRowHeight(row_idx, 54)
-
-        self.rebuild_track_row_map()
-
         self.track_count_card.value_label.setText(str(len(tracks)))
+        self.track_count_label.setText(f"Songs · {len(tracks)}")
 
         if title and hasattr(self, "page_title"):
             self.page_title.setText(title)
@@ -2711,11 +2657,6 @@ class MusicVaultWindow(QMainWindow):
             })
             self.playlists.addItem(item)
 
-        add_sidebar_item("Library", "library")
-        add_sidebar_item("Recently Added", "recent")
-        add_sidebar_item("Downloaded", "downloaded")
-        add_sidebar_item("Albums", "albums")
-        add_sidebar_item("Artists", "artists")
         add_sidebar_item("+ New Playlist", "new")
 
         for playlist in self.db.list_playlists():
@@ -2729,6 +2670,7 @@ class MusicVaultWindow(QMainWindow):
                     else None
                 ),
             )
+        self.update_sidebar_navigation_state()
 
 
     def rounded_cover_pixmap(
@@ -2959,9 +2901,12 @@ class MusicVaultWindow(QMainWindow):
         else:
             self.browser_view.set_view_state(MediaGridState.CONTENT)
         self.browser_view.schedule_visible_items()
+        self.listening.restore_browser_view(kind)
 
     def show_album_browser(self) -> None:
         self.current_view_kind = "albums"
+        self.current_playlist_id = None
+        self.current_playlist_name = "Albums"
         self.library_content_stack.setCurrentIndex(1)
         self.page_title.setText("Albums")
         self.page_subtitle.setText("Browse your collection by album.")
@@ -2973,6 +2918,8 @@ class MusicVaultWindow(QMainWindow):
 
     def show_artist_browser(self) -> None:
         self.current_view_kind = "artists"
+        self.current_playlist_id = None
+        self.current_playlist_name = "Artists"
         self.library_content_stack.setCurrentIndex(1)
         self.page_title.setText("Artists")
         self.page_subtitle.setText("Browse your collection by artist.")
@@ -3395,51 +3342,13 @@ class MusicVaultWindow(QMainWindow):
         summary = self._browser_summary_maps["albums"].get(str(browser_key))
         if not isinstance(summary, AlbumSummary):
             return
-        self._remember_browser_scroll()
-        rows = query_album_tracks(self.db.conn, summary.key)
-        self.current_view_kind = "album_tracks"
-        self.current_playlist_name = summary.album_title
-        self._detail_browser_context = ("album_tracks", summary.key, summary.album_title)
-        self.load_library(rows, summary.album_title, "Album view")
+        self.listening.navigate(Route("album_tracks", entity_key=summary.key, label=summary.album_title))
 
     def open_artist(self, browser_key: str) -> None:
         summary = self._browser_summary_maps["artists"].get(str(browser_key))
         if not isinstance(summary, ArtistSummary):
             return
-        self._remember_browser_scroll()
-        sections = query_artist_track_sections(self.db.conn, summary.key)
-        self.current_view_kind = "artist_tracks"
-        self.current_playlist_name = summary.display_name
-        self._detail_browser_context = ("artist_tracks", summary.key, summary.display_name)
-        selector = self.artist_section_selector
-        previous = selector.blockSignals(True)
-        try:
-            selector.clear()
-            selector.addItem("Tracks", "tracks")
-            if sections.featured_on:
-                selector.addItem("Featured On", "featured_on")
-            if sections.collaborations:
-                selector.addItem("Collaborations", "collaborations")
-            if sections.group_appearances:
-                selector.addItem("Group Appearances", "group_appearances")
-            default_index = 0
-            if not sections.tracks and sections.featured_on:
-                default_index = selector.findData("featured_on")
-            elif not sections.tracks and sections.collaborations:
-                default_index = selector.findData("collaborations")
-            elif not sections.tracks and sections.group_appearances:
-                default_index = selector.findData("group_appearances")
-            selector.setCurrentIndex(max(0, default_index))
-        finally:
-            selector.blockSignals(previous)
-        selector.setVisible(selector.count() > 1)
-        section = str(selector.currentData() or "tracks")
-        rows = getattr(sections, section, sections.tracks)
-        self.load_library(
-            rows,
-            summary.display_name,
-            f"Artist view • {selector.currentText() or 'Tracks'}",
-        )
+        self.listening.navigate(Route("artist_tracks", entity_key=summary.key, label=summary.display_name))
 
     def on_artist_section_changed(self, _index: int) -> None:
         if self.current_view_kind != "artist_tracks":
@@ -3448,11 +3357,9 @@ class MusicVaultWindow(QMainWindow):
         if not context or context[0] != "artist_tracks":
             return
         _kind, key, label = context
-        sections = query_artist_track_sections(self.db.conn, key)
         section = str(self.artist_section_selector.currentData() or "tracks")
-        rows = getattr(sections, section, sections.tracks)
-        section_label = self.artist_section_selector.currentText() or "Tracks"
-        self.load_library(rows, label, f"Artist view • {section_label}")
+        if not self.listening.restoring:
+            self.listening.navigate(Route("artist_tracks", entity_key=key, section=section, label=label))
 
     def refresh_artwork(self) -> None:
         updated = refresh_covers_for_library(self.db)
@@ -3471,6 +3378,11 @@ class MusicVaultWindow(QMainWindow):
 
 
     def refresh_current_view(self) -> None:
+        if self.current_view_kind == "search":
+            route = self.listening.content_route
+            rows = [track for track_id in (route.entity_key or ()) if (track := self.db.get_track(track_id)) is not None]
+            self.load_library(rows, "Search results", "Playback context from global search")
+            return
         if self.current_view_kind in {"album_tracks", "artist_tracks"}:
             context = self._detail_browser_context
             if context and context[0] == self.current_view_kind:
@@ -3545,22 +3457,7 @@ class MusicVaultWindow(QMainWindow):
             self.create_playlist()
             return
 
-        self.current_view_kind = kind or "library"
-        self.current_playlist_id = playlist_id
-        self.current_playlist_name = name
-        self._detail_browser_context = None
-
-        self.pages.setCurrentIndex(0)
-
-        if kind == "albums":
-            self.show_album_browser()
-            return
-
-        if kind == "artists":
-            self.show_artist_browser()
-            return
-
-        self.refresh_current_view()
+        self.listening.navigate(Route(kind or "library", playlist_id=playlist_id if kind == "custom" else None, label=name))
 
     def create_playlist(self) -> None:
         name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
@@ -3580,16 +3477,19 @@ class MusicVaultWindow(QMainWindow):
             return
 
         self.load_playlists()
-        self.current_view_kind = "custom"
-        self.current_playlist_id = playlist_id
-        self.current_playlist_name = name
-        self.refresh_current_view()
+        self.listening.navigate(Route("custom", playlist_id, label=name))
 
     def add_selected_to_playlist(self) -> None:
         track_id = self.selected_track_id()
 
         if track_id is None:
             QMessageBox.information(self, "Select a track", "Select a song first.")
+            return
+
+        self.add_track_to_playlist_by_id(track_id)
+
+    def add_track_to_playlist_by_id(self, track_id: int) -> None:
+        if self.db.get_track(track_id) is None:
             return
 
         playlists = self.db.list_playlists()
@@ -4015,25 +3915,10 @@ class MusicVaultWindow(QMainWindow):
         }
 
     def selected_track_id(self) -> int | None:
-        row = self.library_table.currentRow()
-
-        if row < 0:
-            return None
-
-        item = self.library_table.item(row, 0)
-
-        return int(item.data(Qt.UserRole)) if item else None
+        return self.library_table.current_track_id()
 
     def selected_track_ids(self) -> list[int]:
-        selection = self.library_table.selectionModel()
-        if selection is None:
-            return []
-        track_ids: list[int] = []
-        for index in selection.selectedRows(0):
-            item = self.library_table.item(index.row(), 0)
-            if item is not None:
-                track_ids.append(int(item.data(Qt.UserRole)))
-        return list(dict.fromkeys(track_ids))
+        return self.library_table.selected_track_ids()
 
     def update_metadata_action_state(self) -> None:
         action = getattr(self, "edit_metadata_action", None)
@@ -4138,16 +4023,26 @@ class MusicVaultWindow(QMainWindow):
 
         self.play_track_by_id(track_id)
 
+    def play_current_view(self) -> None:
+        track_id = self.selected_track_id()
+        if self.current_view_kind in {"albums", "artists"}:
+            self.listening.navigate(Route())
+            track_id = None
+        track_ids = self.visible_track_ids()
+        if track_ids:
+            self.play_track_by_id(track_id if track_id in track_ids else track_ids[0])
+
+    def shuffle_current_view(self) -> None:
+        if self.current_view_kind in {"albums", "artists"}:
+            self.listening.navigate(Route())
+        if self.visible_track_ids():
+            self.shuffle_enabled = True
+            self.autoplay_enabled = False
+            self.update_playback_mode_buttons()
+            self.play_random_visible()
+
     def visible_track_ids(self) -> list[int]:
-        track_ids = []
-
-        for row in self.visible_track_rows():
-            item = self.library_table.item(row, 0)
-
-            if item is not None:
-                track_ids.append(int(item.data(Qt.UserRole)))
-
-        return track_ids
+        return self.library_table.visible_track_ids()
 
     def capture_base_playback_context(self, track_id: int) -> None:
         track_ids = self.visible_track_ids()
@@ -4162,6 +4057,8 @@ class MusicVaultWindow(QMainWindow):
             "track_ids": track_ids,
             "current_track_id": track_id,
         }
+        if hasattr(self, "listening"):
+            self.base_playback_context["route"] = self.listening.content_route
 
     def base_track_ids(self) -> list[int]:
         if self.base_playback_context:
@@ -4218,6 +4115,8 @@ class MusicVaultWindow(QMainWindow):
         if party_window is not None and getattr(self, "party_mode_active", False):
             party_window.refresh_from_host(force=True)
         self.write_app_status()
+        if hasattr(self, "listening"):
+            self.listening.refresh_queue()
         return True
 
     def set_cover_art(self, cover_path: str | None) -> None:
@@ -4278,7 +4177,7 @@ class MusicVaultWindow(QMainWindow):
 
     def play_next_from_manual_queue(self) -> bool:
         while self.manual_queue:
-            queued_track_id = self.manual_queue.pop(0)
+            queued_track_id = self._manual_queue_editor().pop_next()
             self.update_queue_label()
             self.write_app_status()
 
@@ -4330,6 +4229,9 @@ class MusicVaultWindow(QMainWindow):
             self.capture_base_playback_context(track_id)
         else:
             self.base_playback_context["current_track_id"] = track_id
+
+        if hasattr(self, "listening"):
+            self.listening.refresh_queue()
 
         return True
 
@@ -4387,6 +4289,15 @@ class MusicVaultWindow(QMainWindow):
         party_window = getattr(self, "party_mode_window", None)
         if party_window is not None and getattr(self, "party_mode_active", False):
             party_window.refresh_from_host()
+        if hasattr(self, "listening"):
+            self.listening.refresh_queue()
+
+    def _manual_queue_editor(self) -> ManualQueueEditor:
+        editor = getattr(self, "_queue_editor", None)
+        if editor is None:
+            editor = ManualQueueEditor(lambda: self.manual_queue)
+            self._queue_editor = editor
+        return editor
 
     def queue_selected_next(self) -> None:
         track_id = self.selected_track_id()
@@ -4395,12 +4306,17 @@ class MusicVaultWindow(QMainWindow):
             QMessageBox.information(self, "Select a track", "Select a song first.")
             return
 
-        # Manual queue order is FIFO: first queued, first played.
-        self.manual_queue.append(track_id)
+        self.queue_track_by_id(track_id)
+
+    def queue_track_by_id(self, track_id: int) -> None:
+        track = self.db.get_track(track_id)
+        if track is None:
+            return
+        # The editor mutates the same authoritative list, preserving FIFO.
+        self._manual_queue_editor().append(track_id)
         self.update_queue_label()
         self.write_app_status()
 
-        track = self.db.get_track(track_id)
         title = "Selected song"
         artist = ""
 
@@ -4408,7 +4324,7 @@ class MusicVaultWindow(QMainWindow):
             title = track["title"] or Path(track["path"]).stem
             artist = track["artist"] or ""
 
-        self.statusBar().showMessage(f"Queued next: {title}" + (f" — {artist}" if artist else ""), 3000)
+        self.statusBar().showMessage(f"Added to queue: {title}" + (f" — {artist}" if artist else ""), 3000)
 
     def open_song_context_menu(self, position) -> None:
         row = self.library_table.rowAt(position.y())
@@ -4422,7 +4338,7 @@ class MusicVaultWindow(QMainWindow):
 
         play_action = menu.addAction("Play")
         play_action.setIcon(ui_icon("play", 18))
-        play_next_action = menu.addAction("Play Next")
+        play_next_action = menu.addAction("Add to queue")
         play_next_action.setIcon(ui_icon("queue-next", 18))
         add_playlist_action = menu.addAction("Add to Playlist")
         add_playlist_action.setIcon(ui_icon("playlists", 18))
@@ -4442,13 +4358,10 @@ class MusicVaultWindow(QMainWindow):
             self.open_metadata_editor()
 
     def visible_track_rows(self) -> list[int]:
-        return [
-            row for row in range(self.library_table.rowCount())
-            if not self.library_table.isRowHidden(row)
-        ]
+        return list(range(self.library_table.visible_track_count()))
 
     def play_row(self, row: int) -> None:
-        if row < 0 or row >= self.library_table.rowCount():
+        if row < 0 or row >= self.library_table.visible_track_count():
             return
 
         self.library_table.selectRow(row)
@@ -4460,7 +4373,7 @@ class MusicVaultWindow(QMainWindow):
         if not rows:
             return
 
-        current_row = self.library_table.currentRow()
+        current_row = self.library_table.currentIndex().row()
 
         choices = [row for row in rows if row != current_row]
 
@@ -4647,26 +4560,9 @@ class MusicVaultWindow(QMainWindow):
 
     def refresh_visible_track_metadata(self, track_id: int) -> None:
         track = self.db.get_track(track_id)
-        row = locate_track_row(track_id, self.track_row_map)
-        if track is None or row is None:
+        if track is None:
             return
-        values = (
-            track["title"] or Path(track["path"]).stem,
-            track["artist"] or "",
-            track["album"] or "",
-            track["year"] or "",
-        )
-        for column, value in enumerate(values):
-            item = self.library_table.item(row, column)
-            if item is not None:
-                item.setText(str(value))
-        title_item = self.library_table.item(row, 0)
-        if title_item is not None:
-            title_item.setToolTip(str(values[0]))
-            title_item.setIcon(QIcon())
-            cover_path = track["cover_path"]
-            if cover_path and Path(cover_path).is_file():
-                title_item.setIcon(QIcon(str(cover_path)))
+        self.library_table.replace_track(track)
         self.apply_now_playing_row_state()
 
     def metadata_change_applied(self, result: MetadataChangeResult) -> None:
@@ -4746,22 +4642,11 @@ class MusicVaultWindow(QMainWindow):
             self.browser_view.schedule_visible_items()
             return
 
-        needle = text.lower().strip()
-        visible_count = 0
-
-        for row in range(self.library_table.rowCount()):
-            row_text = " ".join(
-                self.library_table.item(row, col).text().lower()
-                for col in range(self.library_table.columnCount())
-                if self.library_table.item(row, col)
-            )
-            hidden = needle not in row_text
-            self.library_table.setRowHidden(row, hidden)
-            if not hidden:
-                visible_count += 1
+        self.library_table.set_filter(text)
+        visible_count = self.library_table.visible_track_count()
 
         if hasattr(self, "library_body_stack"):
-            if self.library_table.rowCount() == 0:
+            if self.library_table.total_track_count() == 0:
                 self.library_body_stack.setCurrentIndex(1)
             elif visible_count == 0:
                 self.library_body_stack.setCurrentIndex(2)

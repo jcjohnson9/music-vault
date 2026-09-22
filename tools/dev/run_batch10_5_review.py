@@ -735,7 +735,7 @@ def _validate_scene(target, runtime: ReviewRuntime, scene: ReviewScene) -> dict[
         if (
             str(window.artist_section_selector.currentData()) != expected
             or not getattr(sections, expected)
-            or window.library_table.rowCount() < 1
+            or window.library_table.total_track_count() < 1
         ):
             raise RuntimeError("Canonical artist role section did not render.")
     elif scene.name == "metadata_zero_review":
