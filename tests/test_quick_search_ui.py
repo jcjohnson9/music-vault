@@ -67,7 +67,11 @@ def test_debounce_coalesces_changes_and_disables_stale_controls(dialogs, monkeyp
     assert not dialog.primary_button.isEnabled()
     assert not dialog.queue_button.isEnabled()
     assert not dialog.more_button.isEnabled()
-    QTest.qWait(dialog.DEBOUNCE_MS + 100)
+    # Wait for the event, not one narrow wall-clock deadline on a busy runner.
+    for _ in range(50):
+        if calls:
+            break
+        QTest.qWait(20)
     assert calls == ["moon"]
     assert dialog.selected_entity().track_id == 2
     assert dialog.results_list.isEnabled()
@@ -222,6 +226,20 @@ def test_more_actions_keep_entity_and_ordered_ids_for_host_resolution(dialogs, a
     dialog = dialogs([entity])
     requests = capture(dialog)
     search(dialog, "match")
-    menu_actions = dict(zip(("go_artist", "go_album", "add_to_playlist"), dialog.more_button.menu().actions()))
+    menu_actions = {item.data(): item for item in dialog.more_button.menu().actions()}
     menu_actions[action].trigger()
     assert requests == [(action, entity, (7,))]
+
+
+def test_like_action_is_explicit_local_and_keeps_search_open(dialogs, qapp):
+    entity = track(7, "Match")
+    dialog = dialogs([entity])
+    dialog.favorite_lookup = lambda track_id: track_id == 7
+    requests = capture(dialog)
+    show(dialog, qapp)
+    search(dialog, "match")
+    dialog._update_favorite_action()
+    assert dialog.favorite_action.text() == "Unlike track"
+    dialog.favorite_action.trigger()
+    assert requests == [("toggle_favorite", entity, (7,))]
+    assert dialog.isVisible()

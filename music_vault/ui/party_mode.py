@@ -1140,6 +1140,9 @@ class PartyModeWindow(QMainWindow):
         host = self._host()
         player = getattr(host, "player", None) if host is not None else None
         if player is not None and player.isSeekable():
+            history = getattr(host, "listening_history", None)
+            if history is not None:
+                history.before_seek()
             player.setPosition(self.progress_slider.value())
 
     def seek_relative(self, milliseconds: int) -> int:
@@ -1148,6 +1151,9 @@ class PartyModeWindow(QMainWindow):
         if player is None or not player.isSeekable():
             return player.position() if player is not None else 0
         destination = max(0, min(player.duration(), player.position() + int(milliseconds)))
+        history = getattr(host, "listening_history", None)
+        if history is not None:
+            history.before_seek()
         player.setPosition(destination)
         return destination
 

@@ -712,6 +712,7 @@ def test_window_responsive_critical_controls_and_centered_player(
 
     assert window.library_overflow.action_texts() == EXPECTED_OVERFLOW_ACTIONS + [
         "Import Folder", "New Playlist", "Add to Playlist",
+        "Recently Added", "Downloaded", "Unavailable favorites",
     ]
     # Administrative actions remain available, but do not crowd out listening.
     for button, label in (

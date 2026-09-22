@@ -75,6 +75,29 @@ use the Windows media session; if unavailable, foreground media-key fallback
 does not take over volume keys. Other platforms keep ordinary in-app playback.
 These development controls are not part of the immutable v1.0.0 download.
 
+Liked Tracks, Recently Played, and Rediscover keep listening local. Use the heart
+in Now Playing or Like in a track/search menu. Favorites belong to the canonical
+track and never add it to a playlist. Recently Added and Downloaded remain in
+the library's More menu and global search; Recently Played is a distinct view.
+Open History for paginated playback occurrences, or Rediscover for favorites to
+revisit and tracks with no recorded plays. Neither collection calls a provider.
+
+History starts only after the player progresses, not on selection or a failed
+play request. A meaningful listen is 30 seconds or half the known duration,
+whichever is shorter; mute and human attention are not measured. Seeking,
+pausing and buffering do not earn listening time. Queue duplicates and repeats
+have separate occurrences. Progress is checkpointed every 30 seconds and on
+important transitions; an interrupted process may lose its last uncheckpointed
+interval. History and favorites stay in the private database, with no automatic
+retention deletion or cloud export. Removed-library history remains unavailable
+rather than silently rebinding to another track; unavailable favorites can be
+explicitly removed through More → Unavailable favorites.
+
+These structures use additive schema 9. Upgrading schema 8 creates a verified
+backup and two empty listening tables without changing prior metadata,
+memberships or media. Do not use the development EXE for an unapproved live
+migration gate. The public v1.0.0 download and tag remain unchanged.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the

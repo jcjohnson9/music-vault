@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -7,6 +8,8 @@ from pathlib import Path
 from typing import Optional
 
 from .paths import database_path
+from .listening_schema import create_listening_schema
+from .listening_store import ListeningStore
 from .media_quality_schema import (
     create_media_quality_schema,
     get_track_media_quality as get_track_media_quality_row,
@@ -42,7 +45,7 @@ from music_vault.metadata.canonical_albums import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -86,6 +89,7 @@ class MusicVaultDB:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.migrate()
+        self.listening = ListeningStore(self.conn)
 
         if legacy_failure_file is not None:
             self.import_legacy_failures(legacy_failure_file)
@@ -365,6 +369,55 @@ class MusicVaultDB:
                 + ")."
             )
 
+    @classmethod
+    def _table_fingerprints(cls, connection: sqlite3.Connection, tables=None) -> dict[str, str]:
+        """Private full-row/schema comparison; values never enter diagnostics.
+
+        Sorting row digests handles tables without rowid and duplicate rows,
+        without retaining large private text/blob values in a second copy.
+        SQLite's sequence state is included, but internal index data is not.
+        """
+        definitions = dict(connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='table' "
+            "AND (name NOT LIKE 'sqlite_%' OR name='sqlite_sequence')"
+        ))
+        result = {}
+        for table in sorted(definitions if tables is None else tables):
+            if table not in definitions:
+                raise RuntimeError("An existing table disappeared during listening migration.")
+            digest = hashlib.sha256(str(definitions[table]).encode("utf-8"))
+            rows = sorted(
+                hashlib.sha256(repr(tuple(row)).encode("utf-8")).digest()
+                for row in connection.execute(f"SELECT * FROM {cls._quoted_identifier(table)}")
+            )
+            for row in rows:
+                digest.update(row)
+            result[table] = digest.hexdigest()
+        return result
+
+    def _migrate_listening_only(self) -> None:
+        baseline = self._table_fingerprints(self.conn)
+        if self._has_user_data():
+            backup = self._create_pre_migration_backup(CURRENT_SCHEMA_VERSION)
+            connection = sqlite3.connect(backup.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                if self._table_fingerprints(connection) != baseline:
+                    raise RuntimeError("The listening migration backup failed full-row preservation verification.")
+            finally:
+                connection.close()
+        self.conn.execute("BEGIN IMMEDIATE")
+        with self.conn:
+            if self._table_fingerprints(self.conn) != baseline:
+                raise RuntimeError("The database changed while preparing its listening migration.")
+            create_listening_schema(self.conn)
+            if self._table_fingerprints(self.conn, baseline) != baseline:
+                raise RuntimeError("The listening migration changed existing table values or structure.")
+            self._verify_database_integrity()
+            self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+        self.migration_performed = True
+        self.migrated_from_version = 8
+        self.migrated_to_version = CURRENT_SCHEMA_VERSION
+
     def migrate(self) -> None:
         version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
         if version > CURRENT_SCHEMA_VERSION:
@@ -390,9 +443,16 @@ class MusicVaultDB:
                 seed_existing_canonical_albums(self.conn)
                 create_media_quality_schema(self.conn)
                 seed_existing_track_media_quality(self.conn)
+                create_listening_schema(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
                 self._verify_database_integrity()
             self.initialized_new_database = True
+            return
+
+        # Listening state is strictly additive. Do not route an established
+        # schema-8 library through any metadata, artist or quality seed code.
+        if version == 8:
+            self._migrate_listening_only()
             return
 
         if version < CURRENT_SCHEMA_VERSION:
@@ -445,6 +505,7 @@ class MusicVaultDB:
                     )
                 create_media_quality_schema(self.conn)
                 seed_existing_track_media_quality(self.conn)
+                create_listening_schema(self.conn)
                 self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
                 self._verify_existing_table_counts_preserved(
                     baseline_counts,
@@ -459,20 +520,12 @@ class MusicVaultDB:
             self.migrated_to_version = CURRENT_SCHEMA_VERSION
             return
 
-        # Additive structures remain idempotent at the current schema so a
-        # prerelease database can acquire recovery-only columns and indexes.
+        # Current startup never reseeds or repairs existing metadata. The
+        # listening DDL is idempotent and cannot transform prior library rows.
         if version == CURRENT_SCHEMA_VERSION:
+            self.conn.execute("BEGIN IMMEDIATE")
             with self.conn:
-                create_metadata_schema(self.conn)
-                create_remediation_schema(self.conn)
-                create_sync_schema(self.conn)
-                create_metadata_intelligence_schema(self.conn)
-                seed_existing_metadata_field_extensions(self.conn)
-                seed_existing_artist_credits(self.conn)
-                create_canonical_media_schema(self.conn)
-                seed_existing_canonical_albums(self.conn)
-                create_media_quality_schema(self.conn)
-                seed_existing_track_media_quality(self.conn)
+                create_listening_schema(self.conn)
                 self._verify_database_integrity()
 
     def upsert_track(

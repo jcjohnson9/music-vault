@@ -168,6 +168,9 @@ def test_early_v6_unique_name_schema_upgrades_without_losing_artist_graph(
     # through MusicVaultDB must repair it additively while preserving IDs.
     with sqlite3.connect(path) as conn:
         conn.execute("PRAGMA foreign_keys=OFF")
+        # Keep dependent artist-graph foreign keys pointing to the replacement
+        # table's final name while reconstructing this historical fixture.
+        conn.execute("PRAGMA legacy_alter_table=ON")
         conn.execute("ALTER TABLE track_artist_credits RENAME TO credits_current")
         conn.execute("ALTER TABLE artists RENAME TO artists_current")
         conn.execute(
@@ -214,8 +217,14 @@ def test_early_v6_unique_name_schema_upgrades_without_losing_artist_graph(
         )
         conn.execute("DROP TABLE credits_current")
         conn.execute("DROP TABLE artists_current")
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        # The database was initialized with today's schema above; the altered
+        # uniqueness surface must be marked as the prerelease v6 it represents.
+        conn.execute("PRAGMA user_version=6")
 
     reopened = MusicVaultDB(path)
+    assert reopened.migration_performed and reopened.migrated_from_version == 6
+    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 9
     assert not _single_column_is_unique(reopened.conn, "normalized_name")
     preserved = reopened.conn.execute(
         "SELECT id, artist_id FROM track_artist_credits WHERE track_id=?",

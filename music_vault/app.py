@@ -7,6 +7,7 @@ import math
 import os
 import time
 from functools import partial
+from contextlib import nullcontext
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -124,6 +125,8 @@ from music_vault.core.navigation import Route
 from music_vault.core.queue_editor import ManualQueueEditor
 from music_vault.ui.track_list import TrackTableView
 from music_vault.ui.listening_controller import ListeningController
+from music_vault.ui.listening_library import ListeningLibraryController
+from music_vault.ui.listening_history import ListeningHistoryBridge
 from music_vault.ui.windows_transport import WindowsTransportController
 from music_vault.core.runtime_policy import RuntimePolicy
 from music_vault.core.playback_state import (
@@ -560,6 +563,7 @@ class MusicVaultWindow(QMainWindow):
         )
 
         self.listening = ListeningController(self)
+        self.listening_library = ListeningLibraryController(self)
         self.build_ui()
         self.update_playback_mode_buttons()
         self.load_library()
@@ -567,6 +571,14 @@ class MusicVaultWindow(QMainWindow):
         self.refresh_settings_status()
         self.on_multi_source_status_transition({})
         self.windows_transport = WindowsTransportController(self)
+        self.listening_history = ListeningHistoryBridge(self, self.db.listening)
+        self.listening_history.changed.connect(self.listening_library.changed)
+        self.listening_history.degraded.connect(
+            lambda degraded, _code: self.statusBar().showMessage(
+                "Listening history could not be saved completely. Playback is unaffected."
+                if degraded else "Listening history is saving again.", 6000,
+            )
+        )
         if self.runtime_policy.background_provider_work_allowed:
             QTimer.singleShot(0, self.wake_metadata_intelligence)
 
@@ -1110,8 +1122,9 @@ class MusicVaultWindow(QMainWindow):
         self.library_view_buttons = {"library": self.library_btn}
         for kind, label, icon in (
             ("albums", "Albums", "albums"), ("artists", "Artists", "artists"),
-            ("recent", "Recently Added", "recently-added"),
-            ("downloaded", "Downloaded", "downloaded"),
+            ("liked", "Liked Tracks", "heart"),
+            ("recently_played", "Recently Played", "history"),
+            ("rediscover", "Rediscover", "rediscover"),
         ):
             button = self.make_action_button(label, icon, lambda checked=False, k=kind, title=label: self.listening.navigate(Route(k, label=title)), object_name="SidebarButton")
             button.setCheckable(True)
@@ -1222,6 +1235,7 @@ class MusicVaultWindow(QMainWindow):
         self.playlist_managed_badge.hide()
         self.page_subtitle = QLabel("Your local music collection, synced and ready.")
         self.page_subtitle.setObjectName("MutedLabel")
+        self.page_subtitle.setWordWrap(True)
         page_heading.addWidget(self.page_title)
         page_heading.addWidget(self.playlist_managed_badge)
         page_heading.addStretch(1)
@@ -1286,6 +1300,10 @@ class MusicVaultWindow(QMainWindow):
         self.library_overflow.add_action("Import Folder", "import", self.import_music_folder)
         self.library_overflow.add_action("New Playlist", "add", self.create_playlist)
         self.library_overflow.add_action("Add to Playlist", "playlists", self.add_selected_to_playlist)
+        self.library_overflow.add_action("Recently Added", "recently-added", lambda: self.listening.navigate(Route("recent", label="Recently Added")))
+        self.library_overflow.add_action("Downloaded", "downloaded", lambda: self.listening.navigate(Route("downloaded", label="Downloaded")))
+        self.library_overflow.add_action("Unavailable favorites", "heart", self.listening_library.open_unavailable_favorites)
+        self.listening_library.collection_controls(action_row)
 
         self.search_box = SearchField(
             placeholder="Search songs, artists, albums...",
@@ -2315,6 +2333,7 @@ class MusicVaultWindow(QMainWindow):
         track_info.addStretch(1)
         left_layout.addWidget(self.cover_art)
         left_layout.addLayout(track_info, 1)
+        left_layout.addWidget(self.listening_library.like_button(bar))
 
         self.player_center = QFrame()
         self.player_center.setObjectName("PlayerCenter")
@@ -3380,10 +3399,13 @@ class MusicVaultWindow(QMainWindow):
 
 
     def refresh_current_view(self) -> None:
+        collections = getattr(self, "listening_library", None)
+        if collections is not None and collections.show_route(self.current_view_kind):
+            return
         if self.current_view_kind == "search":
             route = self.listening.content_route
             rows = [track for track_id in (route.entity_key or ()) if (track := self.db.get_track(track_id)) is not None]
-            self.load_library(rows, "Search results", "Playback context from global search")
+            self.load_library(rows, route.label, "Captured playback context")
             return
         if self.current_view_kind in {"album_tracks", "artist_tracks"}:
             context = self._detail_browser_context
@@ -4102,6 +4124,9 @@ class MusicVaultWindow(QMainWindow):
         if capture_base_context:
             self.capture_base_playback_context(track_id)
 
+        history = getattr(self, "listening_history", None)
+        if history is not None:
+            history.prepare_track(track, context=self.base_playback_context)
         self.update_now_playing_indicator(track_id)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.player.play()
@@ -4119,6 +4144,9 @@ class MusicVaultWindow(QMainWindow):
         self.write_app_status()
         if hasattr(self, "listening"):
             self.listening.refresh_queue()
+        collections = getattr(self, "listening_library", None)
+        if collections is not None:
+            collections.refresh_like()
         return True
 
     def set_cover_art(self, cover_path: str | None) -> None:
@@ -4171,14 +4199,16 @@ class MusicVaultWindow(QMainWindow):
 
 
     def play_next(self) -> None:
-        if self.play_next_from_manual_queue():
-            return
+        history = getattr(self, "listening_history", None)
+        with history.intent(reason="next") if history is not None else nullcontext():
+            if self.play_next_from_manual_queue():
+                return
 
-        if self.shuffle_enabled:
-            self.play_random_from_base_context()
-            return
+            if self.shuffle_enabled:
+                self.play_random_from_base_context()
+                return
 
-        self.play_next_from_base_context()
+            self.play_next_from_base_context()
 
     def play_next_from_manual_queue(self) -> bool:
         while self.manual_queue:
@@ -4186,12 +4216,14 @@ class MusicVaultWindow(QMainWindow):
             self.update_queue_label()
             self.write_app_status()
 
-            if self.play_track_by_id(
-                queued_track_id,
-                capture_base_context=False,
-                show_missing_warning=False,
-            ):
-                return True
+            history = getattr(self, "listening_history", None)
+            with history.intent(origin="manual_queue") if history is not None else nullcontext():
+                if self.play_track_by_id(
+                    queued_track_id,
+                    capture_base_context=False,
+                    show_missing_warning=False,
+                ):
+                    return True
 
         return False
 
@@ -4223,12 +4255,14 @@ class MusicVaultWindow(QMainWindow):
         return False
 
     def play_base_track_by_id(self, track_id: int) -> bool:
-        if not self.play_track_by_id(
-            track_id,
-            capture_base_context=False,
-            show_missing_warning=False,
-        ):
-            return False
+        history = getattr(self, "listening_history", None)
+        with history.intent(origin="base") if history is not None else nullcontext():
+            if not self.play_track_by_id(
+                track_id,
+                capture_base_context=False,
+                show_missing_warning=False,
+            ):
+                return False
 
         if self.base_playback_context is None:
             self.capture_base_playback_context(track_id)
@@ -4283,8 +4317,10 @@ class MusicVaultWindow(QMainWindow):
             return
 
         for track_id in candidates:
-            if self.play_base_track_by_id(track_id):
-                return
+            history = getattr(self, "listening_history", None)
+            with history.intent(reason="previous") if history is not None else nullcontext():
+                if self.play_base_track_by_id(track_id):
+                    return
 
 
 
@@ -4350,6 +4386,13 @@ class MusicVaultWindow(QMainWindow):
         play_next_action.setIcon(ui_icon("queue-next", 18))
         add_playlist_action = menu.addAction("Add to Playlist")
         add_playlist_action.setIcon(ui_icon("playlists", 18))
+        track_id = self.selected_track_id()
+        try:
+            liked = self.db.listening.is_favorite(track_id)
+            favorite_action = menu.addAction("Unlike track" if liked else "Like track")
+            favorite_action.setIcon(ui_icon("heart", 18))
+        except Exception:
+            favorite_action = None
         menu.addSeparator()
         edit_metadata_action = menu.addAction("Edit Metadata")
         edit_metadata_action.setIcon(ui_icon("metadata", 18))
@@ -4364,6 +4407,8 @@ class MusicVaultWindow(QMainWindow):
             self.add_selected_to_playlist()
         elif action == edit_metadata_action:
             self.open_metadata_editor()
+        elif favorite_action is not None and action == favorite_action:
+            self.listening_library.toggle_favorite(track_id)
 
     def visible_track_rows(self) -> list[int]:
         return list(range(self.library_table.visible_track_count()))
@@ -4396,10 +4441,16 @@ class MusicVaultWindow(QMainWindow):
             return
 
         if self.repeat_mode == "one":
+            history = getattr(self, "listening_history", None)
+            if history is not None:
+                history.repeat_current(context=self.base_playback_context)
             self.player.setPosition(0)
             self.player.play()
             return
 
+        history = getattr(self, "listening_history", None)
+        if history is not None:
+            history.finish("ended")
         # Queued songs should play next even if Auto is off.
         if self.manual_queue:
             if self.play_next_from_manual_queue():
@@ -4416,6 +4467,9 @@ class MusicVaultWindow(QMainWindow):
         if self._handling_media_error:
             return
         self._handling_media_error = True
+        history = getattr(self, "listening_history", None)
+        if history is not None:
+            history.finish("error")
         track = self.db.get_track(self.current_track_id) if self.current_track_id else None
         title = track["title"] if track else None
         self.statusBar().showMessage(playback_error_message(title), 7000)
@@ -4553,6 +4607,9 @@ class MusicVaultWindow(QMainWindow):
 
     def on_slider_released(self) -> None:
         self.is_seeking = False
+        history = getattr(self, "listening_history", None)
+        if history is not None:
+            history.before_seek()
         self.player.setPosition(self.progress_slider.value())
 
     def format_time(self, milliseconds: int) -> str:
@@ -6077,6 +6134,9 @@ class MusicVaultWindow(QMainWindow):
             event.ignore()
             QTimer.singleShot(100, self.close)
             return
+        history = getattr(self, "listening_history", None)
+        if history is not None:
+            history.accepted_close()
         if self.party_mode_window is not None:
             try:
                 self.party_mode_window.shutdown()

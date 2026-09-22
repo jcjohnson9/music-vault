@@ -67,6 +67,7 @@ class QuickSearchDialog(QDialog):
         self._index = index
         self._context_keys = tuple(context_keys)
         self._results: tuple[SearchEntity, ...] = ()
+        self.favorite_lookup = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
@@ -117,12 +118,17 @@ class QuickSearchDialog(QDialog):
         self.more_button.setAccessibleName("More actions for selected track")
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(self.more_button)
+        self.favorite_action = menu.addAction("Like track")
+        self.favorite_action.setData("toggle_favorite")
+        self.favorite_action.triggered.connect(lambda: self._dispatch("toggle_favorite"))
+        menu.aboutToShow.connect(self._update_favorite_action)
         for label, action_id in (
             ("Go to artist", "go_artist"),
             ("Go to album", "go_album"),
             ("Add to playlist…", "add_to_playlist"),
         ):
             action = menu.addAction(label)
+            action.setData(action_id)
             action.triggered.connect(lambda _checked=False, action_id=action_id: self._dispatch(action_id))
         self.more_button.setMenu(menu)
         buttons.addWidget(self.more_button)
@@ -250,19 +256,30 @@ class QuickSearchDialog(QDialog):
         action = "play_track" if entity.kind == "track" else "invoke_action" if entity.kind == "action" else "open_entity"
         self._dispatch(action)
 
+    def _update_favorite_action(self):
+        entity = self.selected_entity()
+        available = entity is not None and entity.track_id is not None and callable(self.favorite_lookup)
+        self.favorite_action.setEnabled(available)
+        if available:
+            try:
+                liked = self.favorite_lookup(entity.track_id)
+                self.favorite_action.setText("Unlike track" if liked else "Like track")
+            except Exception:
+                self.favorite_action.setEnabled(False)
+
     def _dispatch(self, action: str) -> None:
         if self._debounce.isActive():
             self.refresh_results()
         entity = self.selected_entity()
         if entity is None:
             return
-        track_actions = {"play_track", "queue_track", "go_artist", "go_album", "add_to_playlist"}
+        track_actions = {"play_track", "queue_track", "go_artist", "go_album", "add_to_playlist", "toggle_favorite"}
         if action in track_actions and (entity.kind != "track" or entity.track_id is None):
             return
         ordered_ids = track_result_ids(self._results)
         # Queue keeps search open; the host confirms success and tracks recency.
         # Navigation/play/playlist selection returns control to the host first.
-        if action != "queue_track":
+        if action not in {"queue_track", "toggle_favorite"}:
             self.accept()
         self.action_requested.emit(action, entity, ordered_ids)
 
