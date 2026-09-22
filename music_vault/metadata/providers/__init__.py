@@ -33,6 +33,11 @@ class ProviderArtistCredit:
     join_phrase: str = ""
     entity_type: str = "unknown"
     provider_reference: str | None = None
+    # ``name`` remains the credited display; catalogue identity and a track's
+    # spelling are separate facts. Joins retain provider suffix semantics.
+    provider: str | None = None
+    canonical_name: str | None = None
+    credited_as: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,7 @@ class ProviderReleaseCandidate:
     provider_order: int = 0
     reasons: tuple[str, ...] = ()
     field_scores: dict[str, float] = field(default_factory=dict)
+    album_artist_credits: tuple[ProviderArtistCredit, ...] = ()
 
     @property
     def score(self) -> float:
@@ -109,6 +115,9 @@ class ProviderReleaseCandidate:
                     "join_phrase": credit.join_phrase,
                     "entity_type": credit.entity_type,
                     "provider_reference": credit.provider_reference,
+                    "provider": credit.provider,
+                    "canonical_name": credit.canonical_name,
+                    "credited_as": credit.credited_as,
                 }
                 for credit in self.artist_credits
             ],
@@ -134,6 +143,20 @@ class ProviderReleaseCandidate:
             "provider_order": self.provider_order,
             "reasons": list(self.reasons),
             "field_scores": dict(self.field_scores),
+            "album_artist_credits": [
+                {
+                    "name": credit.name,
+                    "role": credit.role,
+                    "artist_id": credit.artist_id,
+                    "join_phrase": credit.join_phrase,
+                    "entity_type": credit.entity_type,
+                    "provider_reference": credit.provider_reference,
+                    "provider": credit.provider,
+                    "canonical_name": credit.canonical_name,
+                    "credited_as": credit.credited_as,
+                }
+                for credit in self.album_artist_credits
+            ],
         }
 
 

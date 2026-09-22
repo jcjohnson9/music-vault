@@ -6,6 +6,7 @@ from pathlib import Path
 from music_vault.core.db import MusicVaultDB
 from music_vault.metadata.intelligence import MetadataIntelligenceService
 from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
+from music_vault.metadata.musicbrainz_enricher import MetadataCandidate
 from music_vault.metadata.providers import ProviderArtistCredit, ProviderReleaseCandidate
 from music_vault.metadata.review_policy import (
     ReviewOutcome,
@@ -133,6 +134,33 @@ def _discogs(*, reverse: bool, score: float = 96, duration: float = 240):
             "original_release_date": score,
             "version_type": score,
         },
+    )
+
+
+def _musicbrainz(*, reverse: bool, score: int = 96, duration: float = 240):
+    """Use the actual secondary-provider contract, not a Discogs candidate."""
+    title = "Anthem of the Republic" if reverse else "The Cosmic Assembly"
+    artist = "The Cosmic Assembly" if reverse else "Anthem of the Republic"
+    return MetadataCandidate(
+        title=title,
+        artist=artist,
+        album="Synthetic Catalogue Album",
+        release_date="1978",
+        recording_id="synthetic-recording",
+        release_id="synthetic-release",
+        release_group_id="synthetic-release-group",
+        score=score,
+        duration_seconds=duration,
+        album_artist=artist,
+        artist_credits=(
+            ProviderArtistCredit(
+                artist,
+                artist_id="synthetic-artist",
+                entity_type="group",
+                provider="musicbrainz",
+            ),
+        ),
+        original_release_date="1978",
     )
 
 
@@ -289,7 +317,7 @@ def test_discogs_remains_primary_over_conflicting_musicbrainz(tmp_path):
         raw_title="The Cosmic Assembly - Anthem of the Republic (1978)",
     )
     discogs = _SequencedDiscogs((_discogs(reverse=True),))
-    musicbrainz = _MusicBrainz((_discogs(reverse=False),))
+    musicbrainz = _MusicBrainz((_musicbrainz(reverse=False),))
     service = MetadataIntelligenceService(
         db,
         _settings(metadata_musicbrainz_secondary_enabled=True),
@@ -317,7 +345,7 @@ def test_single_musicbrainz_fallback_can_confirm_reverse_after_discogs_no_match(
     db = MusicVaultDB(tmp_path / "library.sqlite3", backup_dir=tmp_path / "backups")
     track_id = _track(db, tmp_path)
     discogs = _SequencedDiscogs((), ())
-    musicbrainz = _MusicBrainz((_discogs(reverse=True, score=97),))
+    musicbrainz = _MusicBrainz((_musicbrainz(reverse=True, score=97),))
     service = MetadataIntelligenceService(
         db,
         _settings(metadata_musicbrainz_secondary_enabled=True),

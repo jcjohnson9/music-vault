@@ -12,6 +12,7 @@ import requests
 from music_vault.core.runtime_policy import runtime_policy_for
 from music_vault.metadata.artist_images import validate_public_url
 from music_vault.metadata.schema import normalize_release_date
+from music_vault.metadata.providers import ProviderArtistCredit
 from music_vault.version import user_agent
 
 
@@ -42,6 +43,11 @@ class MetadataCandidate:
     artwork_available: bool | None = None
     provider: str = "MusicBrainz"
     provider_order: int = 0
+    artist_credits: tuple[ProviderArtistCredit, ...] = ()
+    album_artist_credits: tuple[ProviderArtistCredit, ...] = ()
+    original_release_date: str | None = None
+    release_group_first_release_date: str | None = None
+    provider_reference: str | None = None
 
     @property
     def year(self) -> str | None:
@@ -103,6 +109,43 @@ def _release_date(value: object) -> str | None:
         return normalize_release_date(value)
     except ValueError:
         return None
+
+
+def _structured_artist_credits(value: object) -> tuple[ProviderArtistCredit, ...]:
+    """Retain catalogue identity without interpreting credit punctuation as roles."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    credits: list[ProviderArtistCredit] = []
+    for entry in value:
+        if isinstance(entry, str):
+            # Older payloads may express a join as a separate string.
+            if credits and len(credits[-1].join_phrase + entry) <= 80:
+                from dataclasses import replace
+
+                credits[-1] = replace(credits[-1], join_phrase=credits[-1].join_phrase + entry)
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        artist = entry.get("artist")
+        artist = artist if isinstance(artist, Mapping) else {}
+        canonical = _clean(artist.get("name"))
+        credited = _clean(entry.get("name")) or canonical
+        if not credited:
+            continue
+        kind = str(artist.get("type") or "unknown").casefold()
+        kind = {"character": "fictional", "choir": "group"}.get(kind, kind)
+        if kind not in {"person", "group", "orchestra", "fictional", "unknown"}:
+            kind = "unknown"
+        credits.append(ProviderArtistCredit(
+            name=credited,
+            artist_id=_clean(artist.get("id")),
+            join_phrase=str(entry.get("joinphrase") or ""),
+            entity_type=kind,
+            provider="musicbrainz",
+            canonical_name=canonical,
+            credited_as=credited,
+        ))
+    return tuple(credits)
 
 
 def _duration_seconds(value: object) -> float | None:
@@ -274,6 +317,13 @@ class MusicBrainzProvider:
                         release_status=_clean(release_map.get("status")),
                         artwork_available=artwork_available,
                         provider_order=provider_order,
+                        artist_credits=_structured_artist_credits(recording.get("artist-credit")),
+                        album_artist_credits=_structured_artist_credits(release_map.get("artist-credit")),
+                        original_release_date=_release_date(recording.get("first-release-date")),
+                        release_group_first_release_date=(
+                            _release_date(release_group.get("first-release-date"))
+                            if isinstance(release_group, Mapping) else None
+                        ),
                     )
                 )
                 provider_order += 1

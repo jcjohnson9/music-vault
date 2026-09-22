@@ -33,6 +33,7 @@ from music_vault.metadata.schema import (
     seed_existing_metadata,
 )
 from music_vault.metadata.remediation_schema import create_remediation_schema
+from music_vault.metadata.resolution_schema import create_resolution_schema, required_resolution_indexes
 from music_vault.metadata.artist_credits import seed_existing_artist_credits
 from music_vault.metadata.intelligence_schema import (
     create_metadata_intelligence_schema,
@@ -45,7 +46,7 @@ from music_vault.metadata.canonical_albums import (
 )
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 _LEGACY_FAILURE_IMPORT_KEY = "legacy_failure_file_imported_v2"
 _VALID_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -370,7 +371,9 @@ class MusicVaultDB:
             )
 
     @classmethod
-    def _table_fingerprints(cls, connection: sqlite3.Connection, tables=None) -> dict[str, str]:
+    def _table_fingerprints(
+        cls, connection: sqlite3.Connection, tables=None, *, preserved_columns=None,
+    ) -> dict[str, str]:
         """Private full-row/schema comparison; values never enter diagnostics.
 
         Sorting row digests handles tables without rowid and duplicate rows,
@@ -385,37 +388,77 @@ class MusicVaultDB:
         for table in sorted(definitions if tables is None else tables):
             if table not in definitions:
                 raise RuntimeError("An existing table disappeared during listening migration.")
-            digest = hashlib.sha256(str(definitions[table]).encode("utf-8"))
+            definition = str(definitions[table])
+            projection = "*"
+            if preserved_columns is not None:
+                expected = preserved_columns[table]
+                actual = tuple(tuple(row) for row in connection.execute(
+                    f"PRAGMA table_info({cls._quoted_identifier(table)})"
+                ))
+                if actual != expected:
+                    addition = ((len(expected), "credited_as", "TEXT", 0, None, 0),)
+                    if (table != "track_artist_credits" or actual != expected + addition
+                            or any(column[1] == "credited_as" for column in expected)):
+                        raise RuntimeError("The additive migration changed existing column definitions.")
+                    if connection.execute(
+                        "SELECT 1 FROM track_artist_credits WHERE credited_as IS NOT NULL LIMIT 1"
+                    ).fetchone() is not None:
+                        raise RuntimeError("The additive migration backfilled artist credits.")
+                    # SQLite appends columns before trailing table constraints
+                    # (or the closing parenthesis). Compare the original SQL and
+                    # complete old-column projection, not just aggregate counts.
+                    definition, removed = re.subn(
+                        r",\s*credited_as\s+TEXT(?=\s*[,\)])", "", definition,
+                        flags=re.IGNORECASE,
+                    )
+                    if removed != 1:
+                        raise RuntimeError("Could not verify the additive artist-credit definition.")
+                projection = ",".join(cls._quoted_identifier(column[1]) for column in expected)
+            digest = hashlib.sha256(definition.encode("utf-8"))
             rows = sorted(
                 hashlib.sha256(repr(tuple(row)).encode("utf-8")).digest()
-                for row in connection.execute(f"SELECT * FROM {cls._quoted_identifier(table)}")
+                for row in connection.execute(f"SELECT {projection} FROM {cls._quoted_identifier(table)}")
             )
             for row in rows:
                 digest.update(row)
             result[table] = digest.hexdigest()
         return result
 
-    def _migrate_listening_only(self) -> None:
+    def _migrate_additive_only(self, version: int) -> None:
         baseline = self._table_fingerprints(self.conn)
+        columns = {
+            table: tuple(tuple(row) for row in self.conn.execute(
+                f"PRAGMA table_info({self._quoted_identifier(table)})"
+            )) for table in baseline
+        }
+        counts = self._aggregate_counts(self.conn)
         if self._has_user_data():
             backup = self._create_pre_migration_backup(CURRENT_SCHEMA_VERSION)
             connection = sqlite3.connect(backup.resolve().as_uri() + "?mode=ro", uri=True)
             try:
                 if self._table_fingerprints(connection) != baseline:
-                    raise RuntimeError("The listening migration backup failed full-row preservation verification.")
+                    raise RuntimeError("The additive migration backup failed full-row preservation verification.")
             finally:
                 connection.close()
         self.conn.execute("BEGIN IMMEDIATE")
         with self.conn:
             if self._table_fingerprints(self.conn) != baseline:
-                raise RuntimeError("The database changed while preparing its listening migration.")
+                raise RuntimeError("The database changed while preparing its additive migration.")
             create_listening_schema(self.conn)
-            if self._table_fingerprints(self.conn, baseline) != baseline:
-                raise RuntimeError("The listening migration changed existing table values or structure.")
+            create_resolution_schema(self.conn)
+            if self._table_fingerprints(self.conn, baseline, preserved_columns=columns) != baseline:
+                raise RuntimeError("The additive migration changed existing table values or structure.")
+            self._verify_existing_table_counts_preserved(counts)
+            for table in self._table_names() - set(baseline):
+                if self.conn.execute(f"SELECT 1 FROM {self._quoted_identifier(table)} LIMIT 1").fetchone():
+                    raise RuntimeError("The additive migration unexpectedly populated a new table.")
+            indexes = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+            if not set(required_resolution_indexes()) <= indexes:
+                raise RuntimeError("The additive migration is missing a required evidence index.")
             self._verify_database_integrity()
             self.conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
         self.migration_performed = True
-        self.migrated_from_version = 8
+        self.migrated_from_version = version
         self.migrated_to_version = CURRENT_SCHEMA_VERSION
 
     def migrate(self) -> None:
@@ -437,6 +480,7 @@ class MusicVaultDB:
                 create_remediation_schema(self.conn)
                 create_sync_schema(self.conn)
                 create_metadata_intelligence_schema(self.conn)
+                create_resolution_schema(self.conn)
                 seed_existing_metadata_field_extensions(self.conn)
                 seed_existing_artist_credits(self.conn)
                 create_canonical_media_schema(self.conn)
@@ -449,10 +493,10 @@ class MusicVaultDB:
             self.initialized_new_database = True
             return
 
-        # Listening state is strictly additive. Do not route an established
-        # schema-8 library through any metadata, artist or quality seed code.
-        if version == 8:
-            self._migrate_listening_only()
+        # Established libraries receive empty evidence/listening structures and
+        # one nullable credit column only, never metadata or artist repair.
+        if version in {8, 9}:
+            self._migrate_additive_only(version)
             return
 
         if version < CURRENT_SCHEMA_VERSION:
@@ -481,6 +525,7 @@ class MusicVaultDB:
                 seed_existing_playlist_origins(self.conn)
                 backfill_source_track_identities(self.conn)
                 create_metadata_intelligence_schema(self.conn)
+                create_resolution_schema(self.conn)
                 seed_existing_metadata_field_extensions(self.conn)
                 seed_existing_artist_credits(self.conn)
                 create_canonical_media_schema(self.conn)
@@ -526,6 +571,7 @@ class MusicVaultDB:
             self.conn.execute("BEGIN IMMEDIATE")
             with self.conn:
                 create_listening_schema(self.conn)
+                create_resolution_schema(self.conn)
                 self._verify_database_integrity()
 
     def upsert_track(

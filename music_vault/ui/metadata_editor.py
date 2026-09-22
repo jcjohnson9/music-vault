@@ -1446,7 +1446,15 @@ class MetadataEditorDialog(QDialog):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        result = self.service.undo_last_change(self.track_id)
+        try:
+            result = self.service.undo_last_change(self.track_id)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Metadata changed",
+                "This metadata or its shared artist/album identity changed after acceptance. "
+                "Nothing was restored. Review the current values before making another correction.",
+            )
+            return
         if result.changed:
             self.metadata_changed.emit(result)
             self._refresh_editor_state(result.after)
