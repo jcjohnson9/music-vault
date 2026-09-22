@@ -690,11 +690,12 @@ def test_window_responsive_critical_controls_and_centered_player(
     assert window.size() == QSize(width, height)
     for widget in (
         window.sidebar,
-        window.import_btn,
-        window.create_playlist_btn,
-        window.add_playlist_btn,
+        window.context_play_btn,
+        window.context_shuffle_btn,
         window.queue_next_btn,
         window.library_overflow,
+        window.listening.search_button,
+        window.listening.queue_button,
         window.player_center,
         window.play_btn,
         window.prev_btn,
@@ -709,13 +710,28 @@ def test_window_responsive_critical_controls_and_centered_player(
     player_center_rect = _widget_rect_in_window(window.player_center, window)
     assert abs(player_center_rect.center().x() - player_bar_rect.center().x()) <= 12
 
-    assert window.library_overflow.action_texts() == EXPECTED_OVERFLOW_ACTIONS
+    assert window.library_overflow.action_texts() == EXPECTED_OVERFLOW_ACTIONS + [
+        "Import Folder", "New Playlist", "Add to Playlist",
+    ]
+    # Administrative actions remain available, but do not crowd out listening.
+    for button, label in (
+        (window.import_btn, "Import Folder"),
+        (window.create_playlist_btn, "New Playlist"),
+        (window.add_playlist_btn, "Add to Playlist"),
+    ):
+        assert not button.isVisible()
+        action = window.library_overflow.action(label)
+        assert action.isVisible()
+        assert action.isEnabled()
+        assert not action.icon().isNull()
+    assert window.queue_next_btn.text() == "Add to queue"
     assert window.volume_slider.value() == 23
     assert window.volume_slider.width() >= 96
     assert not window.play_btn.icon().isNull()
     assert not window.prev_btn.icon().isNull()
     assert not window.next_btn.icon().isNull()
-    assert window.library_table.isColumnHidden(4)
+    # Paths are no longer allocated as a hidden fifth column at all.
+    assert window.library_table.model().columnCount() == 4
 
 
 def test_window_interaction_polish_and_dpr_assets(isolated_ui_window, qapp):
@@ -737,7 +753,7 @@ def test_window_interaction_polish_and_dpr_assets(isolated_ui_window, qapp):
     assert window.pages.currentWidget() is window.sync_page
     window.library_btn.click()
 
-    primary_active = window.import_btn.icon().pixmap(
+    primary_active = window.context_play_btn.icon().pixmap(
         QSize(18, 18), QIcon.Mode.Active, QIcon.State.Off
     )
     play_active = window.play_btn.icon().pixmap(
@@ -757,9 +773,9 @@ def test_window_interaction_polish_and_dpr_assets(isolated_ui_window, qapp):
     assert _pixmap_contains_color(danger_active, theme.COLORS["danger_hover"])
     danger_button.deleteLater()
 
-    first_title = window.library_table.item(0, 0)
-    assert first_title.toolTip() == first_title.text()
-    assert str(fixture.root) not in first_title.toolTip()
+    first_title = window.library_table.model().index(0, 0)
+    assert first_title.data(Qt.ToolTipRole) == first_title.data(Qt.DisplayRole)
+    assert str(fixture.root) not in first_title.data(Qt.ToolTipRole)
 
     source = QPixmap(400, 300)
     source.fill(QColor("#315E8A"))
@@ -776,7 +792,7 @@ def test_window_interaction_polish_and_dpr_assets(isolated_ui_window, qapp):
     assert window.shuffle_btn.toolTip() == "Shuffle is off"
     assert window.repeat_btn.toolTip() == "Repeat is off"
 
-    window.import_btn.setFocus()
+    window.context_play_btn.setFocus()
     qapp.processEvents()
     unfocused_slider = window.volume_slider.grab()
     window.volume_slider.setFocus(Qt.FocusReason.TabFocusReason)
@@ -794,10 +810,10 @@ def test_window_pages_empty_states_and_long_synthetic_names(
     window = isolated_ui_window.window
 
     assert window.pages.count() == 3
-    assert window.library_table.rowCount() == 18
+    assert window.library_table.visible_track_count() == 18
     assert any(
-        window.library_table.item(row, 0).text() == LONG_TITLE
-        for row in range(window.library_table.rowCount())
+        window.library_table.model().index(row, 0).data(Qt.DisplayRole) == LONG_TITLE
+        for row in range(window.library_table.visible_track_count())
     )
     assert any(
         window.playlists.item(index).text() == LONG_PLAYLIST
@@ -1018,10 +1034,7 @@ def test_browser_activation_uses_exact_stable_album_and_artist_keys(
 
     window.open_album(album.browser_key)
 
-    actual_album_ids = {
-        window.library_table.item(row, 0).data(Qt.UserRole)
-        for row in range(window.library_table.rowCount())
-    }
+    actual_album_ids = set(window.library_table.visible_track_ids())
     assert actual_album_ids == expected_album_ids
     assert window.current_view_kind == "album_tracks"
 
@@ -1036,10 +1049,7 @@ def test_browser_activation_uses_exact_stable_album_and_artist_keys(
 
     window.open_artist(artist.browser_key)
 
-    actual_artist_ids = {
-        window.library_table.item(row, 0).data(Qt.UserRole)
-        for row in range(window.library_table.rowCount())
-    }
+    actual_artist_ids = set(window.library_table.visible_track_ids())
     assert actual_artist_ids == expected_artist_ids
     assert window.current_view_kind == "artist_tracks"
 
@@ -1227,8 +1237,8 @@ def test_window_preserves_now_playing_selection_modes_queue_and_volume(
     window.library_table.selectRow(browsing_row)
 
     assert playing_row != browsing_row
-    assert window.library_table.item(playing_row, 0).data(fixture.app_module.NOW_PLAYING_ROLE) is True
-    assert window.library_table.currentRow() == browsing_row
+    assert window.library_table.model().index(playing_row, 0).data(fixture.app_module.NOW_PLAYING_ROLE) is True
+    assert window.library_table.currentIndex().row() == browsing_row
     assert window.current_track_id == playing_id
 
     window.manual_queue[:] = fixture.track_ids[2:4]

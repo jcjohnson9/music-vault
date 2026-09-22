@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from PySide6.QtWidgets import QLabel, QTableWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from music_vault.ui import review
 from music_vault.ui.review import (
@@ -21,6 +21,7 @@ from music_vault.ui.review import (
     review_scene_ready,
 )
 from music_vault.ui.sync_center import SyncCenterWidget
+from music_vault.ui.track_list import TrackTableView
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -120,7 +121,12 @@ def test_managed_playlist_review_metrics_require_badge_and_explanation(qapp) -> 
     explanation = QLabel(
         "Managed by a saved source. Manual additions remain after synchronized tracks."
     )
-    window.library_table = QTableWidget(2, 1)
+    window.library_table = TrackTableView()
+    window.library_table.set_tracks([
+        {"id": 1, "title": "Synthetic first"},
+        {"id": 2, "title": "Synthetic second"},
+    ])
+    window.library_table.set_filter("first")
     layout.addWidget(window.playlist_managed_badge)
     layout.addWidget(explanation)
     layout.addWidget(window.library_table)
@@ -131,6 +137,8 @@ def test_managed_playlist_review_metrics_require_badge_and_explanation(qapp) -> 
         assert metrics is not None
         assert metrics["managed_badge_visible"] is True
         assert metrics["managed_explanation_present"] is True
+        assert window.library_table.visible_track_count() == 1
+        # This metric reports source membership, not the current search subset.
         assert metrics["playlist_track_count"] == 2
     finally:
         window.close()

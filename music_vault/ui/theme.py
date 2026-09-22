@@ -691,7 +691,7 @@ QTableView::item:selected {{
     color: {c['text_primary']};
 }}
 
-QTableWidget#LibraryTable:focus {{
+QTableView#LibraryTable:focus {{
     border: 1px solid {c['focus_ring']};
 }}
 
