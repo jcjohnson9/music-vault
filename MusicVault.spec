@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
+from importlib.metadata import version as distribution_version
 from PyInstaller.utils.win32.versioninfo import (
     FixedFileInfo,
     StringFileInfo,
@@ -28,6 +29,33 @@ acquisition_datas = collect_data_files('yt_dlp_ejs', includes=['**/*.js'])
 for dependency in ACQUISITION_PINS:
     # Distribution versions and license files remain inspectable when frozen.
     acquisition_datas += copy_metadata(dependency)
+
+# PyWinRT namespaces load projection extensions dynamically. Keep the exact
+# native closure proven by the Windows transport gate, not unrelated namespaces.
+transport_distributions = {
+    'winrt-runtime': '3.2.1', 'winrt-Windows.Foundation': '3.2.1',
+    'winrt-Windows.Foundation.Collections': '3.2.1', 'winrt-Windows.Media': '3.2.1',
+    'winrt-Windows.Media.Interop': '3.2.1', 'winrt-Windows.Storage.Streams': '3.2.1',
+    'typing_extensions': '4.16.0',
+}
+transport_imports = [
+    'winrt.runtime', 'winrt.system', 'winrt.windows.foundation',
+    'winrt.windows.foundation.collections', 'winrt.windows.media',
+    'winrt.windows.media.interop', 'winrt.windows.storage.streams',
+    'winrt._winrt', 'winrt._winrt_windows_foundation',
+    'winrt._winrt_windows_foundation_collections', 'winrt._winrt_windows_media',
+    'winrt._winrt_windows_media_interop', 'winrt._winrt_windows_storage_streams',
+]
+transport_datas = []
+for dependency, expected_version in transport_distributions.items():
+    if distribution_version(dependency) != expected_version:
+        raise RuntimeError(f"Native transport build preflight failed: {dependency} version")
+    transport_datas += copy_metadata(dependency)
+# The projection wheels omit their MIT text, so metadata alone is insufficient.
+transport_datas += [
+    ('licenses/PYWINRT-3.2.1-MIT.txt', 'licenses'),
+    ('licenses/TYPING-EXTENSIONS-4.16.0-LICENSE.txt', 'licenses'),
+]
 
 
 windows_version_info = VSVersionInfo(
@@ -67,7 +95,7 @@ a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[(str(acquisition.runtime_path), 'acquisition')],
-    datas=[('assets', 'assets'), *acquisition_datas],
+    datas=[('assets', 'assets'), *acquisition_datas, *transport_datas],
     hiddenimports=[
         'yt_dlp',
         'mutagen.id3',
@@ -76,7 +104,7 @@ a = Analysis(
         'music_vault.metadata.providers.discogs',
         'music_vault.metadata.discogs_artwork',
         'tools.dev.verify_acquisition',
-    ] + collect_submodules('yt_dlp_ejs'),
+    ] + collect_submodules('yt_dlp_ejs') + transport_imports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -62,3 +62,20 @@ Discogs metadata and artwork.
 
 This application uses Discogs’ API but is not affiliated with, sponsored or
 endorsed by Discogs. “Discogs” is a trademark of Zink Media, LLC.
+
+## V1.1 development: Windows transport controls
+
+The development EXE includes the six PyWinRT 3.2.1 runtime/projection packages
+for Foundation, Foundation.Collections, Media, Media.Interop and Storage.Streams.
+Their complete [MIT notice](licenses/PYWINRT-3.2.1-MIT.txt) is retained from
+upstream commit `21cbd0fd7ff91422ed76b4e3611d3fb52716e017`, including the
+Microsoft and David Lechner copyright notices. The dependency
+`typing_extensions` 4.16.0 retains its complete
+[license text](licenses/TYPING-EXTENSIONS-4.16.0-LICENSE.txt). Both texts are
+included with the development EXE; Windows itself supplies the system media
+and taskbar services. Music Vault's source license remains MIT.
+
+These additions do not change the immutable v1.0.0 package or its corresponding
+source. A public V1.1 package still requires a fresh complete binary inventory,
+source-compliance review and release verification, including the newer
+acquisition dependencies. Development build success is not publication approval.

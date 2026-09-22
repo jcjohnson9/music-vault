@@ -124,6 +124,7 @@ from music_vault.core.navigation import Route
 from music_vault.core.queue_editor import ManualQueueEditor
 from music_vault.ui.track_list import TrackTableView
 from music_vault.ui.listening_controller import ListeningController
+from music_vault.ui.windows_transport import WindowsTransportController
 from music_vault.core.runtime_policy import RuntimePolicy
 from music_vault.core.playback_state import (
     DEFAULT_VOLUME_PERCENT,
@@ -565,6 +566,7 @@ class MusicVaultWindow(QMainWindow):
         self.load_playlists()
         self.refresh_settings_status()
         self.on_multi_source_status_transition({})
+        self.windows_transport = WindowsTransportController(self)
         if self.runtime_policy.background_provider_work_allowed:
             QTimer.singleShot(0, self.wake_metadata_intelligence)
 
@@ -4120,6 +4122,9 @@ class MusicVaultWindow(QMainWindow):
         return True
 
     def set_cover_art(self, cover_path: str | None) -> None:
+        transport = getattr(self, "windows_transport", None)
+        if transport is not None:
+            transport.invalidate_metadata()
         if cover_path and Path(cover_path).exists():
             pixmap = QPixmap(cover_path)
 
@@ -4284,6 +4289,9 @@ class MusicVaultWindow(QMainWindow):
 
 
     def update_queue_label(self) -> None:
+        transport = getattr(self, "windows_transport", None)
+        if transport is not None:
+            transport.schedule_update()
         if hasattr(self, "queue_label"):
             self.queue_label.setText(f"Q: {len(self.manual_queue)}")
         party_window = getattr(self, "party_mode_window", None)
@@ -6063,6 +6071,11 @@ class MusicVaultWindow(QMainWindow):
                     "No later source will start.",
                 )
             event.ignore()
+            return
+        transport = getattr(self, "windows_transport", None)
+        if transport is not None and not transport.close():
+            event.ignore()
+            QTimer.singleShot(100, self.close)
             return
         if self.party_mode_window is not None:
             try:

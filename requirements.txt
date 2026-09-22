@@ -9,3 +9,11 @@ deno==2.9.5
 brotli==1.2.0
 pycryptodomex==3.23.0
 websockets==17.1
+# Optional native Windows media surfaces over the existing Qt player.
+winrt-runtime==3.2.1; sys_platform == 'win32'
+winrt-Windows.Foundation==3.2.1; sys_platform == 'win32'
+winrt-Windows.Foundation.Collections==3.2.1; sys_platform == 'win32'
+winrt-Windows.Media==3.2.1; sys_platform == 'win32'
+winrt-Windows.Media.Interop==3.2.1; sys_platform == 'win32'
+winrt-Windows.Storage.Streams==3.2.1; sys_platform == 'win32'
+typing_extensions==4.16.0; sys_platform == 'win32'

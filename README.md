@@ -67,6 +67,14 @@ or a new addition expires Undo. “Add to queue” appends in FIFO order, and th
 original playback context resumes after queued tracks finish. Search and
 navigation do not start synchronization or metadata-provider work.
 
+Windows taskbar Previous / Play-Pause / Next and the Windows media surface use
+the same player and captured queue context. Native Play/Pause never starts an
+unselected track from an empty player. Canonical Now Playing metadata and bounded
+in-memory artwork follow playback, not the browsed page. Hardware media commands
+use the Windows media session; if unavailable, foreground media-key fallback
+does not take over volume keys. Other platforms keep ordinary in-app playback.
+These development controls are not part of the immutable v1.0.0 download.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
