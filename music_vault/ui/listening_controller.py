@@ -27,6 +27,7 @@ from music_vault.ui.media_grid import MediaRole
 DESTINATIONS = {
     "library": "Library", "albums": "Albums", "artists": "Artists",
     "recent": "Recently Added", "downloaded": "Downloaded",
+    "liked": "Liked Tracks", "recently_played": "Recently Played", "rediscover": "Rediscover",
     "sync": "Sync Center", "settings": "Settings",
 }
 
@@ -195,6 +196,9 @@ class ListeningController(QObject):
         self._browser_restore = state if route.kind in {"albums", "artists"} else None
         self.restoring = True
         try:
+            collections = getattr(host, "listening_library", None)
+            if collections is not None:
+                collections.update_controls(route.kind)
             if route.kind not in {"sync", "settings"}:
                 self.content_route = route
                 host.current_view_kind = route.kind
@@ -287,7 +291,10 @@ class ListeningController(QObject):
 
     def search_index(self):
         conn = self.host.db.conn
-        stamp = (conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0])
+        # Listening checkpoints are not library/identity changes. Retain the
+        # conservative invalidation for other writes and external connections.
+        store = getattr(self.host.db, "listening", None)
+        stamp = (conn.total_changes - getattr(store, "write_count", 0), conn.execute("PRAGMA data_version").fetchone()[0])
         if self._index is not None and stamp == self._index_stamp:
             return self._index
         entities = [SearchEntity(
@@ -301,7 +308,7 @@ class ListeningController(QObject):
         entities.extend(SearchEntity("artist", item.browser_key, item.display_name, f"{item.track_count} tracks", payload=Route("artist_tracks", entity_key=item.key, label=item.display_name)) for item in self._artists)
         entities.extend(SearchEntity("playlist", str(row["id"]), row["name"], "Playlist", payload=Route("custom", int(row["id"]), label=row["name"])) for row in self.host.db.list_playlists())
         entities.extend(SearchEntity("action", kind, label, "Open view", payload=Route(kind, label=label)) for kind, label in DESTINATIONS.items())
-        entities.extend(SearchEntity("action", key, label, "Playback action") for key, label in (("play_pause", "Play / pause"), ("next", "Next track"), ("previous", "Previous track"), ("queue", "Open queue"), ("party", "Toggle Party Mode")))
+        entities.extend(SearchEntity("action", key, label, "Playback action") for key, label in (("play_pause", "Play / pause"), ("next", "Next track"), ("previous", "Previous track"), ("queue", "Open queue"), ("party", "Toggle Party Mode"), ("history", "Listening history")))
         self._index = LocalSearchIndex(entities)
         self._index_stamp = stamp
         return self._index
@@ -309,6 +316,9 @@ class ListeningController(QObject):
     def open_search(self, _checked=False, *, query=""):
         dialog = QuickSearchDialog(self.search_index(), self.host)
         dialog.action_requested.connect(self.search_action)
+        collections = getattr(self.host, "listening_library", None)
+        if collections is not None:
+            dialog.favorite_lookup = collections.store.is_favorite
         if query:
             dialog.query_edit.setText(query)
         dialog.exec()
@@ -322,6 +332,9 @@ class ListeningController(QObject):
             "queue": self.open_queue, "search": self.open_search,
             "back": self.back, "forward": self.forward,
         }
+        collections = getattr(host, "listening_library", None)
+        if collections is not None:
+            callbacks["history"] = collections.open_history
         callback = callbacks.get(action)
         if callback is not None:
             callback()
@@ -333,14 +346,7 @@ class ListeningController(QObject):
         if self._index is not None:
             self._index.mark_used(entity.kind, entity.key)
         if action == "play_track" and entity.track_id is not None:
-            if host.play_track_by_id(entity.track_id, capture_base_context=False):
-                host.base_playback_context = {
-                    "kind": "search", "playlist_id": None,
-                    "playlist_name": "Search results", "track_ids": list(ordered_ids),
-                    "current_track_id": entity.track_id,
-                    "route": Route("search", entity_key=tuple(ordered_ids), label="Search results"),
-                }
-                self.refresh_queue()
+            self.play_explicit_context(entity.track_id, ordered_ids, "Search results")
         elif action == "queue_track" and entity.track_id is not None:
             host.queue_track_by_id(entity.track_id)
         elif action in {"open_entity", "invoke_action"}:
@@ -350,8 +356,31 @@ class ListeningController(QObject):
                 self.dispatch(entity.key)
         elif action == "add_to_playlist" and entity.track_id is not None:
             host.add_track_to_playlist_by_id(entity.track_id)
+        elif action == "toggle_favorite" and entity.track_id is not None:
+            host.listening_library.toggle_favorite(entity.track_id)
         elif action in {"go_artist", "go_album"} and entity.track_id is not None:
             self._go_related(entity.track_id, action == "go_artist")
+
+    def play_explicit_context(self, track_id, ordered_ids, label):
+        """Capture context before synchronous Qt source/position notifications."""
+        host = self.host
+        previous = host.base_playback_context
+        ids = tuple(dict.fromkeys(ordered_ids))
+        host.base_playback_context = {
+            "kind": "search", "playlist_id": None,
+            "playlist_name": label, "track_ids": list(ids),
+            "current_track_id": track_id,
+            "route": Route("search", entity_key=ids, label=label),
+        }
+        try:
+            played = host.play_track_by_id(track_id, capture_base_context=False)
+        except Exception:
+            host.base_playback_context = previous
+            raise
+        if not played:
+            host.base_playback_context = previous
+        self.refresh_queue()
+        return played
 
     def _go_related(self, track_id, artist):
         row = self.host.db.get_track(track_id)

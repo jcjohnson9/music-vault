@@ -53,6 +53,9 @@ REQUIRED_ICONS: Final[tuple[str, ...]] = (
 )
 
 OPTIONAL_ICONS: Final[tuple[str, ...]] = (
+    "heart",
+    "history",
+    "rediscover",
     "autoplay",
     "chevron-down",
     "music-note",

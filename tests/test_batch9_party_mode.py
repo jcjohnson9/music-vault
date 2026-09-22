@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import struct
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -536,6 +537,20 @@ def test_transport_and_modes_delegate_without_mutating_manual_queue(party_surfac
     window._cycle_repeat()
     assert host.manual_queue == queue_before
     assert window.queue_label.text() == "Q: 2"
+
+
+def test_party_seeks_reset_history_before_small_position_jumps(party_surface):
+    host, window = party_surface
+    calls = []
+    host.listening_history = SimpleNamespace(before_seek=lambda: calls.append(("seek", host.player.position())))
+    host.player.positionChanged.connect(lambda value: calls.append(("position", value)))
+    assert window.seek_relative(100) == 30100
+    assert calls == [("seek", 30000), ("position", 30100)]
+    calls.clear()
+    window.progress_slider.setRange(0, host.player.duration())
+    window.progress_slider.setValue(30200)
+    window._seek_from_slider()
+    assert calls == [("seek", 30100), ("position", 30200)]
 
 
 def test_audio_features_drive_capability_and_fall_back_when_stale(party_surface) -> None:
