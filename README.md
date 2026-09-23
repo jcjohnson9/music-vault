@@ -224,6 +224,12 @@ except the restrained four-beat Pulse, while a smooth beat clock turns transient
 analysis into phrase-scale motion. Party Mode reuses the existing player,
 output, queue, playback context, volume, and transport behavior.
 
+The V1.1 visual refinement combines dimensional glass orbs with choreographed
+comet-and-crown fireworks. Artwork influences a perceptually blended palette
+over a neutral dark stage. Particle/trail budgets stay bounded, and visible
+lyrics and controls are protected. Reduced-motion and paused/hidden behavior
+remain part of the same renderer; no extra playback engine is introduced.
+
 Lyrics are Off by default and appear in a separate overlay directly above the
 playback bar. Local/manual, adjacent, embedded, and cached sources are checked
 before an optional consent-gated LRCLIB lookup. Synchronized lyrics follow the

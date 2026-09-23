@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import math
 from pathlib import Path
@@ -67,6 +68,77 @@ def _linear_channel(value: int) -> float:
     if component <= 0.04045:
         return component / 12.92
     return ((component + 0.055) / 1.055) ** 2.4
+
+
+def _finite(value: object, fallback: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return result if math.isfinite(result) else fallback
+
+
+def rgb_to_oklch(color: RGB) -> tuple[float, float, float]:
+    """sRGB to perceptual lightness/chroma/hue (hue in degrees)."""
+    r, g, b = (_linear_channel(value) for value in normalize_color(color))
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    lightness = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+    a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    b_axis = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+    chroma = math.hypot(a, b_axis)
+    return lightness, chroma, math.degrees(math.atan2(b_axis, a)) % 360 if chroma > 0.0005 else 0.0
+
+
+def oklch_to_rgb(lightness: float, chroma: float, hue: float) -> RGB:
+    """Map OKLCH into sRGB by reducing chroma, never clipping the hue."""
+    lightness = max(0.0, min(1.0, _finite(lightness)))
+    chroma = max(0.0, min(0.4, _finite(chroma)))
+    radians = math.radians(_finite(hue) % 360)
+
+    def linear(c: float) -> tuple[float, float, float]:
+        a, b = c * math.cos(radians), c * math.sin(radians)
+        l = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3
+        m = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3
+        s = (lightness - 0.0894841775 * a - 1.2914855480 * b) ** 3
+        return (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+                -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+    channels = linear(chroma)
+    if not all(-1e-8 <= value <= 1.0 + 1e-8 for value in channels):
+        low, high = 0.0, chroma
+        for _ in range(18):
+            middle = (low + high) / 2
+            if all(-1e-8 <= value <= 1.0 + 1e-8 for value in linear(middle)):
+                low = middle
+            else:
+                high = middle
+        channels = linear(low)
+    return tuple(_channel(round(255 * (12.92 * value if value <= 0.0031308
+                                       else 1.055 * value ** (1 / 2.4) - 0.055)))
+                 for value in channels)  # type: ignore[return-value]
+
+
+def interpolate_perceptual_color(start: RGB, end: RGB, amount: float) -> RGB:
+    """Short-arc OKLCH fade; neutral endpoints borrow the chromatic hue."""
+    ratio = max(0.0, min(1.0, _finite(amount)))
+    if ratio == 0:
+        return normalize_color(start)
+    if ratio == 1:
+        return normalize_color(end)
+    l1, c1, h1 = rgb_to_oklch(start)
+    l2, c2, h2 = rgb_to_oklch(end)
+    if c1 < 0.0005:
+        h1 = h2
+    if c2 < 0.0005:
+        h2 = h1
+    # Exactly opposite hues always take the same positive half-circle.
+    delta = (h2 - h1 + 180) % 360 - 180
+    if abs(delta + 180) < 1e-8:
+        delta = 180.0
+    return oklch_to_rgb(l1 + (l2 - l1) * ratio, c1 + (c2 - c1) * ratio, h1 + delta * ratio)
 
 
 def relative_luminance(color: RGB) -> float:
@@ -130,11 +202,11 @@ class ArtworkPalette:
     @classmethod
     def fallback(cls) -> "ArtworkPalette":
         return cls(
-            background=(6, 9, 16),
-            surface=(16, 24, 38),
-            primary=(29, 185, 84),
-            secondary=(58, 111, 196),
-            accent=(139, 92, 246),
+            background=(8, 12, 22),
+            surface=(18, 23, 35),
+            primary=(128, 224, 218),
+            secondary=(168, 156, 240),
+            accent=(241, 226, 200),
             foreground=(248, 249, 255),
         )
 
@@ -161,26 +233,30 @@ DEFAULT_PARTY_PALETTE = ArtworkPalette.fallback()
 def interpolate_palette(
     start: ArtworkPalette, end: ArtworkPalette, amount: float
 ) -> ArtworkPalette:
-    """Interpolate every palette role with deterministic integer rounding."""
+    """Perceptual track transition; retain the six-role colour contract."""
 
     return ArtworkPalette(
-        background=interpolate_color(start.background, end.background, amount),
-        surface=interpolate_color(start.surface, end.surface, amount),
-        primary=interpolate_color(start.primary, end.primary, amount),
-        secondary=interpolate_color(start.secondary, end.secondary, amount),
-        accent=interpolate_color(start.accent, end.accent, amount),
-        foreground=interpolate_color(start.foreground, end.foreground, amount),
+        background=interpolate_perceptual_color(start.background, end.background, amount),
+        surface=interpolate_perceptual_color(start.surface, end.surface, amount),
+        primary=interpolate_perceptual_color(start.primary, end.primary, amount),
+        secondary=interpolate_perceptual_color(start.secondary, end.secondary, amount),
+        accent=interpolate_perceptual_color(start.accent, end.accent, amount),
+        foreground=interpolate_perceptual_color(start.foreground, end.foreground, amount),
     )
 
 
-def _saturation(color: RGB) -> float:
-    high = max(color)
-    low = min(color)
-    return 0.0 if high == 0 else (high - low) / high
-
-
-def _distance(first: RGB, second: RGB) -> float:
-    return math.sqrt(sum((left - right) ** 2 for left, right in zip(first, second)))
+@lru_cache(maxsize=128)
+def palette_for_preset(palette: ArtworkPalette, preset: str) -> ArtworkPalette:
+    """Apply the chosen A-orbs/B-fireworks art direction, retaining cover hue."""
+    if preset == "orb_cluster":
+        targets = ((128, 224, 218), (168, 156, 240), (241, 226, 200))
+    elif preset == "fireworks":
+        targets = ((102, 179, 255), (246, 189, 103), (232, 140, 170))
+    else:
+        return palette
+    lights = [ensure_contrast(interpolate_perceptual_color(source, target, strength), palette.background, 3.0)
+              for source, target, strength in zip((palette.primary, palette.secondary, palette.accent), targets, (0.72, 0.80, 0.82))]
+    return ArtworkPalette(palette.background, palette.surface, *lights, palette.foreground)
 
 
 def _fit_size(size: QSize) -> QSize:
@@ -331,39 +407,26 @@ class PaletteExtractor:
                 (weight, (_channel(red // weight), _channel(green // weight), _channel(blue // weight)))
             )
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        dominant = ranked[0][1]
-
-        candidates = [
-            (weight, color)
-            for weight, color in ranked
-            if _saturation(color) >= 0.12 and 0.07 <= relative_luminance(color) <= 0.86
-        ] or ranked
-        candidates.sort(
-            key=lambda item: (
-                -(_saturation(item[1]) * math.sqrt(item[0])),
-                -item[0],
-                item[1],
-            )
-        )
-
-        primary = candidates[0][1]
-        secondary = next(
-            (color for _, color in candidates[1:] if _distance(color, primary) >= 72.0),
-            interpolate_color(primary, (35, 214, 191), 0.58),
-        )
-        accent = next(
-            (
-                color
-                for _, color in candidates[1:]
-                if _distance(color, primary) >= 88.0 and _distance(color, secondary) >= 64.0
-            ),
-            interpolate_color(primary, (255, 75, 151), 0.62),
-        )
-
-        background = interpolate_color(dominant, (5, 7, 14), 0.78)
-        if relative_luminance(background) > 0.10:
-            background = interpolate_color(background, (3, 5, 10), 0.52)
-        surface = interpolate_color(background, dominant, 0.24)
+        candidates = [(weight, color, rgb_to_oklch(color)) for weight, color in ranked]
+        candidates = [item for item in candidates if item[2][1] >= 0.035 and 0.20 <= item[2][0] <= 0.94]
+        candidates.sort(key=lambda item: (-item[2][1] * math.sqrt(item[0]), -item[0], item[1]))
+        if candidates:
+            _, _, (_, chroma, hue) = candidates[0]
+            chroma = max(0.10, min(0.16, chroma))
+            secondary_hue = next((lch[2] for _, _, lch in candidates[1:]
+                                  if abs((lch[2] - hue + 180) % 360 - 180) >= 55), (hue + 85) % 360)
+            accent_hue = (hue + 155) % 360
+        else:
+            # Achromatic and near-black covers have no trustworthy hue. Use a
+            # deliberate light family rather than amplifying brown/gray noise.
+            hue, secondary_hue, accent_hue, chroma = 185.0, 300.0, 85.0, 0.12
+        primary = oklch_to_rgb(0.79, chroma, hue)
+        secondary = oklch_to_rgb(0.76, 0.12, secondary_hue)
+        accent = oklch_to_rgb(0.85, 0.075, accent_hue)
+        # Artwork colours the lights, not the stage: almost-neutral ink remains
+        # dark even for white, skin-tone or highly saturated covers.
+        background = oklch_to_rgb(0.14, 0.008, 265.0)
+        surface = oklch_to_rgb(0.205, 0.012, 265.0)
         primary = ensure_contrast(primary, background, 3.0)
         secondary = ensure_contrast(secondary, background, 3.0)
         accent = ensure_contrast(accent, background, 3.0)
@@ -389,5 +452,9 @@ __all__ = [
     "ensure_contrast",
     "interpolate_color",
     "interpolate_palette",
+    "interpolate_perceptual_color",
+    "oklch_to_rgb",
+    "rgb_to_oklch",
+    "palette_for_preset",
     "relative_luminance",
 ]

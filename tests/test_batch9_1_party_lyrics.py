@@ -640,7 +640,7 @@ def test_visible_lyrics_geometry_protects_fireworks_and_clears_when_hidden(
         qapp.processEvents()
 
         protected = window.canvas.firework_protected_rects
-        assert len(protected) == 1
+        assert len(protected) == 3  # Lyrics plus visible transport/top controls.
         left, top, right, bottom = protected[0]
         panel_top_left = window.lyrics_panel.mapTo(
             window.canvas, window.lyrics_panel.rect().topLeft()
@@ -659,14 +659,16 @@ def test_visible_lyrics_geometry_protects_fireworks_and_clears_when_hidden(
         window._lyrics_settings["party_mode_lyrics_enabled"] = False
         window._position_lyrics_panel()
         assert window.lyrics_panel.isHidden()
-        assert window.canvas.firework_protected_rects == ()
+        assert protected[0] not in window.canvas.firework_protected_rects
+        assert len(window.canvas.firework_protected_rects) == 2
 
         window._lyrics_settings["party_mode_lyrics_enabled"] = True
         window._position_lyrics_panel()
         assert window.canvas.firework_protected_rects
         window.toggle_help()
         assert window.lyrics_panel.isHidden()
-        assert window.canvas.firework_protected_rects == ()
+        assert protected[0] not in window.canvas.firework_protected_rects
+        assert len(window.canvas.firework_protected_rects) == 3
     finally:
         window.shutdown()
         host.close()

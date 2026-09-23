@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import random
 from typing import Any, Final
@@ -18,6 +18,7 @@ from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetricsF,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -34,6 +35,7 @@ from music_vault.ui.party_palette import (
     DEFAULT_PARTY_PALETTE,
     RGB,
     interpolate_color,
+    palette_for_preset,
 )
 
 
@@ -59,6 +61,7 @@ MAX_PARTICLES: Final[int] = 420
 MAX_ORBS: Final[int] = 200
 MAX_FIREWORK_PARTICLES: Final[int] = 156
 MAX_FIREWORK_BURSTS: Final[int] = 3
+MAX_FIREWORK_TRAIL_POINTS: Final[int] = 14
 MAX_BEAT: Final[float] = 0.88
 MAX_BRIGHTNESS: Final[float] = 0.84
 BASE_ARTWORK_SCALE: Final[float] = 0.30
@@ -171,6 +174,8 @@ class FireworkParticleState:
     opacity: float
     brightness: float
     color_index: int
+    trail: tuple[tuple[float, float], ...] = ()
+    phase: str = "crown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +245,23 @@ class _FireworkParticle:
     age: float
     lifetime: float
     color_index: int
+    trail: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=MAX_FIREWORK_TRAIL_POINTS)
+    )
+    trail_elapsed: float = 0.0
+
+
+@dataclass(slots=True)
+class _FireworkLaunch:
+    burst_id: int
+    x: float
+    y: float
+    age: float = 0.0
+    duration: float = 0.68
+    trail: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=MAX_FIREWORK_TRAIL_POINTS)
+    )
+    trail_elapsed: float = 0.0
 
 
 def _finite_unit(value: object, default: float = 0.0, cap: float = 1.0) -> float:
@@ -439,10 +461,12 @@ class OrbClusterSimulation:
                     radius=self._random.uniform(0.91, 1.08),
                     size=self._random.uniform(0.72, 1.30),
                     opacity=self._random.uniform(0.56, 0.92),
-                    color_index=self._random.randrange(3),
+                    color_index=self._random.choices((0, 1, 2), (6, 3, 1))[0],
                     color_phase=self._random.random(),
                 )
             )
+        # Every quality prefix samples the whole sphere, not its upper cap.
+        self._random.shuffle(orbs)
         return orbs
 
     def reset(self) -> None:
@@ -514,17 +538,18 @@ class OrbClusterSimulation:
             size = orb.size * perspective * (1.0 + (orb.accent * 0.045))
             opacity = min(
                 0.86,
-                orb.opacity * (0.40 + (normalized_depth * 0.48)) + (orb.accent * 0.06),
+                (0.36 + normalized_depth**0.70 * 0.50) * (0.90 + orb.opacity * 0.10)
+                + orb.accent * 0.035,
             )
             projected.append(
                 OrbState(
-                    x=0.5 + (rotated_x * radius_scale * perspective * 0.255),
-                    y=0.47 + (rotated_y * radius_scale * perspective * 0.255),
+                    x=0.5 + (rotated_x * radius_scale * perspective * 0.35),
+                    y=0.43 + (rotated_y * radius_scale * perspective * 0.285),
                     depth=max(0.0, min(1.0, normalized_depth)),
                     size=size,
                     opacity=max(0.0, opacity),
                     color_index=orb.color_index,
-                    color_mix=(orb.color_phase + (motion.beat_position / 48.0)) % 1.0,
+                    color_mix=orb.color_phase,
                     accent=orb.accent,
                 )
             )
@@ -533,24 +558,27 @@ class OrbClusterSimulation:
 
 
 class FireworksSimulation:
-    """Bounded intermittent bursts with drag, gravity, fade, and cleanup."""
+    """Beat-led comets, radial crowns and falling embers; no second clock."""
 
     def __init__(self, *, seed: int = 0) -> None:
         self.seed = int(seed)
         self._random = random.Random(self.seed)
-        self._schedule_random = random.Random(self.seed + 1)
         self._particles: list[_FireworkParticle] = []
+        self._launches: list[_FireworkLaunch] = []
         self._next_burst_id = 1
         self._next_firework_beat: int | None = None
         self._protected_rects: tuple[NormalizedRect, ...] = ()
 
     @property
     def live_particle_count(self) -> int:
-        return len(self._particles)
+        return len(self._particles) + len(self._launches)
 
     @property
     def active_burst_count(self) -> int:
-        return len({particle.burst_id for particle in self._particles})
+        return len(
+            {particle.burst_id for particle in self._particles}
+            | {launch.burst_id for launch in self._launches}
+        )
 
     @property
     def protected_rects(self) -> tuple[NormalizedRect, ...]:
@@ -564,8 +592,8 @@ class FireworksSimulation:
 
     def reset(self) -> None:
         self._random.seed(self.seed)
-        self._schedule_random.seed(self.seed + 1)
         self._particles.clear()
+        self._launches.clear()
         self._next_burst_id = 1
         self._next_firework_beat = None
 
@@ -575,12 +603,31 @@ class FireworksSimulation:
         return max(0, self._next_firework_beat - max(0, int(total_beat_count)))
 
     def _safe_center(self) -> tuple[float, float]:
-        for _ in range(24):
-            x = self._random.uniform(0.08, 0.92)
-            y = self._random.uniform(0.10, 0.64)
+        # A composed left/right/upper-stage conversation, not arbitrary flashes.
+        centers = ((0.18, 0.30), (0.82, 0.26), (0.50, 0.12))
+        for offset in range(len(centers)):
+            cx, cy = centers[(self._next_burst_id - 1 + offset) % len(centers)]
+            x = cx + self._random.uniform(-0.025, 0.025)
+            y = cy + self._random.uniform(-0.018, 0.018)
             if is_safe_firework_position(x, y, self._protected_rects):
                 return x, y
         return (0.18, 0.30)
+
+    @staticmethod
+    def _burst_color(burst_id: int) -> int:
+        # One coherent hue per crown; the rose accent remains genuinely rare.
+        return (0, 1, 0, 0, 1, 0, 2)[(burst_id - 1) % 7]
+
+    def _trim_to_budget(self, maximum_bursts: int, maximum_particles: int) -> None:
+        ids = sorted(
+            {particle.burst_id for particle in self._particles}
+            | {launch.burst_id for launch in self._launches}
+        )[:maximum_bursts]
+        self._launches = [launch for launch in self._launches if launch.burst_id in ids]
+        self._particles = [p for p in self._particles if p.burst_id in ids][
+            : max(0, maximum_particles - len(self._launches))
+        ]
+        self._launches = self._launches[:maximum_particles]
 
     def spawn(
         self,
@@ -590,10 +637,11 @@ class FireworksSimulation:
         maximum_particles: int,
         reduced_motion: bool,
         center: tuple[float, float] | None = None,
+        _burst_id: int | None = None,
     ) -> bool:
         max_bursts = max(1, min(MAX_FIREWORK_BURSTS, int(maximum_bursts)))
         max_particles = max(1, min(MAX_FIREWORK_PARTICLES, int(maximum_particles)))
-        if self.active_burst_count >= max_bursts or len(self._particles) >= max_particles:
+        if self.active_burst_count >= max_bursts or self.live_particle_count >= max_particles:
             return False
         x, y = center if center is not None else self._safe_center()
         if not is_safe_firework_position(x, y, self._protected_rects):
@@ -601,9 +649,10 @@ class FireworksSimulation:
         requested = max(4, min(64, int(particles_per_burst)))
         if reduced_motion:
             requested = max(4, math.ceil(requested * 0.42))
-        count = min(requested, max_particles - len(self._particles))
-        burst_id = self._next_burst_id
-        self._next_burst_id += 1
+        count = min(requested, max_particles - self.live_particle_count)
+        burst_id = self._next_burst_id if _burst_id is None else _burst_id
+        if _burst_id is None:
+            self._next_burst_id += 1
         speed_scale = 0.56 if reduced_motion else 1.0
         phase_offset = self._random.random() * math.tau
         for index in range(count):
@@ -619,7 +668,8 @@ class FireworksSimulation:
                     size=self._random.uniform(0.65, 1.25),
                     age=0.0,
                     lifetime=self._random.uniform(1.35, 2.15) * (0.72 if reduced_motion else 1.0),
-                    color_index=self._random.randrange(3),
+                    color_index=self._burst_color(burst_id),
+                    trail=deque(((x, y),), maxlen=MAX_FIREWORK_TRAIL_POINTS),
                 )
             )
         return True
@@ -634,29 +684,75 @@ class FireworksSimulation:
         maximum_particles: int,
         reduced_motion: bool,
         total_beat_count: int | None = None,
+        energy: float = 0.5,
     ) -> tuple[FireworkParticleState, ...]:
+        delta = max(0.0, min(0.25, float(delta)))
+        max_bursts = max(1, min(MAX_FIREWORK_BURSTS, int(maximum_bursts)))
+        max_particles = max(1, min(MAX_FIREWORK_PARTICLES, int(maximum_particles)))
+        if reduced_motion:
+            self._launches.clear()
+            max_bursts = 1
+            max_particles = min(max_particles, max(4, math.ceil(particles_per_burst * 0.42)))
+        self._trim_to_budget(max_bursts, max_particles)
         scheduled = False
         beat_count = None if total_beat_count is None else max(0, int(total_beat_count))
         if beat_count is not None:
-            if self._next_firework_beat is None:
-                self._next_firework_beat = (
-                    beat_count + self._schedule_random.randint(1, 64)
-                )
+            if self._next_firework_beat is None or _finite_unit(energy) < 0.08:
+                self._next_firework_beat = beat_count + 1
             scheduled = beat_count >= self._next_firework_beat
         if trigger or scheduled:
-            spawned = self.spawn(
-                particles_per_burst=particles_per_burst,
-                maximum_bursts=maximum_bursts,
-                maximum_particles=maximum_particles,
-                reduced_motion=reduced_motion,
-            )
+            spawned = False
+            if _finite_unit(energy) >= 0.08:
+                if reduced_motion or trigger:
+                    spawned = self.spawn(
+                        particles_per_burst=particles_per_burst,
+                        maximum_bursts=max_bursts,
+                        maximum_particles=max_particles,
+                        reduced_motion=reduced_motion,
+                    )
+                elif self.active_burst_count < max_bursts and self.live_particle_count < max_particles:
+                    x, y = self._safe_center()
+                    if is_safe_firework_position(x, y, self._protected_rects):
+                        self._launches.append(_FireworkLaunch(self._next_burst_id, x, y))
+                        self._next_burst_id += 1
+                        spawned = True
             if scheduled and beat_count is not None:
-                interval = self._schedule_random.randint(1, 64) if spawned else 1
-                self._next_firework_beat = beat_count + interval
+                interval = 8 if reduced_motion or _finite_unit(energy) < 0.30 else 4
+                self._next_firework_beat = (
+                    ((beat_count // interval) + 1) * interval if spawned else beat_count + 1
+                )
+        # A launch reserves one particle and one burst slot, then hands the same
+        # identity to its crown. Its path is finite; nothing accumulates on canvas.
+        states: list[FireworkParticleState] = []
+        for launch in tuple(self._launches):
+            launch.age += delta
+            progress = min(1.0, launch.age / launch.duration)
+            if progress >= 1.0:
+                self._launches.remove(launch)
+                self.spawn(
+                    particles_per_burst=particles_per_burst,
+                    maximum_bursts=max_bursts,
+                    maximum_particles=max_particles,
+                    reduced_motion=False,
+                    center=(launch.x, launch.y),
+                    _burst_id=launch.burst_id,
+                )
+                continue
+            eased = 1.0 - (1.0 - progress) ** 1.45
+            x = launch.x - 0.055 * (1.0 - progress)
+            y = 0.86 + (launch.y - 0.86) * eased
+            launch.trail_elapsed += delta
+            if launch.trail_elapsed >= 1.0 / 30.0 or not launch.trail:
+                launch.trail.append((x, y))
+                launch.trail_elapsed %= 1.0 / 30.0
+            states.append(FireworkParticleState(
+                launch.burst_id, x, y, 0.055 / launch.duration,
+                (launch.y - 0.86) / launch.duration, 0.95, 0.68, 0.76,
+                self._burst_color(launch.burst_id), tuple(launch.trail), "comet",
+            ))
         drag = math.exp(-1.05 * delta)
         gravity = 0.105 if reduced_motion else 0.145
         live: list[_FireworkParticle] = []
-        states: list[FireworkParticleState] = []
         for particle in self._particles[:MAX_FIREWORK_PARTICLES]:
             particle.age += delta
             particle.velocity_x *= drag
@@ -667,7 +763,13 @@ class FireworksSimulation:
             if life <= 0.0 or particle.y > 1.08 or particle.x < -0.08 or particle.x > 1.08:
                 continue
             live.append(particle)
-            opacity = max(0.0, min(0.78, (life**1.45) * 0.78))
+            particle.trail_elapsed += delta
+            # Fourteen points cover a useful crown arc (~1.1 seconds), rather
+            # than just its last few dim tips. This stays bounded at every FPS.
+            if particle.trail_elapsed >= 0.08:
+                particle.trail.append((particle.x, particle.y))
+                particle.trail_elapsed %= 0.08
+            opacity = max(0.0, min(0.78, (life**0.65) * 0.78))
             states.append(
                 FireworkParticleState(
                     burst_id=particle.burst_id,
@@ -679,6 +781,8 @@ class FireworksSimulation:
                     opacity=opacity,
                     brightness=min(0.82, 0.36 + (life * 0.46)),
                     color_index=particle.color_index,
+                    trail=tuple(particle.trail)[-4:] if reduced_motion else tuple(particle.trail),
+                    phase="ember" if life < 0.36 else "crown",
                 )
             )
         self._particles = live
@@ -1036,6 +1140,7 @@ class PartyVisualEngine:
                 total_beat_count=(
                     motion.total_beat_count if self.preset == "fireworks" else None
                 ),
+                energy=energy,
             )
         elif self._fireworks.live_particle_count:
             # Leaving Fireworks clears private simulation state rather than
@@ -1650,18 +1755,17 @@ class PartyCanvas(QWidget):
 
     def _orb_sprite(self, orb: OrbState, diameter: int) -> QPixmap:
         diameter_bucket = max(4, min(64, round(diameter / 4) * 4))
-        mix_bucket = max(0, min(7, round(orb.color_mix * 7)))
-        opacity_bucket = max(1, min(7, round(orb.opacity * 7)))
-        key = (diameter_bucket, orb.color_index % 3, mix_bucket, opacity_bucket)
+        # Material alpha lives in the sprite. Depth is applied once, by the
+        # painter, not baked into another multiplicative opacity bucket.
+        key = (diameter_bucket, orb.color_index % 3, 0, 0)
         cached = self._orb_sprite_cache.get(key)
         if cached is not None:
             return cached
         if len(self._orb_sprite_cache) >= MAX_ORB_SPRITE_CACHE:
             self._orb_sprite_cache.pop(next(iter(self._orb_sprite_cache)))
-        colors = (self._palette.primary, self._palette.secondary, self._palette.accent)
-        start = colors[orb.color_index % len(colors)]
-        end = colors[(orb.color_index + 1) % len(colors)]
-        color = interpolate_color(start, end, mix_bucket / 7.0)
+        palette = palette_for_preset(self._palette, "orb_cluster")
+        colors = (palette.primary, palette.secondary, palette.accent)
+        color = colors[orb.color_index % len(colors)]
         pixmap = QPixmap(diameter_bucket, diameter_bucket)
         pixmap.fill(Qt.GlobalColor.transparent)
         sprite_painter = QPainter(pixmap)
@@ -1672,27 +1776,109 @@ class PartyCanvas(QWidget):
             radius,
             QPointF(radius * 0.58, radius * 0.52),
         )
-        alpha = round((opacity_bucket / 7.0) * 205)
-        highlight = tuple(min(255, channel + 58) for channel in color)
-        rim = tuple(max(0, round(channel * 0.38)) for channel in color)
-        gradient.setColorAt(0.0, _qcolor(highlight, min(220, alpha + 34)))
-        gradient.setColorAt(0.23, _qcolor(color, alpha))
-        gradient.setColorAt(0.72, _qcolor(color, round(alpha * 0.68)))
-        gradient.setColorAt(0.93, _qcolor(rim, round(alpha * 0.52)))
+        highlight = tuple(min(255, round(channel * 0.46 + 138)) for channel in color)
+        rim = tuple(max(0, round(channel * 0.30)) for channel in color)
+        gradient.setColorAt(0.0, _qcolor(highlight, 238))
+        gradient.setColorAt(0.22, _qcolor(color, 236))
+        gradient.setColorAt(0.54, _qcolor(color, 206))
+        gradient.setColorAt(0.83, _qcolor(rim, 224))
+        gradient.setColorAt(0.96, _qcolor(color, 96))
         gradient.setColorAt(1.0, _qcolor(rim, 0))
         sprite_painter.setPen(Qt.PenStyle.NoPen)
         sprite_painter.setBrush(gradient)
         sprite_painter.drawEllipse(QRectF(0.0, 0.0, diameter_bucket, diameter_bucket))
+        sprite_painter.setBrush(Qt.BrushStyle.NoBrush)
+        sprite_painter.setPen(QPen(_qcolor(highlight, 218), max(0.7, diameter_bucket * 0.020)))
+        inset = diameter_bucket * 0.14
+        sprite_painter.drawArc(
+            QRectF(inset, inset, diameter_bucket - 2 * inset, diameter_bucket - 2 * inset),
+            35 * 16, 105 * 16,
+        )
+        sprite_painter.setPen(Qt.PenStyle.NoPen)
+        sprite_painter.setBrush(_qcolor((234, 255, 250), 232))
+        sprite_painter.drawEllipse(
+            QPointF(radius * 0.66, radius * 0.63),
+            max(0.6, radius * 0.08), max(0.5, radius * 0.06),
+        )
         sprite_painter.end()
         self._orb_sprite_cache[key] = pixmap
         return pixmap
+
+    def _center_text_font(
+        self,
+        row_height: float,
+        divisor: int,
+        minimum: int,
+        weight: QFont.Weight = QFont.Weight.Normal,
+    ) -> QFont:
+        """Fit existing center rows at the widget's actual logical DPI.
+
+        Point sizes derived only from viewport height exceed the fixed rows on
+        large displays. Keep those rows and artwork fixed; shrink typography to
+        the available ascent/descent instead. Painting and effect protection
+        deliberately share this calculation.
+        """
+        font = QFont(self.font())
+        font.setWeight(weight)
+        requested = max(minimum, round(min(self.width(), self.height()) / divisor))
+        font.setPointSizeF(float(requested))
+        available = max(1.0, row_height - 4.0)
+        measured = QFontMetricsF(font, self).height()
+        if measured > available:
+            font.setPointSizeF(max(1.0, requested * available / measured))
+            # Hinting can round a proportional estimate up by a pixel.
+            while font.pointSizeF() > 1.0 and QFontMetricsF(font, self).height() > available:
+                font.setPointSizeF(max(1.0, font.pointSizeF() - 0.25))
+        return font
+
+    def _effect_clip_path(self) -> QPainterPath:
+        """Clip complete effect geometry, including trails, halos and pen width.
+
+        Burst-center avoidance alone cannot protect text from a travelling tail.
+        The tiny expansion also keeps antialiased edges outside protected pixels.
+        """
+        width, height = max(1.0, float(self.width())), max(1.0, float(self.height()))
+        allowed = QPainterPath()
+        allowed.addRect(QRectF(0.0, 0.0, width, height))
+        artwork = center_artwork_rect(width, height)
+        rects = [
+            artwork.adjusted(-18.0, -18.0, 18.0, 10.0),
+            QRectF(0.0, 0.0, width * 0.20, height * 0.18),
+            QRectF(width * 0.80, 0.0, width * 0.20, height * 0.18),
+        ]
+        # Match the existing title/artist typography. Protect the actual text,
+        # not an empty full-width band that shears the constellation in half.
+        for text, y_offset, row_height, divisor, minimum, weight in (
+            (self._title, 14.0, 32.0, 55, 10, QFont.Weight.DemiBold),
+            (self._artist or self._album, 46.0, 28.0, 68, 9, QFont.Weight.Normal),
+        ):
+            if not text:
+                continue
+            font = self._center_text_font(row_height, divisor, minimum, weight)
+            text_width = min(max(1.0, width - 80.0), QFontMetricsF(font, self).horizontalAdvance(text))
+            rects.append(QRectF(
+                (width - text_width) / 2.0 - 8.0,
+                artwork.bottom() + y_offset - 4.0, text_width + 16.0, row_height + 8.0,
+            ))
+        rects.extend(
+            QRectF(left * width, top * height, (right - left) * width, (bottom - top) * height)
+            for left, top, right, bottom in self.firework_protected_rects
+        )
+        for rect in rects:
+            protected = QPainterPath()
+            protected.addRect(rect.adjusted(-2.0, -2.0, 2.0, 2.0))
+            allowed = allowed.subtracted(protected)
+        return allowed
 
     def _paint_orb_cluster(self, painter: QPainter, frame: VisualFrame) -> None:
         width = max(1.0, float(self.width()))
         height = max(1.0, float(self.height()))
         span = min(width, height)
+        painter.save()
+        painter.setClipPath(self._effect_clip_path(), Qt.ClipOperation.IntersectClip)
+        transition_opacity = painter.opacity()
         for orb in frame.orbs:
-            diameter = max(4, round(span * 0.0105 * orb.size))
+            diameter = max(4, round(span * (0.010 + 0.042 * orb.depth**2) * orb.size))
             sprite = self._orb_sprite(orb, diameter)
             rendered = diameter * (1.0 + (orb.accent * 0.04))
             rect = QRectF(
@@ -1701,43 +1887,59 @@ class PartyCanvas(QWidget):
                 rendered,
                 rendered,
             )
-            painter.setOpacity(max(0.0, min(0.88, orb.opacity)))
+            painter.setOpacity(transition_opacity * max(0.0, min(0.88, orb.opacity)))
             painter.drawPixmap(rect, sprite, sprite.rect())
-        painter.setOpacity(1.0)
+        painter.restore()
 
     def _paint_fireworks(self, painter: QPainter, frame: VisualFrame) -> None:
         width = max(1.0, float(self.width()))
         height = max(1.0, float(self.height()))
         span = min(width, height)
-        colors = (self._palette.primary, self._palette.secondary, self._palette.accent)
-        painter.setPen(Qt.PenStyle.NoPen)
+        palette = palette_for_preset(self._palette, "fireworks")
+        colors = (palette.primary, palette.secondary, palette.accent)
+        painter.save()
+        painter.setClipPath(self._effect_clip_path(), Qt.ClipOperation.IntersectClip)
         for particle in frame.firework_particles:
-            radius = max(1.0, span * 0.0022 * particle.size)
+            radius = max(0.7, span * 0.0015 * particle.size)
             center = QPointF(particle.x * width, particle.y * height)
             color = colors[particle.color_index % len(colors)]
-            glow = QRadialGradient(center, radius * 2.8)
-            alpha = round(min(0.72, particle.opacity) * 220)
+            alpha = round(min(0.78, particle.opacity) * 250)
+            points = tuple(QPointF(x * width, y * height) for x, y in particle.trail)
+            if len(points) > 1 and not frame.reduced_motion:
+                path = QPainterPath(points[0])
+                for point in points[1:]:
+                    path.lineTo(point)
+                path.lineTo(center)
+                trail_gradient = QLinearGradient(points[0], center)
+                trail_gradient.setColorAt(0.0, _qcolor(color, round(alpha * 0.18)))
+                trail_gradient.setColorAt(0.50, _qcolor(color, round(alpha * 0.80)))
+                trail_gradient.setColorAt(1.0, _qcolor(palette.foreground, alpha))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(_qcolor(color, round(alpha * 0.10)), radius * 3.4))
+                painter.drawPath(path)
+                painter.setPen(QPen(trail_gradient, max(0.7, radius * 0.75)))
+                painter.drawPath(path)
+            glow = QRadialGradient(center, radius * 3.0)
             glow.setColorAt(0.0, _qcolor(color, alpha))
-            glow.setColorAt(0.46, _qcolor(color, round(alpha * 0.68)))
+            glow.setColorAt(0.32, _qcolor(color, round(alpha * 0.52)))
             glow.setColorAt(1.0, _qcolor(color, 0))
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(glow)
-            painter.drawEllipse(center, radius * 2.8, radius * 2.8)
+            painter.drawEllipse(center, radius * 3.0, radius * 3.0)
+            painter.setBrush(_qcolor(palette.foreground, round(alpha * 0.80)))
+            painter.drawEllipse(center, radius * 0.46, radius * 0.46)
+        painter.restore()
 
     def _paint_center(self, painter: QPainter, frame: VisualFrame) -> None:
         width = max(1.0, float(self.width()))
         height = max(1.0, float(self.height()))
         if not self._has_track:
             painter.setPen(_qcolor(self._palette.foreground, 220))
-            title_font = QFont(self.font())
-            title_font.setPointSize(max(20, round(min(width, height) / 24)))
-            title_font.setWeight(QFont.Weight.DemiBold)
-            painter.setFont(title_font)
+            painter.setFont(self._center_text_font(54.0, 24, 20, QFont.Weight.DemiBold))
             center_rect = QRectF(40.0, (height / 2.0) - 58.0, width - 80.0, 54.0)
             painter.drawText(center_rect, Qt.AlignmentFlag.AlignCenter, "Music Vault")
             painter.setPen(_qcolor(self._palette.foreground, 145))
-            body_font = QFont(self.font())
-            body_font.setPointSize(max(10, round(min(width, height) / 58)))
-            painter.setFont(body_font)
+            painter.setFont(self._center_text_font(40.0, 58, 10))
             painter.drawText(
                 QRectF(40.0, (height / 2.0) + 4.0, width - 80.0, 40.0),
                 Qt.AlignmentFlag.AlignCenter,
@@ -1772,10 +1974,7 @@ class PartyCanvas(QWidget):
 
         if self._title:
             painter.setPen(_qcolor(self._palette.foreground, 230))
-            font = QFont(self.font())
-            font.setPointSize(max(10, round(min(width, height) / 55)))
-            font.setWeight(QFont.Weight.DemiBold)
-            painter.setFont(font)
+            painter.setFont(self._center_text_font(32.0, 55, 10, QFont.Weight.DemiBold))
             title = painter.fontMetrics().elidedText(
                 self._title,
                 Qt.TextElideMode.ElideRight,
@@ -1794,9 +1993,7 @@ class PartyCanvas(QWidget):
         detail = self._artist or self._album
         if detail:
             painter.setPen(_qcolor(self._palette.foreground, 150))
-            font = QFont(self.font())
-            font.setPointSize(max(9, round(min(width, height) / 68)))
-            painter.setFont(font)
+            painter.setFont(self._center_text_font(28.0, 68, 9))
             detail = painter.fontMetrics().elidedText(
                 detail,
                 Qt.TextElideMode.ElideRight,

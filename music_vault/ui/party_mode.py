@@ -494,6 +494,7 @@ class PartyModeWindow(QMainWindow):
         self.overlay_animation = QPropertyAnimation(effect, b"opacity", self)
         self.overlay_animation.setDuration(180)
         self.overlay_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.overlay_animation.finished.connect(self._update_firework_lyrics_protection)
         stack.addWidget(self.overlay)
 
         self.help_panel = QFrame(root)
@@ -742,6 +743,7 @@ class PartyModeWindow(QMainWindow):
             self.overlay_animation.start()
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self._restart_overlay_timer()
+        self._update_firework_lyrics_protection()
 
     def hide_overlay(self) -> None:
         if self._help_visible:
@@ -756,6 +758,7 @@ class PartyModeWindow(QMainWindow):
             self.overlay_animation.start()
         self.setCursor(QCursor(Qt.CursorShape.BlankCursor))
         self.overlay_timer.stop()
+        self._update_firework_lyrics_protection()
 
     def toggle_overlay(self) -> None:
         if self._overlay_visible:
@@ -1273,29 +1276,43 @@ class PartyModeWindow(QMainWindow):
         self._update_firework_lyrics_protection()
 
     def _update_firework_lyrics_protection(self) -> None:
-        """Keep firework burst centers outside the visible lyrics overlay."""
+        """Protect actual lyrics/control geometry, including overlay fades."""
 
         panel = getattr(self, "lyrics_panel", None)
         canvas = getattr(self, "canvas", None)
         if panel is None or canvas is None:
             return
-        if not panel.isVisible() or canvas.width() <= 0 or canvas.height() <= 0:
+        if not self.isVisible() or canvas.width() <= 0 or canvas.height() <= 0:
             canvas.set_firework_protected_rects(())
             return
-        top_left = panel.mapTo(canvas, panel.rect().topLeft())
         padding = 12
         canvas_width = float(canvas.width())
         canvas_height = float(canvas.height())
-        canvas.set_firework_protected_rects(
-            (
-                (
-                    (top_left.x() - padding) / canvas_width,
-                    (top_left.y() - padding) / canvas_height,
-                    (top_left.x() + panel.width() + padding) / canvas_width,
-                    (top_left.y() + panel.height() + padding) / canvas_height,
-                ),
+        protected = []
+
+        def rectangle(widget):
+            top_left = widget.mapTo(canvas, widget.rect().topLeft())
+            return (
+                (top_left.x() - padding) / canvas_width,
+                (top_left.y() - padding) / canvas_height,
+                (top_left.x() + widget.width() + padding) / canvas_width,
+                (top_left.y() + widget.height() + padding) / canvas_height,
             )
-        )
+
+        if panel.isVisible():
+            protected.append(rectangle(panel))
+        if self.help_panel.isVisible():
+            protected.append(rectangle(self.help_panel))
+        if self._overlay_visible or self.overlay_effect.opacity() > 0.0:
+            protected.append(rectangle(self.controls_panel))
+            # One compact top-row rectangle keeps the exclusion list bounded.
+            top_row = [rectangle(widget) for widget in (
+                self.party_brand, self.lyrics_button, self.preset_button,
+                self.help_button, self.exit_button,
+            )]
+            protected.append((min(row[0] for row in top_row), min(row[1] for row in top_row),
+                              max(row[2] for row in top_row), max(row[3] for row in top_row)))
+        canvas.set_firework_protected_rects(protected)
 
     def _host(self) -> Any | None:
         return self._host_ref()
