@@ -4,7 +4,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
@@ -430,7 +430,9 @@ class MetadataService:
             for row in rows
         )
 
-    def _best_automatic_row(self, track_id: int, field_name: str) -> sqlite3.Row | None:
+    def _best_automatic_row(self, track_id: int, field_name: str, *, local_only: bool = False) -> sqlite3.Row | None:
+        from .reset_policy import is_local_reset_provider, observation_is_reset_eligible
+
         rows = self.conn.execute(
             """
             SELECT * FROM track_metadata_observations
@@ -440,6 +442,9 @@ class MetadataService:
             """,
             (int(track_id), field_name),
         ).fetchall()
+        rows = [row for row in rows if (not local_only or is_local_reset_provider(row["provider"])) and observation_is_reset_eligible(
+            self.conn, track_id, row, provenance=_provider_provenance(row["provider"], field_name),
+        )]
         if field_name in {"release_date", "original_release_date"}:
             valid_rows: list[sqlite3.Row] = []
             for row in rows:
@@ -1009,6 +1014,13 @@ class MetadataService:
         reason: str = "manual_edit",
         commit: bool = True,
     ) -> MetadataChangeResult:
+        # A standalone reset is a structured user write on modern schemas.
+        # The wrapper calls back here under its deferred reconciliation scope;
+        # that inner call must remain scalar (not recurse into another journal).
+        if (any(isinstance(command, MetadataAction) and command.action == "reset" for command in actions.values())
+                and self._has_materialization_journal()
+                and not any(entry[:2] == (id(self.conn), int(track_id)) for entry in _DEFERRED_RECONCILIATION.get())):
+            return self.apply_manual_actions(track_id, actions, actor=actor, reason=reason, commit=commit)
         before = self.snapshot(track_id)
         track = self._track(track_id)
         pending: dict[str, tuple[MetadataFieldState, MetadataFieldState]] = {}
@@ -1054,7 +1066,13 @@ class MetadataService:
                         old.updated_at,
                     )
                 elif command.action == "reset":
-                    row = self._best_automatic_row(track_id, field_name)
+                    # This transaction may also change the version identity.
+                    # Do not use the old version to authorize a catalogue fact
+                    # that would immediately become incompatible at commit.
+                    row = self._best_automatic_row(
+                        track_id, field_name,
+                        local_only=bool({"version_type", "version_label"}.intersection(actions)),
+                    )
                     if row is None:
                         reset_value = old.value if field_name == "title" else None
                         new = MetadataFieldState(
@@ -1303,6 +1321,7 @@ class MetadataService:
     def apply_manual_actions(
         self, track_id: int, actions: Mapping[str, MetadataAction], *,
         credit_inputs=None, expected_fingerprint: str | None = None, commit: bool = True,
+        actor: str = "user", reason: str = "manual_edit",
     ) -> MetadataChangeResult:
         """Journal one explicit manual field/credit edit without provider authority."""
         from .artist_credits import ArtistCreditService
@@ -1316,19 +1335,20 @@ class MetadataService:
         if not self._has_materialization_journal():
             if expected_fingerprint is not None or prepared is not None:
                 raise RuntimeError("structured_metadata_edit_requires_schema10")
-            return self.apply_actions(track_id, actions, commit=commit)
+            return self.apply_actions(track_id, actions, actor=actor, reason=reason, commit=commit)
         before = self.snapshot(track_id)
         fingerprint = expected_fingerprint if expected_fingerprint is not None else self.metadata_state_fingerprint(track_id)
         intent = user_write_intent(track_id, fingerprint, mode="manual", undo_revision=self._user_undo_revision(track_id), selection={
             "actions": {name: asdict(action) for name, action in actions.items()},
             "credits": None if prepared is None else [asdict(value) for value in prepared],
         })
+        intent = replace(intent, actor=actor, reason=reason)
         with materialize_proposal(self.conn, intent) as transaction:
             if transaction.already_applied:
                 return MetadataChangeResult(track_id, None, frozenset(), before, before)
             if prepared is not None:
                 self._validate_track_scoped_credits(track_id, prepared)
-            result = self.apply_actions(track_id, actions, commit=False)
+            result = self.apply_actions(track_id, actions, actor=actor, reason=reason, commit=False)
             if prepared is not None:
                 ArtistCreditService(self.conn).replace_track_credits(
                     track_id, prepared, provenance="manual", is_manual=True, is_locked=True,

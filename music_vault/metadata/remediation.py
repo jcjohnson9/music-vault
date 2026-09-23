@@ -213,7 +213,12 @@ def candidate_review_token(candidate: object) -> str:
     return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
 
 
-def _snapshot_dict(snapshot: EffectiveMetadataSnapshot, track: Mapping[str, object]) -> dict:
+def _snapshot_dict(
+    snapshot: EffectiveMetadataSnapshot,
+    track: Mapping[str, object],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> dict:
     fields = {
         name: {
             "value": state.value,
@@ -233,7 +238,7 @@ def _snapshot_dict(snapshot: EffectiveMetadataSnapshot, track: Mapping[str, obje
     except OSError:
         file_size = None
         file_mtime_ns = None
-    return {
+    result = {
         "track_id": snapshot.track_id,
         "path": snapshot.path,
         "source_kind": snapshot.source_kind,
@@ -247,6 +252,18 @@ def _snapshot_dict(snapshot: EffectiveMetadataSnapshot, track: Mapping[str, obje
         "file_mtime_ns": file_mtime_ns,
         "fields": fields,
     }
+    if conn is not None and conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata_materializations'"
+    ).fetchone() is not None:
+        from .materializer import capture_metadata_state, state_fingerprint
+
+        graph = capture_metadata_state(conn, snapshot.track_id)
+        result["metadata_graph"] = {
+            "version": 1,
+            "fingerprint": state_fingerprint(graph),
+            "state": graph,
+        }
+    return result
 
 
 class RemediationService:
@@ -887,7 +904,7 @@ class RemediationService:
                 ):
                     continue
                 snapshot = self.metadata.snapshot(int(track["id"]))
-                private_snapshot = _snapshot_dict(snapshot, dict(track))
+                private_snapshot = _snapshot_dict(snapshot, dict(track), conn=self.conn)
                 if self._locked_complete(snapshot):
                     self._upsert_analysis_item(
                         job.id,
@@ -1347,6 +1364,7 @@ class RemediationService:
         private_snapshot: Mapping[str, object],
         *,
         require_update_marker: bool = True,
+        require_graph: bool = True,
     ) -> bool:
         try:
             track_id = int(private_snapshot["track_id"])
@@ -1356,6 +1374,19 @@ class RemediationService:
             return False
         if track is None:
             return False
+        if require_graph and "metadata_graph" in private_snapshot:
+            from .materializer import capture_metadata_state, state_fingerprint
+
+            graph = private_snapshot["metadata_graph"]
+            if not isinstance(graph, Mapping) or graph.get("version") != 1:
+                return False
+            expected_state = graph.get("state")
+            if not isinstance(expected_state, dict):
+                return False
+            if graph.get("fingerprint") != state_fingerprint(expected_state):
+                return False
+            if capture_metadata_state(self.conn, track_id) != expected_state:
+                return False
         if (
             current.path != str(private_snapshot.get("path") or "")
             or current.source_kind != private_snapshot.get("source_kind")
@@ -1846,7 +1877,7 @@ class RemediationService:
                     applied_track = self.db.get_track(int(item["track_id"]))
                     if applied_track is None:
                         raise RemediationError("applied_track_missing")
-                    applied_snapshot = _snapshot_dict(result.after, dict(applied_track))
+                    applied_snapshot = _snapshot_dict(result.after, dict(applied_track), conn=self.conn)
                     self.conn.execute(
                         f"""
                         UPDATE {REMEDIATION_ITEMS_TABLE} SET
@@ -1935,6 +1966,17 @@ class RemediationService:
         _atomic_json(self._report_dir(job_id) / "backup_manifest.json", manifest)
 
     def _metadata_matches_applied_item(self, item: Mapping[str, object]) -> bool:
+        try:
+            journal = self._applied_materialization(item)
+            if journal is not None:
+                from .materializer import capture_metadata_state
+
+                if journal["undone_at"] is not None or capture_metadata_state(
+                    self.conn, int(item["track_id"])
+                ) != json.loads(journal["after_json"]):
+                    return False
+        except (RemediationError, KeyError, ValueError, TypeError):
+            return False
         applied_snapshot = _json_object(item.get("applied_snapshot"))
         if applied_snapshot:
             return self._snapshot_still_current(applied_snapshot)
@@ -1960,6 +2002,67 @@ class RemediationService:
         if release_id and current.musicbrainz_release_id != release_id:
             return False
         return True
+
+    def _applied_materialization(self, item: Mapping[str, object]) -> dict | None:
+        """Find this item's exact journal, never an unrelated latest change."""
+
+        snapshot = _json_object(item.get("applied_snapshot"))
+        expected_id = snapshot.get("metadata_materialization_id")
+        identifier = item.get("applied_change_group_id")
+        if expected_id is not None and expected_id != identifier:
+            raise RemediationError("remediation_materialization_mismatch")
+        row = None
+        if self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata_materializations'"
+        ).fetchone() is not None:
+            row = self.conn.execute(
+                "SELECT * FROM metadata_materializations WHERE id=?", (identifier,)
+            ).fetchone()
+        if row is None:
+            if expected_id is not None:
+                raise RemediationError("remediation_materialization_missing")
+            return None
+        if int(row["track_id"]) != int(item["track_id"]):
+            raise RemediationError("remediation_materialization_mismatch")
+        return dict(row)
+
+    def _restore_item_materialization(self, item: Mapping[str, object]) -> str | None:
+        """Undo the whole graph before touching media, within the caller's writer."""
+
+        from .materializer import (
+            capture_metadata_state, structural_change_fields, undo_materialization,
+        )
+
+        journal = self._applied_materialization(item)
+        if journal is None:
+            return None  # Historical scalar-only jobs retain their original path.
+        if not self.conn.in_transaction:
+            raise RemediationError("remediation_rollback_requires_transaction")
+        track_id = int(item["track_id"])
+        before = self.metadata.snapshot(track_id)
+        graph_before = capture_metadata_state(self.conn, track_id)
+        identifier = str(journal["id"])
+        if not undo_materialization(self.conn, identifier):
+            raise RemediationError("metadata_changed_after_remediation")
+        after = self.metadata.snapshot(track_id)
+        fields = {
+            name for name in before.fields
+            if not self.metadata._same_state(before.fields[name], after.fields[name])
+        }
+        fields |= structural_change_fields(
+            graph_before, capture_metadata_state(self.conn, track_id)
+        )
+        # Keep reversal audit under the now-undone journal's identity. A new
+        # scalar-only history group would offer an unsafe partial Undo of this
+        # structured restoration. The original apply rows remain unmodified.
+        for name in sorted(fields):
+            self.metadata._write_history(
+                track_id=track_id, group_id=identifier,
+                old=before.fields[name], new=after.fields[name],
+                actor="remediation_rollback", reason="remediation_rollback",
+                changed_at=_utc_now(),
+            )
+        return identifier
 
     def rollback(
         self,
@@ -2019,6 +2122,7 @@ class RemediationService:
                         self.conn.execute("BEGIN IMMEDIATE")
                     if not self._snapshot_still_current(applied_snapshot):
                         raise RemediationError("metadata_changed_after_remediation")
+                    rollback_group = self._restore_item_materialization(item)
                     if str(item.get("file_write_status")) == "verified":
                         original_hash = str(item.get("original_file_hash") or "")
                         updated_hash = str(item.get("updated_file_hash") or "")
@@ -2044,12 +2148,14 @@ class RemediationService:
                         else:
                             media_conflict = True
                             raise RemediationError("media_changed_after_remediation")
-                    result = self.metadata.restore_remediation_snapshot(
-                        int(item["track_id"]),
-                        snapshot,
-                        expected_current_snapshot=applied_snapshot,
-                        commit=False,
-                    )
+                    if rollback_group is None:
+                        result = self.metadata.restore_remediation_snapshot(
+                            int(item["track_id"]),
+                            snapshot,
+                            expected_current_snapshot=applied_snapshot,
+                            commit=False,
+                        )
+                        rollback_group = result.change_group_id
                     self.conn.execute(
                         f"""
                         UPDATE {REMEDIATION_ITEMS_TABLE} SET
@@ -2062,7 +2168,7 @@ class RemediationService:
                             apply_error=NULL, updated_at=?
                         WHERE id=?
                         """,
-                        (result.change_group_id, _utc_now(), item_id),
+                        (rollback_group, _utc_now(), item_id),
                     )
                 if rollback_safety is not None:
                     rollback_safety.unlink(missing_ok=True)
@@ -2252,6 +2358,20 @@ class RemediationService:
                 ).fetchone()
                 if history is None:
                     checks["rollback_history_present"] = False
+                try:
+                    journal = self._applied_materialization(item)
+                    if journal is not None and (
+                        journal["undone_at"] is None
+                        or item["rollback_change_group_id"] != journal["id"]
+                        or self.conn.execute(
+                            "SELECT 1 FROM track_metadata_history WHERE change_group_id=? "
+                            "AND track_id=? AND actor='remediation_rollback' LIMIT 1",
+                            (journal["id"], int(item["track_id"])),
+                        ).fetchone() is None
+                    ):
+                        checks["rollback_history_present"] = False
+                except RemediationError:
+                    checks["rollback_history_present"] = False
             file_status = str(item.get("file_write_status") or "")
             if status == "conflict" or file_status in {
                 "pending",
@@ -2368,10 +2488,16 @@ class RemediationService:
                         or not state.is_locked
                     ):
                         checks["locked_fields_preserved"] = False
-            if status == "rolled_back" and not self._snapshot_still_current(
-                snapshot, require_update_marker=False
-            ):
-                checks["database_matches_applied_patch"] = False
+            if status == "rolled_back":
+                try:
+                    journaled = self._applied_materialization(item) is not None
+                except RemediationError:
+                    journaled = True
+                    checks["database_matches_applied_patch"] = False
+                if not self._snapshot_still_current(
+                    snapshot, require_update_marker=False, require_graph=journaled
+                ):
+                    checks["database_matches_applied_patch"] = False
             patch = _json_object(item.get("proposed_patch"))
             candidate = _json_object(item.get("candidate_snapshot"))
             if patch.get("release_date") and patch.get("release_date") != candidate.get(
@@ -2534,13 +2660,13 @@ class RemediationService:
         snapshot = self.metadata.snapshot(track_id)
         duration = track["duration_seconds"]
         metrics = self._load_metrics(job_id)
+        refreshed_snapshot = _snapshot_dict(snapshot, dict(track), conn=self.conn)
         candidates, metrics, provider_error = self._provider_candidates(
             query_title,
             query_artist,
             float(duration) if duration is not None else None,
             metrics,
         )
-        refreshed_snapshot = _snapshot_dict(snapshot, dict(track))
         if provider_error:
             self._upsert_analysis_item(
                 job_id,
@@ -2913,14 +3039,32 @@ class RemediationService:
                     release_id=release_id,
                     confidence=confidence,
                     artwork_path=artwork_path,
+                    expected_fingerprint=(
+                        snapshot["metadata_graph"]["fingerprint"]
+                        if "metadata_graph" in snapshot else None
+                    ),
                     commit=False,
                 )
-                if set(result.changed_fields) != set(patch):
+                # changed_fields also includes structured identity/browser
+                # invalidations. Consent restricts actual scalar field writes,
+                # not those notifications (e.g. title can invalidate an album).
+                scalar_changes = {
+                    name for name in result.before.fields
+                    if not self.metadata._same_state(
+                        result.before.fields[name], result.after.fields[name]
+                    )
+                }
+                if scalar_changes != set(patch) or any(
+                    result.after.value(name) != self.metadata._normalized_value(name, value)
+                    for name, value in patch.items()
+                ):
                     raise RemediationError("metadata_precondition_changed")
                 applied_track = self.db.get_track(int(item["track_id"]))
                 if applied_track is None:
                     raise RemediationError("applied_track_missing")
-                applied_snapshot = _snapshot_dict(result.after, dict(applied_track))
+                applied_snapshot = _snapshot_dict(result.after, dict(applied_track), conn=self.conn)
+                if "metadata_graph" in applied_snapshot:
+                    applied_snapshot["metadata_materialization_id"] = result.change_group_id
                 now = _utc_now()
                 self.conn.execute(
                     f"""

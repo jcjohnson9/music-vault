@@ -76,6 +76,13 @@ FIELD_LABELS = {
     "artwork": "Artwork",
 }
 
+RESET_HELP = (
+    "On Save, release this field's manual lock and use compatible saved metadata. "
+    "Unverified provider suggestions are not applied. If no safe value is available, "
+    "the field becomes unknown (the title stays visible). No online lookup or audio-file "
+    "change is made. You can undo the saved reset in History."
+)
+
 
 LEGACY_TEXT_FIELDS = (
     "title",
@@ -292,6 +299,7 @@ class MetadataFieldEditor(QFrame):
         self.unlock_button.clicked.connect(self._unlock)
         self.reset_button = QPushButton("Reset")
         self.reset_button.setObjectName("GhostButton")
+        self.reset_button.setToolTip(RESET_HELP)
         self.reset_button.clicked.connect(self._reset)
 
         layout.addWidget(label, 0, 0)
@@ -342,7 +350,7 @@ class MetadataFieldEditor(QFrame):
 
     def _reset(self) -> None:
         self.pending_action = MetadataAction.reset()
-        self.lock_badge.setText("Reset to automatic")
+        self.lock_badge.setText("Will reset from saved metadata")
         self.lock_badge.setObjectName("MetadataBadge")
 
     def action_for_save(self) -> MetadataAction | None:
@@ -393,6 +401,7 @@ class VersionTypeFieldEditor(QFrame):
         self.unlock_button.clicked.connect(self._unlock)
         self.reset_button = QPushButton("Reset")
         self.reset_button.setObjectName("GhostButton")
+        self.reset_button.setToolTip(RESET_HELP)
         self.reset_button.clicked.connect(self._reset)
 
         layout.addWidget(label, 0, 0)
@@ -449,7 +458,7 @@ class VersionTypeFieldEditor(QFrame):
 
     def _reset(self) -> None:
         self.pending_action = MetadataAction.reset()
-        self.lock_badge.setText("Reset to automatic")
+        self.lock_badge.setText("Will reset from saved metadata")
         self.lock_badge.setObjectName("MetadataBadge")
 
     def action_for_save(self) -> MetadataAction | None:
@@ -495,6 +504,7 @@ class ArtworkFieldEditor(QFrame):
         self.clear_button.clicked.connect(self.clear_artwork)
         self.reset_button = QPushButton("Reset to Automatic")
         self.reset_button.setObjectName("GhostButton")
+        self.reset_button.setToolTip(RESET_HELP)
         self.reset_button.clicked.connect(self.reset_artwork)
         self.unlock_button = QPushButton("Unlock")
         self.unlock_button.setObjectName("GhostButton")
@@ -584,7 +594,7 @@ class ArtworkFieldEditor(QFrame):
     def reset_artwork(self) -> None:
         self.prepared_artwork = None
         self.pending_action = MetadataAction.reset()
-        self.status.setText("Will reset to best automatic artwork")
+        self.status.setText("Will use compatible saved artwork, or leave it unknown")
 
 
 @dataclass

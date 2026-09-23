@@ -13,7 +13,7 @@ from music_vault.core.db import MusicVaultDB
 from music_vault.metadata.artwork import prepare_artwork_bytes
 from music_vault.metadata.musicbrainz_enricher import MetadataCandidate
 from music_vault.metadata.providers import ProviderArtistCredit
-from music_vault.metadata.service import MetadataService
+from music_vault.metadata.service import MetadataAction, MetadataService
 from music_vault.ui.metadata_editor import MetadataEditorDialog, _PendingCandidateApply
 from music_vault.ui.metadata_tasks import MetadataTaskResult
 
@@ -136,6 +136,54 @@ def test_typing_after_clear_unlock_or_reset_supersedes_pending_action(editor_con
         assert action is not None
         assert action.action == "set"
         assert action.value == "Reconsidered Value"
+
+
+def test_reset_controls_explain_offline_deferred_undoable_behavior(editor_context):
+    dialog, _service, db, _track_id, _runtime = editor_context
+    before = tuple(db.conn.iterdump())
+    for editor in (*dialog.field_editors.values(), dialog.version_type_editor):
+        assert "On Save" in editor.reset_button.toolTip()
+        assert "No online lookup" in editor.reset_button.toolTip()
+        assert "History" in editor.reset_button.toolTip()
+        editor.reset_button.click()
+        assert editor.action_for_save().action == "reset"
+        assert "saved metadata" in editor.lock_badge.text()
+    dialog.artwork_editor.reset_button.click()
+    assert dialog.artwork_editor.pending_action.action == "reset"
+    assert "unknown" in dialog.artwork_editor.status.text()
+    assert "No online lookup" in dialog.artwork_editor.reset_button.toolTip()
+    dialog.reject()
+    assert tuple(db.conn.iterdump()) == before
+
+
+def test_editor_reset_ignores_unaccepted_provider_and_undo_restores_graph(editor_context):
+    _dialog, service, db, track_id, _runtime = editor_context
+    from music_vault.metadata.materializer import capture_metadata_state
+
+    service.record_source_observations(
+        track_id, provider="embedded", values={"title": "Local Saved Title"},
+    )
+    service.apply_manual_actions(track_id, {"title": MetadataAction.set("My Manual Title")})
+    service.record_source_observations(
+        track_id, provider="discogs_high_confidence",
+        values={"title": "Unaccepted Provider Suggestion"},
+        provider_reference="unaccepted-release", confidence=100, apply_effective=False,
+    )
+    before = capture_metadata_state(db.conn, track_id)
+    editor = MetadataEditorDialog(service, track_id)
+    emitted = []
+    editor.metadata_changed.connect(emitted.append)
+    try:
+        editor.field_editors["title"].reset_button.click()
+        editor.save_manual_changes()
+        assert len(emitted) == 1
+        state = service.snapshot(track_id).fields["title"]
+        assert state.value == "Local Saved Title"
+        assert not state.is_manual and not state.is_locked
+        service.undo_last_change(track_id)
+        assert capture_metadata_state(db.conn, track_id) == before
+    finally:
+        editor.close()
 
 
 def test_cancel_with_prepared_artwork_creates_no_runtime_file(editor_context):

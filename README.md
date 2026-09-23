@@ -119,6 +119,17 @@ migration or automatic personal-library correction is introduced.
 Track-scoped confirmation refuses shared-artist changes and unproven
 cross-catalogue release links that would require a separate identity review.
 
+Reset releases only the selected field's manual authority and uses compatible
+saved metadata; it does not contact a provider. A recorded suggestion is not
+proof that it was accepted. Unverified or incompatible provider values remain
+unresolved, with local embedded/filename facts available as conservative
+fallbacks. If no safe value exists, the field becomes unknown (a nonempty title
+stays visible). Saved editor resets retain complete, conflict-aware Undo.
+Remediation reviews that use this journal also roll back the exact accepted
+metadata graph, not just displayed strings. A later identity/credit change
+blocks rollback before any media restoration; historical scalar-only jobs
+retain their separate compatibility path.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
