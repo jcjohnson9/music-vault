@@ -26,6 +26,7 @@ from .artwork import (
     store_prepared_artwork,
 )
 from .musicbrainz_enricher import MetadataProviderError, MusicBrainzProvider
+from .materializer import _writer, state_fingerprint
 from .remediation_schema import (
     PROVIDER_CACHE_TABLE,
     REMEDIATION_ITEMS_TABLE,
@@ -47,7 +48,7 @@ _ANALYSIS_FINAL_STATUSES = frozenset(
     {"high_confidence", "needs_review", "ambiguous", "no_match", "skipped", "failed"}
 )
 _PROTECTED_PROVENANCE = frozenset(
-    {"manual", "musicbrainz_confirmed", "provider_confirmed"}
+    {"manual", "musicbrainz_confirmed", "provider_confirmed", "discogs_confirmed"}
 )
 _REVIEW_FIELDS = frozenset(
     {"title", "artist", "album", "album_artist", "release_date", "artwork"}
@@ -490,7 +491,7 @@ class RemediationService:
             (str(job_id),),
         ).fetchone()
         now = _utc_now()
-        with self.conn:
+        with _writer(self.conn):
             self.conn.execute(
                 f"""
                 UPDATE {REMEDIATION_JOBS_TABLE} SET
@@ -1619,6 +1620,11 @@ class RemediationService:
             or journal_status in {"prepared", "written", "verified"}
         )
         if not replacement_possible:
+            if prepared is not None:
+                try:
+                    self.tag_writer.discard_prepared(prepared, source=path)
+                except Exception:
+                    return "conflict"
             return "failed"
 
         original_hash = str(item.get("original_file_hash") or "")
@@ -1706,6 +1712,47 @@ class RemediationService:
             else "conflict"
         )
 
+    def _assert_automatic_item_current(self, item: Mapping[str, object], *, write_files: bool) -> None:
+        """Recheck the exact saved decision before each owned state transition."""
+        row = self.conn.execute(
+            f"SELECT * FROM {REMEDIATION_ITEMS_TABLE} WHERE id=?", (item["id"],),
+        ).fetchone()
+        job = self._job_row(str(item["job_id"]))
+        if (row is None or dict(row) != dict(item)
+                or job["status"] != "applying"
+                or job["mode"] != ("apply_files" if write_files else "apply_database")
+                or job["provider"] != "musicbrainz"):
+            raise RemediationError("remediation_decision_changed")
+
+    def _reject_automatic_item(self, item: Mapping[str, object], error: str, *, write_files: bool) -> None:
+        """Reject without stranding a previous crash's verified replacement."""
+        with _writer(self.conn):
+            self._assert_automatic_item_current(item, write_files=write_files)
+            file_status = str(item.get("file_write_status") or "not_requested")
+            if file_status == "prepared":
+                snapshot = _json_object(item["current_snapshot"])
+                file_status = self._reconcile_failed_file_write(
+                    item=item, path=Path(str(snapshot.get("path") or "")), backup=None,
+                )
+            self.conn.execute(
+                f"UPDATE {REMEDIATION_ITEMS_TABLE} SET status=?, confidence_class='needs_review', "
+                "file_write_status=?,apply_error=?,updated_at=? WHERE id=?",
+                ("conflict" if file_status == "conflict" else "needs_review", file_status,
+                 sanitize_error_text(error, 200), _utc_now(), item["id"]),
+            )
+            self._refresh_counts(str(item["job_id"]))
+
+    @staticmethod
+    def _automatic_proposal_revision(item: Mapping[str, object], patch: Mapping[str, object], *, write_files: bool) -> str:
+        # Exclude only owned processing timestamps/file evidence. Bind analysis,
+        # candidate, identity, classification, exact patch and explicit mode.
+        keys = ("id", "job_id", "track_id", "current_snapshot", "candidate_snapshot",
+                "confidence_class", "confidence_score", "provider_recording_id",
+                "provider_release_id", "match_reasons", "artwork_candidate")
+        return state_fingerprint({"automatic_remediation": 1,
+                                  "item": {key: item.get(key) for key in keys},
+                                  "patch": dict(patch), "write_files": write_files})
+
     def apply_high_confidence(
         self,
         job_id: str,
@@ -1716,6 +1763,11 @@ class RemediationService:
     ) -> tuple[JobSummary, ApplyEstimate]:
         if not confirmed:
             raise RemediationError("explicit_apply_confirmation_required")
+        # This durable job operation owns filesystem backups/crash recovery.
+        # Reject an unrelated caller transaction instead of committing it or
+        # deadlocking SQLite backup. Individual service writes support nesting.
+        if self.conn.in_transaction:
+            raise RemediationError("remediation_requires_idle_connection")
         job_row = self._job_row(job_id)
         job = self._summary(job_row)
         resuming_apply = job.status == "applying"
@@ -1763,22 +1815,15 @@ class RemediationService:
             item = dict(raw_row)
             item_id = int(item["id"])
             if candidates_expired and str(item.get("status")) != "applying":
-                self._mark_item_issue(
-                    item_id,
-                    status="needs_review",
-                    error="remediation_candidates_stale",
-                    confidence_class="needs_review",
-                )
+                self._reject_automatic_item(item, "remediation_candidates_stale", write_files=write_files)
                 continue
             snapshot = _json_object(item["current_snapshot"])
             patch = _json_object(item["proposed_patch"])
-            if not patch or not self._snapshot_still_current(snapshot):
-                self._mark_item_issue(
-                    item_id,
-                    status="needs_review",
-                    error="item_stale_or_locked",
-                    confidence_class="needs_review",
-                )
+            if (not patch or "metadata_graph" not in snapshot
+                    or not self._snapshot_still_current(snapshot)):
+                self._reject_automatic_item(item,
+                    "fresh_graph_analysis_required" if "metadata_graph" not in snapshot else "item_stale_or_locked",
+                    write_files=write_files)
                 continue
             path = Path(str(snapshot.get("path") or ""))
             recording_id = str(item.get("provider_recording_id") or "").strip() or None
@@ -1788,30 +1833,78 @@ class RemediationService:
                 if item.get("confidence_score") is not None
                 else None
             )
+            try:
+                with _writer(self.conn):
+                    self._assert_automatic_item_current(item, write_files=write_files)
+                    authority = self.metadata.prepare_high_confidence_candidate(
+                        int(item["track_id"]), patch, recording_id=recording_id,
+                        release_id=release_id, confidence=confidence,
+                        expected_fingerprint=snapshot["metadata_graph"]["fingerprint"],
+                        proposal_revision=self._automatic_proposal_revision(item, patch, write_files=write_files),
+                    )
+                    if set(authority.values) != set(patch):
+                        raise RemediationError("automatic_selection_protected")
+            except (ValueError, RuntimeError) as exc:
+                if str(exc) == "remediation_decision_changed":
+                    raise
+                self._reject_automatic_item(item, str(exc), write_files=write_files)
+                continue
             existing_artwork = str(patch.get("artwork") or "").strip()
             if existing_artwork and Path(existing_artwork).is_file():
                 artwork_path, artwork_issue = existing_artwork, None
             else:
                 artwork_path, artwork_issue = self._prepare_candidate_artwork(item, snapshot)
-            if artwork_path is not None:
-                patch["artwork"] = artwork_path
-                with self.conn:
-                    self.conn.execute(
-                        f"UPDATE {REMEDIATION_ITEMS_TABLE} SET proposed_patch=?, updated_at=? WHERE id=?",
-                        (_json(patch), _utc_now(), item_id),
-                    )
             backup = None
             file_result = None
             prepared = None
             commit_attempted = False
             file_status = "not_requested"
             try:
+                if artwork_path is not None:
+                    patch["artwork"] = artwork_path
+                    with _writer(self.conn):
+                        self._assert_automatic_item_current(item, write_files=write_files)
+                        self.conn.execute(
+                            f"UPDATE {REMEDIATION_ITEMS_TABLE} SET proposed_patch=?, updated_at=? WHERE id=?",
+                            (_json(patch), _utc_now(), item_id),
+                        )
+                        item = dict(self.conn.execute(
+                            f"SELECT * FROM {REMEDIATION_ITEMS_TABLE} WHERE id=?", (item_id,),
+                        ).fetchone())
+                proposal_revision = self._automatic_proposal_revision(item, patch, write_files=write_files)
+                with _writer(self.conn):
+                    self._assert_automatic_item_current(item, write_files=write_files)
+                    authority = self.metadata.prepare_high_confidence_candidate(
+                        int(item["track_id"]), patch, recording_id=recording_id,
+                        release_id=release_id, confidence=confidence, artwork_path=artwork_path,
+                        expected_fingerprint=snapshot["metadata_graph"]["fingerprint"],
+                        proposal_revision=proposal_revision,
+                    )
+                    if set(authority.values) != set(patch):
+                        raise RemediationError("automatic_selection_protected")
+                if not authority.effective_change:
+                    if item["status"] == "applying":
+                        raise RemediationError("automatic_no_effective_metadata_change")
+                    with _writer(self.conn):
+                        self._assert_automatic_item_current(item, write_files=write_files)
+                        self.conn.execute(
+                            f"UPDATE {REMEDIATION_ITEMS_TABLE} SET status='skipped',confidence_class='skipped',"
+                            "apply_error='no_metadata_change',updated_at=? WHERE id=?", (_utc_now(), item_id),
+                        )
+                    continue
                 if write_files and self.tag_writer.supports(path):
                     tag_patch = dict(patch)
-                    if recording_id:
-                        tag_patch["musicbrainz_recording_id"] = recording_id
-                    if release_id:
-                        tag_patch["musicbrainz_release_id"] = release_id
+                    if authority.recording_id:
+                        tag_patch["musicbrainz_recording_id"] = authority.recording_id
+                    if authority.release_id:
+                        tag_patch["musicbrainz_release_id"] = authority.release_id
+                    file_authority = state_fingerprint({
+                        "version": 1, "proposal": proposal_revision,
+                        "graph": authority.expected_fingerprint, "tags": tag_patch,
+                    })
+                    if (item.get("file_write_status") == "prepared"
+                            and _json_object(item.get("applied_snapshot")).get("automatic_prepared_authority") != file_authority):
+                        raise RemediationError("prepared_write_authority_unverified")
                     recovered = self._recover_prepared_write(item, path)
                     if recovered is not None:
                         backup, file_result = recovered
@@ -1832,14 +1925,17 @@ class RemediationService:
                             expected_full_sha256=backup.fingerprint.full_sha256,
                             artwork_path=artwork_path,
                         )
-                        with self.conn:
+                        with _writer(self.conn):
+                            self._assert_automatic_item_current(item, write_files=write_files)
+                            if not self._snapshot_still_current(snapshot):
+                                raise RemediationError("metadata_precondition_changed")
                             self.conn.execute(
                                 f"""
                                 UPDATE {REMEDIATION_ITEMS_TABLE} SET
                                     status='applying', file_write_status='prepared',
                                     original_file_hash=?, original_audio_payload_hash=?,
                                     backup_file=?, prepared_file=?, updated_file_hash=?,
-                                    updated_audio_payload_hash=?, updated_at=?
+                                    updated_audio_payload_hash=?, applied_snapshot=?, updated_at=?
                                 WHERE id=?
                                 """,
                                 (
@@ -1849,18 +1945,21 @@ class RemediationService:
                                     str(prepared.temporary_path),
                                     prepared.updated.full_sha256,
                                     prepared.updated.audio_payload_sha256,
+                                    _json({"automatic_prepared_authority": file_authority}),
                                     _utc_now(),
                                     item_id,
                                 ),
                             )
+                            item = dict(self.conn.execute(
+                                f"SELECT * FROM {REMEDIATION_ITEMS_TABLE} WHERE id=?", (item_id,),
+                            ).fetchone())
                         commit_attempted = True
                         file_result = self.tag_writer.commit(prepared, backup=backup)
                     file_status = "verified"
                 elif write_files:
                     file_status = "unsupported"
-                with self.conn:
-                    if not self.conn.in_transaction:
-                        self.conn.execute("BEGIN IMMEDIATE")
+                with _writer(self.conn):
+                    self._assert_automatic_item_current(item, write_files=write_files)
                     if not self._snapshot_still_current(snapshot):
                         raise RemediationError("metadata_precondition_changed")
                     result = self.metadata.apply_high_confidence_candidate(
@@ -1870,14 +1969,26 @@ class RemediationService:
                         release_id=release_id,
                         confidence=confidence,
                         artwork_path=artwork_path,
+                        expected_fingerprint=snapshot["metadata_graph"]["fingerprint"],
+                        proposal_revision=proposal_revision,
                         commit=False,
                     )
-                    if set(result.changed_fields) != set(patch):
+                    scalar_changes = {
+                        name for name in result.before.fields
+                        if not self.metadata._same_state(result.before.fields[name], result.after.fields[name])
+                    }
+                    if not scalar_changes <= set(patch) or any(
+                        result.after.value(name) != self.metadata._normalized_value(name, value)
+                        for name, value in patch.items()
+                    ):
                         raise RemediationError("metadata_precondition_changed")
+                    if not result.change_group_id:
+                        raise RemediationError("automatic_materialization_missing")
                     applied_track = self.db.get_track(int(item["track_id"]))
                     if applied_track is None:
                         raise RemediationError("applied_track_missing")
                     applied_snapshot = _snapshot_dict(result.after, dict(applied_track), conn=self.conn)
+                    applied_snapshot["metadata_materialization_id"] = result.change_group_id
                     self.conn.execute(
                         f"""
                         UPDATE {REMEDIATION_ITEMS_TABLE} SET
@@ -1906,6 +2017,7 @@ class RemediationService:
                             item_id,
                         ),
                     )
+                    self._refresh_counts(job_id)
             except Exception as exc:
                 restore_status = self._reconcile_failed_file_write(
                     item=item,
@@ -1915,6 +2027,11 @@ class RemediationService:
                     file_result=file_result,
                     commit_attempted=commit_attempted,
                 )
+                if str(exc) == "remediation_decision_changed":
+                    # The saved decision belongs to a newer actor now. Do not
+                    # overwrite their state after compensating our file write.
+                    self._write_apply_manifests(job_id, database_backup)
+                    raise
                 self._mark_item_issue(
                     item_id,
                     status="apply_failed",
@@ -1929,20 +2046,26 @@ class RemediationService:
             self.conn.execute(
                 f"""
                 SELECT COUNT(*) FROM {REMEDIATION_ITEMS_TABLE}
-                WHERE job_id=? AND status='applied'
-                  AND apply_error IS NOT NULL AND TRIM(apply_error) <> ''
+                WHERE job_id=? AND (
+                    (status='applied' AND apply_error IS NOT NULL AND TRIM(apply_error) <> '')
+                    OR status='conflict'
+                    OR file_write_status IN ('conflict','prepared','written')
+                )
                 """,
                 (str(job_id),),
             ).fetchone()[0]
         )
         final_status = "complete_with_issues" if summary.failed or applied_issues else "complete"
-        self._set_job_status(job_id, final_status, finish=True)
-        with self.conn:
+        with _writer(self.conn):
+            final_job = self._job_row(job_id)
+            if (final_job["status"] != "applying"
+                    or final_job["mode"] != ("apply_files" if write_files else "apply_database")):
+                raise RemediationError("remediation_decision_changed")
             self.conn.execute(
-                f"UPDATE {REMEDIATION_JOBS_TABLE} SET library_revision=?, updated_at=? WHERE id=?",
-                (self.library_revision(), _utc_now(), str(job_id)),
+                f"UPDATE {REMEDIATION_JOBS_TABLE} SET status=?,finished_at=?,last_error=NULL,library_revision=?,updated_at=? WHERE id=?",
+                (final_status, _utc_now(), self.library_revision(), _utc_now(), str(job_id)),
             )
-        summary = self._refresh_counts(job_id)
+            summary = self._refresh_counts(job_id)
         self._write_apply_manifests(job_id, database_backup)
         self._write_reports(job_id)
         return summary, estimate
@@ -3150,6 +3273,12 @@ class RemediationService:
             raise RemediationError("remediation_job_not_clearable")
         if summary.applied and summary.status != "rolled_back":
             raise RemediationError("applied_job_requires_rollback_before_clear")
+        if self.conn.execute(
+            f"SELECT 1 FROM {REMEDIATION_ITEMS_TABLE} WHERE job_id=? "
+            "AND (status='conflict' OR file_write_status IN ('conflict','prepared','written')) LIMIT 1",
+            (str(job_id),),
+        ).fetchone():
+            raise RemediationError("unresolved_media_requires_recovery_before_clear")
         with self.conn:
             self.conn.execute(
                 f"DELETE FROM {REMEDIATION_JOBS_TABLE} WHERE id=?", (str(job_id),)

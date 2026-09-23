@@ -137,6 +137,15 @@ job, or metadata changes after display, refresh is required before applying.
 Selected corrections and review completion commit together; History Undo
 restores the complete metadata state rather than only displayed strings.
 
+Strict high-confidence remediation uses the same complete journal with narrower
+automatic authority: manual/confirmed values and protected structured credits
+remain authoritative, and conflicting catalogue identities require review.
+Saved analysis is checked again before applying; legacy pending jobs without
+complete metadata revisions need fresh analysis or explicit review. Database
+changes, their exact job linkage and counters commit together. Existing verified
+media-backup and compensation checks remain in force; database-only apply never
+writes audio tags. This development work does not automatically run remediation.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the

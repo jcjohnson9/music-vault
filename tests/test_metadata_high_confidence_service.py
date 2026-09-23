@@ -215,8 +215,8 @@ def test_high_confidence_ids_field_confidence_and_history_are_one_atomic_group(
         service.apply_high_confidence_candidate(
             track_id,
             {"title": "Must Roll Back"},
-            recording_id="must-not-persist",
-            release_id="must-not-persist",
+            recording_id="recording-id",
+            release_id="release-id",
             confidence=99,
         )
     after_failure = service.snapshot(track_id)
@@ -285,7 +285,7 @@ def test_restore_remediation_snapshot_restores_ids_provenance_confidence_and_loc
 
     service.unlock_fields(track_id, ["album"])
     service.apply_manual_patch(track_id, {"artist": "Temporary Manual Artist"})
-    service.apply_high_confidence_candidate(
+    service.apply_confirmed_candidate(
         track_id,
         {"title": "Temporary Canonical Title", "release_date": "2010-11-12"},
         recording_id="temporary-recording",

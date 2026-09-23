@@ -134,6 +134,16 @@ def _shared_album_states(conn: sqlite3.Connection, track_id: int) -> dict:
     return {row[0]: dict(zip(names, tuple(row), strict=True)) for row in cursor}
 
 
+def _shared_artist_states(conn: sqlite3.Connection, track_id: int) -> dict:
+    cursor = conn.execute(
+        "SELECT artist.* FROM artists artist WHERE EXISTS ("
+        "SELECT 1 FROM track_artist_credits credit WHERE credit.artist_id=artist.id "
+        "AND credit.track_id<>?) ORDER BY artist.id", (int(track_id),),
+    )
+    names = [column[0] for column in cursor.description]
+    return {row[0]: dict(zip(names, tuple(row), strict=True)) for row in cursor}
+
+
 @contextmanager
 def _writer(conn: sqlite3.Connection):
     nested = conn.in_transaction
@@ -180,8 +190,11 @@ def materialize_proposal(conn: sqlite3.Connection, proposal):
         if fingerprint != proposal.expected_fingerprint:
             raise StaleMetadataProposal("metadata_changed_since_analysis")
         transaction = MaterializationTransaction(str(uuid.uuid4()), before)
-        shared_albums = _shared_album_states(conn, proposal.track_id) if isinstance(proposal, MetadataWriteIntent) else None
-        user_noop_savepoint = "user_metadata_" + uuid.uuid4().hex if isinstance(proposal, MetadataWriteIntent) else None
+        protect_shared = isinstance(proposal, MetadataWriteIntent) or getattr(proposal, "protect_shared_catalogue", False)
+        shared_albums = _shared_album_states(conn, proposal.track_id) if protect_shared else None
+        shared_artists = _shared_artist_states(conn, proposal.track_id) if getattr(proposal, "protect_shared_catalogue", False) else None
+        suppress_noop = isinstance(proposal, MetadataWriteIntent) or getattr(proposal, "suppress_noop_writes", False)
+        user_noop_savepoint = "user_metadata_" + uuid.uuid4().hex if suppress_noop else None
         if user_noop_savepoint:
             conn.execute(f"SAVEPOINT {user_noop_savepoint}")
         for evidence in proposal.evidence:
@@ -199,6 +212,8 @@ def materialize_proposal(conn: sqlite3.Connection, proposal):
             # and make immediate conflict-aware Undo impossible. Refuse the
             # whole edit, including observations and membership rebindings.
             raise ValueError("Shared album facts require a separate catalogue-wide edit; this track's edit was not applied.")
+        if shared_artists is not None and _shared_artist_states(conn, proposal.track_id) != shared_artists:
+            raise ValueError("Shared artist facts require a separate catalogue-wide edit; this track's edit was not applied.")
         after = capture_metadata_state(conn, proposal.track_id)
         transaction.changed = before != after
         if user_noop_savepoint:

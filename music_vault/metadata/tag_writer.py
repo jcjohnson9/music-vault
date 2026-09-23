@@ -440,6 +440,26 @@ class SafeTagWriter:
             temporary.unlink(missing_ok=True)
             raise TagWriteError("restore_failed") from exc
 
+    def discard_prepared(self, prepared: PreparedTagWrite, *, source: Path) -> None:
+        """Discard only the unchanged owned staging copy, never the source."""
+        source = source.resolve()
+        temporary = prepared.temporary_path
+        if (
+            prepared.original_path.resolve() != source
+            or temporary.is_symlink()
+            or temporary.resolve().parent != source.parent
+            or not re.fullmatch(
+                rf"\.{re.escape(source.stem)}\.music-vault-[0-9a-f]{{32}}\.tmp\.mp3",
+                temporary.name,
+            )
+        ):
+            raise TagWriteError("prepared_file_ownership_conflict")
+        if not temporary.exists():
+            return
+        if not _same_file(self.fingerprint(temporary), prepared.updated):
+            raise TagWriteError("prepared_file_changed")
+        temporary.unlink()
+
     def commit(
         self,
         prepared: PreparedTagWrite,
