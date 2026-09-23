@@ -270,14 +270,16 @@ def test_restore_remediation_snapshot_restores_ids_provenance_confidence_and_loc
     tmp_path,
 ):
     database, track_id, service = _track(tmp_path, source_kind=None)
-    service.apply_manual_patch(track_id, {"album": "Locked Manual Album"})
     service.apply_confirmed_candidate(
         track_id,
-        {"artist": "Locked Confirmed Artist"},
+        # Establish both identities through explicit song/release selection;
+        # artist-only confirmation no longer authorizes a release-ID change.
+        {"artist": "Locked Confirmed Artist", "album": "Locked Manual Album"},
         recording_id="original-recording",
         release_id="original-release",
         confidence=99,
     )
+    service.apply_manual_patch(track_id, {"album": "Locked Manual Album"})
     before = service.snapshot(track_id)
     private_snapshot = _private_snapshot(before)
 

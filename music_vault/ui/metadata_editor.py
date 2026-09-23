@@ -47,6 +47,7 @@ from music_vault.metadata.musicbrainz_enricher import (
     MusicBrainzProvider,
 )
 from music_vault.metadata.artist_credits import ArtistCreditInput, ArtistCreditService
+from music_vault.metadata.materializer import StaleMetadataProposal
 from music_vault.metadata.schema import (
     VERSION_TYPES,
     normalize_release_date,
@@ -591,6 +592,7 @@ class _PendingCandidateApply:
     candidate: MetadataCandidate
     values: dict[str, str]
     include_artwork: bool
+    expected_fingerprint: str | None = None
 
 
 class MetadataEditorDialog(QDialog):
@@ -613,6 +615,7 @@ class MetadataEditorDialog(QDialog):
         self.setMinimumSize(760, 620)
         self.service = service
         self.track_id = int(track_id)
+        self._metadata_revision = service.metadata_state_fingerprint(track_id)
         self.snapshot = service.snapshot(track_id)
         self.artist_credit_service = ArtistCreditService(service.conn)
         self.musicbrainz_provider = musicbrainz_provider or MusicBrainzProvider()
@@ -1138,6 +1141,8 @@ class MetadataEditorDialog(QDialog):
         self.validation_label.clear()
         try:
             actions = self._validate_manual()
+            if self.service.metadata_state_fingerprint(self.track_id) != self._metadata_revision:
+                raise StaleMetadataProposal("metadata_changed_since_editor_opened")
             credit_inputs: tuple[ArtistCreditInput, ...] | None = None
             credit_dirty = self.artist_credit_editor.is_dirty()
             artist_action = actions.get("artist")
@@ -1163,35 +1168,18 @@ class MetadataEditorDialog(QDialog):
                     actions["artwork"] = MetadataAction.set(str(stored))
                 else:
                     actions["artwork"] = art_action
-            before = self.snapshot
-            with self.service.conn:
-                result = self.service.apply_actions(
-                    self.track_id,
-                    actions,
-                    commit=False,
-                )
-                if credit_inputs is not None:
-                    self.artist_credit_service.replace_track_credits(
-                        self.track_id,
-                        credit_inputs,
-                        provenance="manual",
-                        is_manual=True,
-                        is_locked=True,
-                        actor="user",
-                        reason="manual_artist_credit_edit",
-                        commit=False,
-                    )
-            after = self.service.snapshot(self.track_id)
-            changed_fields = set(result.changed_fields)
-            if credit_inputs is not None:
-                changed_fields.add("artist")
-            result = MetadataChangeResult(
+            result = self.service.apply_manual_actions(
                 self.track_id,
-                result.change_group_id,
-                frozenset(changed_fields),
-                before,
-                after,
+                actions,
+                credit_inputs=credit_inputs,
+                expected_fingerprint=self._metadata_revision,
             )
+        except StaleMetadataProposal:
+            self.validation_label.setText(
+                "This track changed while the editor was open. Nothing was applied. "
+                "Close and reopen the editor to review the latest values."
+            )
+            return
         except (ValueError, ArtworkError) as exc:
             self.validation_label.setText(str(exc))
             return
@@ -1199,13 +1187,13 @@ class MetadataEditorDialog(QDialog):
             self.metadata_changed.emit(result)
         self.accept()
 
-    def _refresh_editor_state(
-        self,
-        snapshot: EffectiveMetadataSnapshot | None = None,
-    ) -> None:
+    def _refresh_editor_state(self) -> None:
         """Synchronize every editor surface after an in-dialog mutation."""
 
-        self.snapshot = snapshot or self.service.snapshot(self.track_id)
+        self._metadata_revision = self.service.metadata_state_fingerprint(self.track_id)
+        # Read after the revision: a concurrent correction can cause a safe
+        # stale rejection, never authorize old displayed values with a new key.
+        self.snapshot = self.service.snapshot(self.track_id)
         for field_name, editor in self.field_editors.items():
             editor.load_state(self.snapshot.fields[field_name])
         for field_name, editor in self.intelligence_field_editors.items():
@@ -1329,11 +1317,28 @@ class MetadataEditorDialog(QDialog):
         artwork_check = self.candidate_field_checks.get("artwork")
         if artwork_check is not None and artwork_check.isChecked() and candidate.release_id:
             changes.append("Artwork: current image retained until the selected candidate image validates")
+        selected = {name for name, checkbox in self.candidate_field_checks.items() if checkbox.isChecked()}
+        if selected & {"title", "artist"}:
+            changes.append("Selected song fields also confirm the candidate's recording identity.")
+        if "artist" in selected and candidate.artist_credits:
+            changes.append("Artist also applies the candidate's ordered artist credits and identities.")
+        if selected & {"album", "release_date"}:
+            changes.append("Selected release fields also confirm the candidate's release identity.")
         self.candidate_preview.setText(
             confidence + ("\n".join(changes) if changes else "No populated candidate fields are selected.")
         )
 
+    def _has_manual_draft(self) -> bool:
+        return (
+            any(editor.action_for_save() is not None for editor in self._all_field_editors().values())
+            or self.artist_credit_editor.is_dirty()
+            or self.artwork_editor.pending_action is not None
+        )
+
     def apply_selected_candidate(self) -> None:
+        if self._has_manual_draft():
+            self.search_status.setText("Save or discard your unsaved edits before applying a candidate.")
+            return
         candidate = self._selected_candidate()
         if candidate is None:
             self.search_status.setText("Select exactly one candidate first.")
@@ -1375,7 +1380,7 @@ class MetadataEditorDialog(QDialog):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        pending = _PendingCandidateApply(candidate, patch, include_artwork)
+        pending = _PendingCandidateApply(candidate, patch, include_artwork, self._metadata_revision)
         if include_artwork and candidate.release_id:
             self._pending_candidate = pending
             self.apply_candidate_button.setEnabled(False)
@@ -1396,18 +1401,35 @@ class MetadataEditorDialog(QDialog):
         artwork_unavailable: bool = False,
     ) -> None:
         candidate = pending.candidate
-        result = self.service.apply_confirmed_candidate(
-            self.track_id,
-            pending.values,
-            recording_id=candidate.recording_id,
-            release_id=candidate.release_id,
-            confidence=float(candidate.score),
-            release_group_id=candidate.release_group_id,
-            artwork_path=artwork_path,
-        )
+        if self._has_manual_draft():
+            self.search_status.setText(
+                "You have unsaved edits. The candidate was not applied; your edits were retained."
+            )
+            return
+        try:
+            result = self.service.apply_confirmed_candidate(
+                self.track_id,
+                pending.values,
+                recording_id=candidate.recording_id,
+                release_id=candidate.release_id,
+                confidence=float(candidate.score),
+                release_group_id=candidate.release_group_id,
+                artwork_path=artwork_path,
+                candidate=candidate,
+                expected_fingerprint=pending.expected_fingerprint or self._metadata_revision,
+            )
+        except StaleMetadataProposal:
+            self.search_status.setText(
+                "This track changed after your review. Nothing was applied. "
+                "Close and reopen the editor to review the latest values."
+            )
+            return
+        except (ValueError, ArtworkError):
+            self.search_status.setText("The selected candidate could not be applied safely. No metadata was changed.")
+            return
         if result.changed:
             self.metadata_changed.emit(result)
-        self._refresh_editor_state(result.after)
+        self._refresh_editor_state()
         if pending.include_artwork and artwork_unavailable:
             self.search_status.setText(
                 "Selected metadata was applied and locked. Candidate artwork was unavailable; "
@@ -1457,7 +1479,7 @@ class MetadataEditorDialog(QDialog):
             return
         if result.changed:
             self.metadata_changed.emit(result)
-            self._refresh_editor_state(result.after)
+            self._refresh_editor_state()
 
     def _close_pending_tasks(self) -> None:
         """Invalidate queued results before hiding or destroying the dialog."""

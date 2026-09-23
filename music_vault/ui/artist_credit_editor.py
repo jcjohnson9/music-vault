@@ -33,7 +33,7 @@ def _friendly(value: str) -> str:
 def _join_credit_names(credits: Sequence[ArtistCreditInput]) -> str:
     parts: list[str] = []
     for index, credit in enumerate(credits):
-        name = credit.display_name.strip()
+        name = (credit.credited_as or credit.display_name).strip()
         if not name:
             continue
         if index == 0:
@@ -167,14 +167,16 @@ class ArtistCreditEditor(QGroupBox):
         self.table.setItem(row, self.ORDER_COLUMN, order)
 
         if isinstance(credit, TrackArtistCredit):
-            name = credit.artist.display_name
+            canonical_name = credit.artist.display_name
+            name = credit.credited_as or canonical_name
             entity_type = credit.artist.entity_type
             role = credit.role
             join_phrase = credit.join_phrase
             discogs_id = credit.artist.discogs_artist_id
             musicbrainz_id = credit.artist.musicbrainz_artist_id
         else:
-            name = credit.display_name
+            canonical_name = credit.display_name
+            name = credit.credited_as or canonical_name
             entity_type = credit.entity_type
             role = credit.role
             join_phrase = credit.join_phrase
@@ -186,6 +188,8 @@ class ArtistCreditEditor(QGroupBox):
         name_edit.setObjectName("ArtistCreditName")
         name_edit.setAccessibleName(f"Artist credit {row + 1} name")
         name_edit.setProperty("original_name", name)
+        name_edit.setProperty("canonical_name", canonical_name)
+        name_edit.setProperty("credited_as", credit.credited_as)
         entity_combo = self._combo(ARTIST_ENTITY_TYPES, entity_type, "ArtistCreditEntityType")
         role_combo = self._combo(ARTIST_CREDIT_ROLES, role, "ArtistCreditRole")
         join_edit = QLineEdit(join_phrase)
@@ -305,7 +309,7 @@ class ArtistCreditEditor(QGroupBox):
         original_name = str(name_edit.property("original_name") or "")
         identity_unchanged = bool(name) and name == original_name
         return ArtistCreditInput(
-            name,
+            str(name_edit.property("canonical_name") or name) if identity_unchanged else name,
             role=str(role_combo.currentData() or "primary"),
             join_phrase=join_edit.text(),
             entity_type=str(entity_combo.currentData() or "unknown"),
@@ -319,6 +323,7 @@ class ArtistCreditEditor(QGroupBox):
                 if identity_unchanged
                 else None
             ),
+            credited_as=name_edit.property("credited_as") if identity_unchanged else None,
         )
 
     def credit_inputs(
@@ -354,6 +359,7 @@ class ArtistCreditEditor(QGroupBox):
                 credit.join_phrase,
                 credit.discogs_artist_id,
                 credit.musicbrainz_artist_id,
+                credit.credited_as,
             )
             for credit in self.credit_inputs(require_primary=False, allow_blank=True)
         )

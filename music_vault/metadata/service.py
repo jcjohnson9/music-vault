@@ -4,7 +4,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
@@ -1229,7 +1229,247 @@ class MetadataService:
             commit=commit,
         )
 
+    def _has_materialization_journal(self) -> bool:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN "
+            "('metadata_evidence_bundles','metadata_materializations')"
+        ).fetchone()[0] == 2
+
+    def metadata_state_fingerprint(self, track_id: int) -> str:
+        """Read the complete current graph revision for a delayed UI decision."""
+        from .materializer import capture_metadata_state, state_fingerprint
+
+        return state_fingerprint(capture_metadata_state(self.conn, track_id))
+
+    def _user_undo_revision(self, track_id: int) -> tuple:
+        # A fresh deliberate edit after Undo is new authority, not an automatic
+        # replay of the undone proposal. Ordinary retries retain the same key.
+        return tuple(tuple(row) for row in self.conn.execute(
+            "SELECT id,undone_at FROM metadata_materializations WHERE track_id=? "
+            "AND undone_at IS NOT NULL ORDER BY id", (int(track_id),),
+        ))
+
+    def _user_write_result(self, track_id, before, transaction):
+        from .materializer import capture_metadata_state, structural_change_fields
+
+        after = self.snapshot(track_id)
+        changed = frozenset(name for name in before.fields
+                            if not self._same_state(before.fields[name], after.fields[name]))
+        changed |= structural_change_fields(transaction.before, capture_metadata_state(self.conn, track_id))
+        return MetadataChangeResult(track_id, transaction.identifier if transaction.changed else None,
+                                    changed, before, after)
+
+    def _validate_track_scoped_credits(self, track_id: int, inputs) -> None:
+        """A track edit cannot rename/enrich a catalogue identity used elsewhere."""
+        from .artist_credits import _display_name, _provider_id, _repair_alias_candidate, normalize_artist_name
+
+        for value in inputs:
+            display = _display_name(value.display_name)
+            normalized = normalize_artist_name(display)
+            rows = []
+            for column, identity in (("musicbrainz_artist_id", value.musicbrainz_artist_id),
+                                     ("discogs_artist_id", value.discogs_artist_id)):
+                identity = _provider_id(identity)
+                if identity:
+                    row = self.conn.execute(f"SELECT * FROM artists WHERE {column}=?", (identity,)).fetchone()
+                    if row is not None:
+                        rows.append(row)
+            alias = None
+            if not rows and not (value.musicbrainz_artist_id or value.discogs_artist_id):
+                alias, ambiguous = _repair_alias_candidate(self.conn, normalized)
+                if ambiguous:
+                    raise ValueError("Artist alias requires separate identity review.")
+                row = alias or self.conn.execute(
+                    "SELECT * FROM artists WHERE normalized_name=? AND "
+                    "NULLIF(TRIM(musicbrainz_artist_id),'') IS NULL AND "
+                    "NULLIF(TRIM(discogs_artist_id),'') IS NULL ORDER BY id LIMIT 1", (normalized,),
+                ).fetchone()
+                if row is not None:
+                    rows.append(row)
+            for row in rows:
+                if self.conn.execute("SELECT 1 FROM track_artist_credits WHERE artist_id=? AND track_id<>? LIMIT 1", (row["id"], track_id)).fetchone() is None:
+                    continue
+                alias_for_provider, _ambiguous = _repair_alias_candidate(self.conn, normalized)
+                from_alias = alias is not None or (alias_for_provider is not None and alias_for_provider["id"] == row["id"])
+                changes_name = not from_alias and normalized != row["normalized_name"]
+                changes_spelling = not from_alias and display != row["display_name"]
+                changes_kind = row["entity_type"] == "unknown" and value.entity_type.strip().casefold() != "unknown"
+                adds_identity = any(_provider_id(identifier) and row[column] != _provider_id(identifier) for column, identifier in (
+                    ("musicbrainz_artist_id", value.musicbrainz_artist_id), ("discogs_artist_id", value.discogs_artist_id),
+                ))
+                if changes_name or changes_spelling or changes_kind or adds_identity:
+                    raise ValueError("Shared artist facts require a separate catalogue-wide edit; only this track's credited name can change here.")
+
+    def apply_manual_actions(
+        self, track_id: int, actions: Mapping[str, MetadataAction], *,
+        credit_inputs=None, expected_fingerprint: str | None = None, commit: bool = True,
+    ) -> MetadataChangeResult:
+        """Journal one explicit manual field/credit edit without provider authority."""
+        from .artist_credits import ArtistCreditService
+        from .materializer import materialize_proposal, user_write_intent
+
+        if not commit and not self.conn.in_transaction:
+            raise RuntimeError("metadata_edit_requires_caller_transaction")
+        prepared = None if credit_inputs is None else tuple(
+            ArtistCreditService._coerce_credit(value) for value in credit_inputs
+        )
+        if not self._has_materialization_journal():
+            if expected_fingerprint is not None or prepared is not None:
+                raise RuntimeError("structured_metadata_edit_requires_schema10")
+            return self.apply_actions(track_id, actions, commit=commit)
+        before = self.snapshot(track_id)
+        fingerprint = expected_fingerprint if expected_fingerprint is not None else self.metadata_state_fingerprint(track_id)
+        intent = user_write_intent(track_id, fingerprint, mode="manual", undo_revision=self._user_undo_revision(track_id), selection={
+            "actions": {name: asdict(action) for name, action in actions.items()},
+            "credits": None if prepared is None else [asdict(value) for value in prepared],
+        })
+        with materialize_proposal(self.conn, intent) as transaction:
+            if transaction.already_applied:
+                return MetadataChangeResult(track_id, None, frozenset(), before, before)
+            if prepared is not None:
+                self._validate_track_scoped_credits(track_id, prepared)
+            result = self.apply_actions(track_id, actions, commit=False)
+            if prepared is not None:
+                ArtistCreditService(self.conn).replace_track_credits(
+                    track_id, prepared, provenance="manual", is_manual=True, is_locked=True,
+                    actor="user", reason="manual_artist_credit_edit", commit=False,
+                )
+            from .materializer import capture_metadata_state, structural_change_fields
+
+            if result.changed or structural_change_fields(transaction.before, capture_metadata_state(self.conn, track_id)):
+                self.finalize_identity(track_id, reconcile_artist="artist" in result.changed_fields and prepared is None)
+        return self._user_write_result(track_id, before, transaction)
+
     def apply_confirmed_candidate(
+        self, track_id: int, values: Mapping[str, object], *,
+        recording_id: str | None, release_id: str | None, confidence: float | None,
+        release_group_id: str | None = None, artwork_path: str | None = None,
+        commit: bool = True, candidate=None, expected_fingerprint: str | None = None,
+    ) -> MetadataChangeResult:
+        """Apply explicit selected MusicBrainz facts, not unrelated identity scope.
+
+        Title/artist/version selection permits recording linkage. Album/date
+        selection permits release/family linkage. Artwork alone never changes
+        catalogue IDs. Explicit confirmation can override selected manual locks;
+        it still rejects a stale complete graph before writing anything.
+        """
+        from .artist_credits import ArtistCreditInput, ArtistCreditService
+        from .evidence import normalize_candidate
+        from .materializer import (
+            capture_metadata_state, materialize_proposal, structural_change_fields,
+            user_write_intent,
+        )
+
+        if not self._has_materialization_journal():
+            if candidate is not None or expected_fingerprint is not None:
+                raise RuntimeError("structured_metadata_confirmation_requires_schema10")
+            return self._apply_confirmed_candidate_legacy(
+                track_id, values, recording_id=recording_id, release_id=release_id,
+                confidence=confidence, release_group_id=release_group_id,
+                artwork_path=artwork_path, commit=commit,
+            )
+        if not commit and not self.conn.in_transaction:
+            raise RuntimeError("metadata_confirmation_requires_caller_transaction")
+        before = self.snapshot(track_id)
+        selected = {self._validate_field(name): self._normalized_value(name, value) for name, value in values.items()}
+        if artwork_path is not None:
+            selected["artwork"] = self._normalized_value("artwork", artwork_path)
+        selected = {name: value for name, value in selected.items() if value is not None}
+        recording_scope = bool(set(selected) & {"title", "artist", "version_type", "version_label"})
+        release_scope = bool(set(selected) & {"album", "album_artist", "release_date", "original_release_date"})
+        recording = _clean_optional(recording_id) if recording_scope else None
+        release = _clean_optional(release_id) if release_scope else None
+        family = _clean_optional(release_group_id) if release_scope else None
+        evidence = (normalize_candidate(candidate),) if candidate is not None else ()
+        if evidence and evidence[0].provider != "musicbrainz":
+            raise ValueError("Confirmed MusicBrainz metadata requires MusicBrainz evidence.")
+        if evidence:
+            for supplied, identity in ((recording, evidence[0].recording), (release, evidence[0].edition), (family, evidence[0].release_family)):
+                if supplied and (identity is None or supplied != identity.entity_id):
+                    raise ValueError("Confirmed identity differs from selected candidate evidence.")
+        credits = ()
+        if "artist" in selected and evidence:
+            credits = tuple(ArtistCreditInput(
+                display_name=value.canonical_name or value.credited_as, credited_as=value.credited_as,
+                role=value.role, join_phrase=value.prefix_join, entity_type=value.entity_type,
+                musicbrainz_artist_id=next((identity.entity_id for identity in value.identities
+                                            if identity.provider == "musicbrainz"), None),
+            ) for value in evidence[0].recording_credits)
+        fingerprint = expected_fingerprint if expected_fingerprint is not None else self.metadata_state_fingerprint(track_id)
+        intent = user_write_intent(track_id, fingerprint, mode="confirmed", evidence=evidence, undo_revision=self._user_undo_revision(track_id), selection={
+            "values": selected, "recording_id": recording, "release_id": release,
+            "release_group_id": family, "confidence": confidence,
+        })
+        with materialize_proposal(self.conn, intent) as transaction:
+            if transaction.already_applied:
+                return MetadataChangeResult(track_id, None, frozenset(), before, before)
+            if credits:
+                self._validate_track_scoped_credits(track_id, credits)
+            prior_context = transaction.before["track_release_context"]
+            prior_family = prior_context[0].get("musicbrainz_release_group_id") if prior_context else None
+            new_release_identity = release_scope and (
+                (release is not None and release != transaction.before["track"]["musicbrainz_release_id"])
+                or (family is not None and family != prior_family)
+            )
+            other_catalogue_facts = any(
+                row.get(name) not in (None, "")
+                for row in (transaction.before["track"], *prior_context, *transaction.before["canonical_albums"])
+                for name in ("discogs_release_id", "discogs_master_id", "provider_release_family_id")
+            )
+            if new_release_identity and other_catalogue_facts:
+                raise ValueError("This release already has another catalogue identity. Review its cross-catalogue relationship before selecting a different release.")
+            # Reuse existing confirmed provenance semantics, but suppress its
+            # legacy identity/reconciliation phase inside this complete unit.
+            result = self._apply_confirmed_candidate_legacy(
+                track_id, selected, recording_id=None, release_id=None,
+                confidence=confidence, commit=False, _references=(recording_id, release_id),
+                _skip_identity=True,
+            )
+            updates = {name: value for name, value in (
+                ("musicbrainz_recording_id", recording), ("musicbrainz_release_id", release),
+            ) if value is not None}
+            current = self._track(track_id)
+            updates = {name: value for name, value in updates.items() if current[name] != value}
+            old_context = self.conn.execute("SELECT musicbrainz_release_group_id FROM track_release_context WHERE track_id=?", (track_id,)).fetchone()
+            explicit_release_reselection = release_scope and (
+                "musicbrainz_release_id" in updates or (family is not None and (old_context is None or old_context[0] != family))
+            )
+            if updates:
+                self.conn.execute(
+                    "UPDATE tracks SET " + ",".join(name + "=?" for name in updates) + " WHERE id=?",
+                    (*updates.values(), int(track_id)),
+                )
+            if family is not None:
+                existing = self.conn.execute("SELECT musicbrainz_release_group_id FROM track_release_context WHERE track_id=?", (track_id,)).fetchone()
+                if existing is None or existing[0] != family:
+                    self.conn.execute(
+                        "INSERT INTO track_release_context(track_id,musicbrainz_release_group_id,release_title,provider_reference,confidence,updated_at) "
+                        "VALUES(?,?,?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET "
+                        "musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,updated_at=excluded.updated_at",
+                        (track_id, family, selected.get("album"), release, confidence, utc_now()),
+                    )
+            elif "musicbrainz_release_id" in updates and old_context is not None and old_context[0] is not None:
+                # A new edition with unknown family is not evidence that the
+                # previously selected edition's family still applies.
+                self.conn.execute(
+                    "UPDATE track_release_context SET musicbrainz_release_group_id=NULL,updated_at=? WHERE track_id=?",
+                    (utc_now(), track_id),
+                )
+            if credits:
+                ArtistCreditService(self.conn).replace_track_credits(
+                    track_id, credits, provenance="musicbrainz_confirmed", provider_reference=recording,
+                    confidence=confidence, is_locked=True, confirmed_override=True,
+                    update_display=False, commit=False,
+                )
+            if explicit_release_reselection:
+                # Explicitly selecting another catalogue release authorizes
+                # only this track's membership change. The old album remains.
+                self.conn.execute("DELETE FROM track_album_memberships WHERE track_id=?", (track_id,))
+            if result.changed or structural_change_fields(transaction.before, capture_metadata_state(self.conn, track_id)):
+                self.finalize_identity(track_id, reconcile_artist="artist" in result.changed_fields and not credits)
+        return self._user_write_result(track_id, before, transaction)
+
+    def _apply_confirmed_candidate_legacy(
         self,
         track_id: int,
         values: Mapping[str, object],
@@ -1240,6 +1480,8 @@ class MetadataService:
         release_group_id: str | None = None,
         artwork_path: str | None = None,
         commit: bool = True,
+        _references: tuple | None = None,
+        _skip_identity: bool = False,
     ) -> MetadataChangeResult:
         before = self.snapshot(track_id)
         track = self._track(track_id)
@@ -1255,12 +1497,12 @@ class MetadataService:
                 if value is None:
                     continue
                 reference = (
-                    release_id
+                    (_references[1] if _references else release_id)
                     if field_name in {
                         "album", "album_artist", "release_date",
                         "original_release_date", "version_type", "version_label", "artwork",
                     }
-                    else recording_id
+                    else (_references[0] if _references else recording_id)
                 )
                 provider = "cover_art_archive" if field_name == "artwork" else "musicbrainz"
                 self._write_observation(
@@ -1293,7 +1535,7 @@ class MetadataService:
                 actor="user",
                 reason="musicbrainz_confirmed",
             )
-            if any(value not in (None, "") for value in selected.values()):
+            if not _skip_identity and any(value not in (None, "") for value in selected.values()):
                 self.conn.execute(
                     """
                     UPDATE tracks SET

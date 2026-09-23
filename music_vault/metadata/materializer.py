@@ -93,6 +93,47 @@ class MaterializationTransaction:
     changed: bool = False
 
 
+@dataclass(frozen=True)
+class MetadataWriteIntent:
+    """Explicit user write authority, distinct from automatic resolver policy."""
+
+    track_id: int
+    expected_fingerprint: str
+    evidence: tuple
+    proposal_key: str
+    actor: str = "user"
+    reason: str = "manual_metadata_edit"
+
+
+def user_write_intent(track_id: int, fingerprint: str, *, mode: str, selection: dict, evidence: tuple = (), undo_revision: tuple = ()) -> MetadataWriteIntent:
+    if mode not in {"manual", "confirmed"}:
+        raise ValueError("Invalid explicit metadata write mode.")
+    payload = {"version": 1, "track_id": int(track_id), "fingerprint": fingerprint,
+               "mode": mode, "selection": selection, "evidence": [item.evidence_key for item in evidence],
+               "undo_revision": undo_revision}
+    key = "metadata-user-intent-v1:" + hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+    return MetadataWriteIntent(int(track_id), fingerprint, evidence, key,
+                               reason="musicbrainz_confirmed" if mode == "confirmed" else "manual_metadata_edit")
+
+
+def _shared_album_states(conn: sqlite3.Connection, track_id: int) -> dict:
+    """Catalogue rows owned by another track are outside a track edit's scope.
+
+    Include possible destination albums, not just the edited track's current
+    graph: selecting an existing family may otherwise rename its shared card.
+    This read occurs once inside the user edit's writer transaction, never in
+    browser rendering or playback updates.
+    """
+    cursor = conn.execute(
+        "SELECT album.* FROM canonical_albums album WHERE EXISTS ("
+        "SELECT 1 FROM track_album_memberships member "
+        "WHERE member.canonical_album_id=album.id AND member.track_id<>?) ORDER BY album.id",
+        (int(track_id),),
+    )
+    names = [column[0] for column in cursor.description]
+    return {row[0]: dict(zip(names, tuple(row), strict=True)) for row in cursor}
+
+
 @contextmanager
 def _writer(conn: sqlite3.Connection):
     nested = conn.in_transaction
@@ -139,6 +180,10 @@ def materialize_proposal(conn: sqlite3.Connection, proposal):
         if fingerprint != proposal.expected_fingerprint:
             raise StaleMetadataProposal("metadata_changed_since_analysis")
         transaction = MaterializationTransaction(str(uuid.uuid4()), before)
+        shared_albums = _shared_album_states(conn, proposal.track_id) if isinstance(proposal, MetadataWriteIntent) else None
+        user_noop_savepoint = "user_metadata_" + uuid.uuid4().hex if isinstance(proposal, MetadataWriteIntent) else None
+        if user_noop_savepoint:
+            conn.execute(f"SAVEPOINT {user_noop_savepoint}")
         for evidence in proposal.evidence:
             conn.execute(
                 "INSERT OR IGNORE INTO metadata_evidence_bundles "
@@ -149,8 +194,21 @@ def materialize_proposal(conn: sqlite3.Connection, proposal):
             )
         with MetadataService(conn).defer_reconciliation(proposal.track_id, transaction.identifier):
             yield transaction
+        if shared_albums is not None and _shared_album_states(conn, proposal.track_id) != shared_albums:
+            # A title/date change on a shared card would affect other tracks
+            # and make immediate conflict-aware Undo impossible. Refuse the
+            # whole edit, including observations and membership rebindings.
+            raise ValueError("Shared album facts require a separate catalogue-wide edit; this track's edit was not applied.")
         after = capture_metadata_state(conn, proposal.track_id)
         transaction.changed = before != after
+        if user_noop_savepoint:
+            if not transaction.changed:
+                # Equivalent explicit user saves are true no-ops, including
+                # observation freshness, evidence and journal creation dates.
+                conn.execute(f"ROLLBACK TO SAVEPOINT {user_noop_savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {user_noop_savepoint}")
+            if not transaction.changed:
+                return
         # Identity-only acceptance must appear in the existing history/Undo UI
         # too. Recording an audit entry does not rewrite scalar field state.
         metadata = MetadataService(conn)
@@ -166,7 +224,8 @@ def materialize_proposal(conn: sqlite3.Connection, proposal):
                     track_id=proposal.track_id, group_id=transaction.identifier,
                     old=metadata._state_from_row(before_fields[name]),
                     new=metadata._state_from_row(after_fields[name]),
-                    actor="metadata_intelligence", reason="structured_metadata_identity",
+                    actor=getattr(proposal, "actor", "metadata_intelligence"),
+                    reason=getattr(proposal, "reason", "structured_metadata_identity"),
                     changed_at=utc_now(),
                 )
         conn.execute(

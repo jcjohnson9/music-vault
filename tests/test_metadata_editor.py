@@ -12,6 +12,7 @@ from music_vault.core import paths
 from music_vault.core.db import MusicVaultDB
 from music_vault.metadata.artwork import prepare_artwork_bytes
 from music_vault.metadata.musicbrainz_enricher import MetadataCandidate
+from music_vault.metadata.providers import ProviderArtistCredit
 from music_vault.metadata.service import MetadataService
 from music_vault.ui.metadata_editor import MetadataEditorDialog, _PendingCandidateApply
 from music_vault.ui.metadata_tasks import MetadataTaskResult
@@ -284,7 +285,8 @@ def test_candidate_apply_and_undo_refresh_every_editor_surface(
     assert "Cover Art Archive" in dialog.artwork_editor.status.text()
     assert "Locked" in dialog.artwork_editor.status.text()
     assert dialog.source_context_labels["musicbrainz_recording_id"].text() == "recording-id"
-    assert dialog.source_context_labels["musicbrainz_release_id"].text() == "release-id"
+    # Title/artist/art selection does not authorize rebinding the album edition.
+    assert service.snapshot(track_id).musicbrainz_release_id is None
     assert "Confirmed Current Title" in dialog.candidate_preview.text()
     assert dialog.history_table.rowCount() >= 1
     assert any(
@@ -402,4 +404,106 @@ def test_history_and_confirmed_undo_are_exposed(editor_context, monkeypatch):
     dialog.metadata_changed.connect(changes.append)
     dialog.undo_last_change()
     assert changes and changes[-1].changed
+    assert service.snapshot(track_id).value("artist") == "Synthetic Artist"
+
+
+def test_manual_save_rejects_external_change_without_losing_newer_metadata(editor_context):
+    dialog, service, db, track_id, runtime = editor_context
+    emitted = []
+    dialog.metadata_changed.connect(emitted.append)
+    dialog.field_editors["title"].value_edit.setText("Pending edit")
+    service.apply_manual_patch(track_id, {"album": "Newer correction"})
+    before = tuple(db.conn.iterdump())
+    dialog.save_manual_changes()
+    assert "changed while the editor was open" in dialog.validation_label.text()
+    assert tuple(db.conn.iterdump()) == before
+    assert emitted == []
+    assert (runtime / "track.synthetic").read_bytes() == b"synthetic"
+
+
+def test_async_candidate_result_rejects_revision_changed_after_confirmation(editor_context, monkeypatch):
+    dialog, service, db, track_id, _runtime = editor_context
+    candidate = MetadataCandidate("Candidate title", "Candidate artist", "Candidate album", "1995", "rec", "rel", 98)
+    dialog.set_candidates([candidate])
+    dialog.candidate_table.selectRow(0)
+    dialog.candidate_field_checks["artwork"].setChecked(True)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+    monkeypatch.setattr(dialog.task_runner, "submit", lambda *args, **kwargs: 101)
+    emitted = []
+    dialog.metadata_changed.connect(emitted.append)
+    dialog.apply_selected_candidate()
+    assert dialog._pending_candidate.expected_fingerprint == dialog._metadata_revision
+    service.apply_manual_patch(track_id, {"title": "Newer protected title"})
+    before = tuple(db.conn.iterdump())
+    dialog._task_completed(MetadataTaskResult("candidate_artwork", 101, value=None, error="unavailable"))
+    assert "changed after your review" in dialog.search_status.text()
+    assert tuple(db.conn.iterdump()) == before
+    assert emitted == []
+    assert dialog.search_button.isEnabled()
+
+
+def test_artwork_only_confirmation_preserves_song_and_release_identity(editor_context):
+    dialog, service, db, track_id, runtime = editor_context
+    with db.conn:
+        db.conn.execute("UPDATE tracks SET musicbrainz_recording_id='original-recording', musicbrainz_release_id='original-release' WHERE id=?", (track_id,))
+    dialog._refresh_editor_state()
+    candidate = MetadataCandidate("Unselected title", "Unselected artist", "Unselected album", "1999", "other-recording", "other-release", 95, release_group_id="other-family")
+    art = runtime / "selected-cover.png"
+    image = QImage(16, 16, QImage.Format.Format_ARGB32)
+    image.fill(0xFF2BD576)
+    assert image.save(str(art), "PNG")
+    dialog._commit_candidate(_PendingCandidateApply(candidate, {}, True, dialog._metadata_revision), str(art))
+    after = service.snapshot(track_id)
+    assert after.value("artwork") == str(art)
+    assert after.musicbrainz_recording_id == "original-recording"
+    assert after.musicbrainz_release_id == "original-release"
+    assert after.value("title") == "Synthetic Title"
+    context = db.conn.execute("SELECT musicbrainz_release_group_id FROM track_release_context WHERE track_id=?", (track_id,)).fetchone()
+    assert context is None or context[0] is None
+
+
+def test_late_candidate_does_not_discard_unsaved_manual_draft(editor_context):
+    dialog, _service, db, _track_id, _runtime = editor_context
+    candidate = MetadataCandidate("Candidate title", "Candidate artist", None, None, "rec", "rel", 99)
+    pending = _PendingCandidateApply(candidate, {"title": candidate.title}, True, dialog._metadata_revision)
+    dialog.field_editors["album"].value_edit.setText("Unsaved album draft")
+    before = tuple(db.conn.iterdump())
+    dialog._commit_candidate(pending, None)
+    assert "edits were retained" in dialog.search_status.text()
+    assert dialog.field_editors["album"].value_edit.text() == "Unsaved album draft"
+    assert tuple(db.conn.iterdump()) == before
+
+
+def test_candidate_confirmation_does_not_begin_with_unsaved_edits(editor_context, monkeypatch):
+    dialog, _service, db, _track_id, _runtime = editor_context
+    candidate = MetadataCandidate("Candidate title", "Candidate artist", None, None, "rec", "rel", 99)
+    dialog.set_candidates([candidate])
+    dialog.candidate_table.selectRow(0)
+    dialog.field_editors["album"].value_edit.setText("Keep draft")
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: pytest.fail("Do not confirm over unsaved edits"))
+    before = tuple(db.conn.iterdump())
+    dialog.apply_selected_candidate()
+    assert "unsaved edits" in dialog.search_status.text()
+    assert tuple(db.conn.iterdump()) == before
+
+
+def test_confirmed_structured_credits_reach_service_and_undo(editor_context, monkeypatch):
+    dialog, service, db, track_id, _runtime = editor_context
+    before = [tuple(row) for row in db.conn.execute("SELECT * FROM track_artist_credits WHERE track_id=? ORDER BY rowid", (track_id,))]
+    candidate = MetadataCandidate(
+        "Unselected title", "Stage Name", None, None, "selected-recording", None, 99,
+        artist_credits=(ProviderArtistCredit("Stage Name", artist_id="canonical-artist", provider="musicbrainz", canonical_name="Canonical Name", credited_as="Stage Name", entity_type="person"),),
+    )
+    dialog._commit_candidate(_PendingCandidateApply(candidate, {"artist": "Stage Name"}, False, dialog._metadata_revision), None)
+    row = db.conn.execute("SELECT a.musicbrainz_artist_id, c.credited_as FROM track_artist_credits c JOIN artists a ON a.id=c.artist_id WHERE c.track_id=?", (track_id,)).fetchone()
+    assert tuple(row) == ("canonical-artist", "Stage Name")
+    editor = dialog.artist_credit_editor
+    assert editor.table.cellWidget(0, editor.NAME_COLUMN).text() == "Stage Name"
+    assert editor.display_artist() == "Stage Name"
+    assert not editor.is_dirty()
+    credit = editor.credit_inputs()[0]
+    assert (credit.display_name, credit.credited_as, credit.musicbrainz_artist_id) == ("Canonical Name", "Stage Name", "canonical-artist")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+    dialog.undo_last_change()
+    assert [tuple(row) for row in db.conn.execute("SELECT * FROM track_artist_credits WHERE track_id=? ORDER BY rowid", (track_id,))] == before
     assert service.snapshot(track_id).value("artist") == "Synthetic Artist"

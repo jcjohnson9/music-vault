@@ -109,6 +109,16 @@ evidence and reversible acceptance history remain private database data; Undo
 refuses to overwrite newer or changed shared identities. This foundation does
 not run a library repair, contact a provider at startup, or write media tags.
 
+The metadata editor journals manual fields and structured artist credits as one
+undoable change. MusicBrainz confirmation preserves the selected candidate's
+ordered identities and credited names without treating artwork-only selection
+as permission to replace song or release IDs. If metadata changes while the
+editor or an artwork request is open, the old confirmation is rejected for a
+fresh review. These editor safeguards use schema 10; no further startup
+migration or automatic personal-library correction is introduced.
+Track-scoped confirmation refuses shared-artist changes and unproven
+cross-catalogue release links that would require a separate identity review.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
