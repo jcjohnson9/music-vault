@@ -157,6 +157,12 @@ def parse_discogs_artist_credits(
                 join_phrase=join_phrase,
                 entity_type="unknown",
                 provider_reference=reference,
+                provider="discogs",
+                canonical_name=(
+                    _DISCOGS_NAME_SUFFIX_RE.sub("", str(raw.get("name") or "")).strip()
+                    or None
+                ),
+                credited_as=name,
             )
         )
         if re.search(r"\b(?:feat\.?|ft\.?|featuring)\b", join_phrase, re.IGNORECASE):
@@ -436,6 +442,7 @@ def parse_discogs_release(
         title=title,
         artist=artist,
         artist_credits=best_credits,
+        album_artist_credits=release_credits,
         album=album,
         album_artist=release_artist or artist,
         release_date=release_date,

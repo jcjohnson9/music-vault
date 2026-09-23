@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +18,11 @@ from .schema import (
     observation_key,
     release_year,
     utc_now,
+)
+
+
+_DEFERRED_RECONCILIATION: ContextVar[tuple] = ContextVar(
+    "metadata_deferred_reconciliation", default=()
 )
 
 
@@ -689,7 +695,9 @@ class MetadataService:
         if not changes:
             return None
         changed_at = utc_now()
-        identifier = group_id or str(uuid.uuid4())
+        deferred = next((entry for entry in reversed(_DEFERRED_RECONCILIATION.get())
+                         if entry[:2] == (id(self.conn), int(track_id))), None)
+        identifier = deferred[2] if deferred else group_id or str(uuid.uuid4())
         new_states: dict[str, MetadataFieldState] = {}
         for field_name, (old, new) in changes.items():
             stamped = MetadataFieldState(
@@ -714,13 +722,13 @@ class MetadataService:
             )
             new_states[field_name] = stamped
         self._materialize(track_id, new_states, changed_at)
-        if "artist" in new_states:
+        if "artist" in new_states and deferred is None:
             self._reconcile_artist_credits(
                 track_id,
                 new_states["artist"],
                 changed_at,
             )
-        if set(new_states) & {
+        if deferred is None and set(new_states) & {
             "artist",
             "album",
             "album_artist",
@@ -736,6 +744,31 @@ class MetadataService:
 
                 upsert_track_canonical_album(self.conn, int(track_id))
         return identifier
+
+    @contextmanager
+    def defer_reconciliation(self, track_id: int, group_id: str):
+        """Materialize scalar fields before one final identity reconciliation.
+
+        The context follows nested service instances on this connection only.
+        It never disables manual locks or opens/commits a transaction itself.
+        """
+        entries = _DEFERRED_RECONCILIATION.get()
+        token = _DEFERRED_RECONCILIATION.set((*entries, (id(self.conn), int(track_id), group_id)))
+        try:
+            yield
+        finally:
+            _DEFERRED_RECONCILIATION.reset(token)
+
+    def finalize_identity(self, track_id: int, *, reconcile_artist: bool) -> None:
+        """Finish a caller-owned atomic metadata proposal exactly once."""
+        if not self.conn.in_transaction:
+            raise RuntimeError("metadata_finalization_requires_transaction")
+        if reconcile_artist:
+            state = self.snapshot(track_id).fields["artist"]
+            self._reconcile_artist_credits(track_id, state, state.updated_at)
+        from .canonical_albums import upsert_track_canonical_album
+
+        upsert_track_canonical_album(self.conn, int(track_id))
 
     def record_source_observations(
         self,
@@ -1536,7 +1569,18 @@ class MetadataService:
 
     def preview_undo(self, track_id: int) -> MetadataHistoryGroup | None:
         groups = self.history_groups(track_id)
+        has_journal = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata_materializations'"
+        ).fetchone() is not None
+        undone = set()
+        if has_journal:
+            undone = {str(row[0]) for row in self.conn.execute(
+                "SELECT id FROM metadata_materializations WHERE track_id=? AND undone_at IS NOT NULL",
+                (int(track_id),),
+            )}
         for index, group in enumerate(groups):
+            if group.change_group_id in undone:
+                continue
             is_oldest_group = index == len(groups) - 1
             is_initial_import = (
                 is_oldest_group
@@ -1569,6 +1613,28 @@ class MetadataService:
         group = self.preview_undo(track_id)
         if group is None:
             return MetadataChangeResult(int(track_id), None, frozenset(), before, before)
+        has_journal = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata_materializations'"
+        ).fetchone() is not None
+        if has_journal and self.conn.execute(
+            "SELECT 1 FROM metadata_materializations WHERE id=? AND track_id=?",
+            (group.change_group_id, int(track_id)),
+        ).fetchone() is not None:
+            from .materializer import (
+                capture_metadata_state, structural_change_fields, undo_materialization,
+            )
+
+            # The journal checks the complete graph revision, not just fields.
+            # Do not fall through to a scalar-only undo if it refuses a conflict.
+            if not commit and not self.conn.in_transaction:
+                raise RuntimeError("metadata_undo_requires_caller_transaction")
+            graph_before = capture_metadata_state(self.conn, track_id)
+            undo_materialization(self.conn, group.change_group_id)
+            after = self.snapshot(track_id)
+            changed = frozenset(name for name in before.fields
+                                if not self._same_state(before.fields[name], after.fields[name]))
+            changed |= structural_change_fields(graph_before, capture_metadata_state(self.conn, track_id))
+            return MetadataChangeResult(int(track_id), group.change_group_id, changed, before, after)
         track = self._track(track_id)
         pending: dict[str, tuple[MetadataFieldState, MetadataFieldState]] = {}
         with self._transaction(commit=commit):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -11,15 +12,21 @@ from music_vault.core.listening_schema import LISTENING_TABLES, required_listeni
 from music_vault.core.playlist_membership import PlaylistMembershipService
 from music_vault.core.sync_sources import SyncSourceService
 from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
+from music_vault.metadata.resolution_schema import RESOLUTION_TABLES, required_resolution_indexes
 from music_vault.metadata.service import MetadataService
 
 
-def snapshot(conn, tables=None):
+def snapshot(conn, tables=None, *, old_credit_projection=False):
     definitions = dict(conn.execute("SELECT name,sql FROM sqlite_master WHERE type='table'"))
-    return {
-        name: (definitions[name], sorted((tuple(row) for row in conn.execute(f'SELECT * FROM "{name}"')), key=repr))
-        for name in sorted(definitions if tables is None else tables)
-    }
+    result = {}
+    for name in sorted(definitions if tables is None else tables):
+        sql, projection = definitions[name], "*"
+        if old_credit_projection and name == "track_artist_credits":
+            columns = [row[1] for row in conn.execute('PRAGMA table_info("track_artist_credits")')]
+            projection = ",".join(f'"{column}"' for column in columns if column != "credited_as")
+            sql = re.sub(r",\s*credited_as\s+TEXT(?=\s*[,\)])", "", sql, flags=re.I)
+        result[name] = (sql, sorted((tuple(row) for row in conn.execute(f'SELECT {projection} FROM "{name}"')), key=repr))
+    return result
 
 
 def schema8(tmp_path, *, populated=True):
@@ -51,6 +58,9 @@ def schema8(tmp_path, *, populated=True):
                 VALUES('synthetic-job',?,'{}','unchanged-created','unchanged-updated')""", (first,))
             db.conn.execute("UPDATE tracks SET created_at='original-created',updated_at='original-updated'")
     with db.conn:
+        for table in RESOLUTION_TABLES:
+            db.conn.execute(f"DROP TABLE {table}")
+        db.conn.execute("ALTER TABLE track_artist_credits DROP COLUMN credited_as")
         for table in LISTENING_TABLES:
             db.conn.execute(f"DROP TABLE {table}")
         db.conn.execute("PRAGMA user_version=8")
@@ -61,7 +71,7 @@ def schema8(tmp_path, *, populated=True):
 
 def forbid_seeds(monkeypatch):
     def forbidden(*args, **kwargs):
-        raise AssertionError("Schema 8/9 listening startup must not reseed unrelated data")
+        raise AssertionError("Schema 8/10 additive startup must not reseed unrelated data")
     for name in (
         "create_metadata_schema", "create_remediation_schema", "create_sync_schema", "create_metadata_intelligence_schema",
         "seed_existing_metadata", "seed_existing_playlist_origins", "backfill_source_track_identities",
@@ -71,7 +81,7 @@ def forbid_seeds(monkeypatch):
         monkeypatch.setattr(database_module, name, forbidden)
 
 
-def test_populated8_to9_full_row_preservation_backup_and_current9_idempotence(tmp_path, monkeypatch):
+def test_populated8_to10_old_column_preservation_backup_and_current10_idempotence(tmp_path, monkeypatch):
     path, before = schema8(tmp_path)
     assert before["track_metadata_history"][1]
     assert before["track_artist_credits"][1]
@@ -92,16 +102,19 @@ def test_populated8_to9_full_row_preservation_backup_and_current9_idempotence(tm
     with monkeypatch.context() as media_guard:
         media_guard.setattr(Path, "open", forbid_media_open)
         migrated = MusicVaultDB(path, backup_dir=tmp_path / "backups")
-    assert CURRENT_SCHEMA_VERSION == 9
-    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert CURRENT_SCHEMA_VERSION == 10
+    assert migrated.conn.execute("PRAGMA user_version").fetchone()[0] == 10
     assert migrated.migration_performed and migrated.migrated_from_version == 8
-    assert migrated.migrated_to_version == 9
-    assert snapshot(migrated.conn, before) == before
-    assert set(snapshot(migrated.conn)) - set(before) == set(LISTENING_TABLES)
-    for table in LISTENING_TABLES:
+    assert migrated.migrated_to_version == 10
+    assert snapshot(migrated.conn, before, old_credit_projection=True) == before
+    columns = {row[1]: tuple(row) for row in migrated.conn.execute("PRAGMA table_info(track_artist_credits)")}
+    assert columns["credited_as"][2:] == ("TEXT", 0, None, 0)
+    assert migrated.conn.execute("SELECT COUNT(*) FROM track_artist_credits WHERE credited_as IS NOT NULL").fetchone()[0] == 0
+    assert set(snapshot(migrated.conn)) - set(before) == set(LISTENING_TABLES + RESOLUTION_TABLES)
+    for table in LISTENING_TABLES + RESOLUTION_TABLES:
         assert migrated.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     indexes = {row[0] for row in migrated.conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    assert set(required_listening_indexes()) <= indexes
+    assert set(required_listening_indexes() + required_resolution_indexes()) <= indexes
     assert migrated.conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert migrated.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert migrated.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -121,12 +134,12 @@ def test_populated8_to9_full_row_preservation_backup_and_current9_idempotence(tm
     assert not (tmp_path / "dist" / "MusicVault" / "data").exists()
 
 
-def test_empty8_to9_preserves_all_existing_empty_tables(tmp_path, monkeypatch):
+def test_empty8_to10_preserves_all_existing_empty_columns(tmp_path, monkeypatch):
     path, before = schema8(tmp_path, populated=False)
     forbid_seeds(monkeypatch)
     db = MusicVaultDB(path)
-    assert snapshot(db.conn, before) == before
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert snapshot(db.conn, before, old_credit_projection=True) == before
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 10
     assert db.listening.favorite_ids() == set()
     assert db.listening.history_page() == []
     db.close()
@@ -184,7 +197,7 @@ def test_backup_equal_counts_but_changed_values_is_rejected_before_migration(tmp
 def test_older_supported_upgrade_and_fresh_database_install_empty_listening_tables(v0_database, tmp_path):
     for path in (v0_database(), tmp_path / "fresh.sqlite3"):
         db = MusicVaultDB(path)
-        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 10
         assert db.listening.history_page() == []
         assert db.listening.favorite_ids() == set()
         assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

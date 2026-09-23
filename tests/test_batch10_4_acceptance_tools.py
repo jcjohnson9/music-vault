@@ -51,10 +51,12 @@ def _schema7_database_runtime():
     original_create = db_module.create_media_quality_schema
     original_seed = db_module.seed_existing_track_media_quality
     original_listening = db_module.create_listening_schema
+    original_resolution = db_module.create_resolution_schema
     db_module.CURRENT_SCHEMA_VERSION = 7
     db_module.create_media_quality_schema = lambda _connection: None
     db_module.seed_existing_track_media_quality = lambda _connection, *_track_ids: None
     db_module.create_listening_schema = lambda _connection: None
+    db_module.create_resolution_schema = lambda _connection: None
     try:
         yield
     finally:
@@ -62,6 +64,7 @@ def _schema7_database_runtime():
         db_module.create_media_quality_schema = original_create
         db_module.seed_existing_track_media_quality = original_seed
         db_module.create_listening_schema = original_listening
+        db_module.create_resolution_schema = original_resolution
 
 
 def _migrate_schema7(root: Path, database: Path) -> None:

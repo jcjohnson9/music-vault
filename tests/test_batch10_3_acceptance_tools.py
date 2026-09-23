@@ -37,10 +37,12 @@ def _schema7_database_runtime():
     original_create = db_module.create_media_quality_schema
     original_seed = db_module.seed_existing_track_media_quality
     original_listening = db_module.create_listening_schema
+    original_resolution = db_module.create_resolution_schema
     db_module.CURRENT_SCHEMA_VERSION = 7
     db_module.create_media_quality_schema = lambda _connection: None
     db_module.seed_existing_track_media_quality = lambda _connection, *_track_ids: None
     db_module.create_listening_schema = lambda _connection: None
+    db_module.create_resolution_schema = lambda _connection: None
     try:
         yield
     finally:
@@ -48,6 +50,7 @@ def _schema7_database_runtime():
         db_module.create_media_quality_schema = original_create
         db_module.seed_existing_track_media_quality = original_seed
         db_module.create_listening_schema = original_listening
+        db_module.create_resolution_schema = original_resolution
 
 
 @pytest.fixture(autouse=True)
@@ -170,7 +173,10 @@ def _insert_exact_duplicate_credit_evidence(database: Path) -> None:
                 FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE,
                 FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE RESTRICT
             );
-            INSERT INTO track_artist_credits SELECT * FROM legacy_artist_credits;
+            INSERT INTO track_artist_credits
+            SELECT id,track_id,artist_id,role,credit_order,join_phrase,provenance,
+                   provider_reference,confidence,is_manual,is_locked,created_at,updated_at
+            FROM legacy_artist_credits;
             DROP TABLE legacy_artist_credits;
             """
         )

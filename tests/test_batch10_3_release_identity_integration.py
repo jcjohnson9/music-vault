@@ -677,13 +677,13 @@ def test_prerelease_schema7_adds_release_identity_columns_idempotently(tmp_path:
         )
     }
     # This fixture models a prerelease schema-7 database, not a damaged latest
-    # database. Current schema-9 startup intentionally performs no metadata repair.
+    # database. Current schema-10 startup intentionally performs no metadata repair.
     db.conn.execute("PRAGMA user_version=7")
     db.conn.commit()
     db.close()
 
     reopened = MusicVaultDB(path)
-    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 10
     assert {
         "musicbrainz_release_group_id",
         "provider_release_family_id",

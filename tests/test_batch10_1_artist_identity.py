@@ -213,7 +213,10 @@ def test_early_v6_unique_name_schema_upgrades_without_losing_artist_graph(
         )
         conn.execute("INSERT INTO artists SELECT * FROM artists_current")
         conn.execute(
-            "INSERT INTO track_artist_credits SELECT * FROM credits_current"
+            "INSERT INTO track_artist_credits "
+            "SELECT id,track_id,artist_id,role,credit_order,join_phrase,provenance,"
+            "provider_reference,confidence,is_manual,is_locked,created_at,updated_at "
+            "FROM credits_current"
         )
         conn.execute("DROP TABLE credits_current")
         conn.execute("DROP TABLE artists_current")
@@ -224,7 +227,7 @@ def test_early_v6_unique_name_schema_upgrades_without_losing_artist_graph(
 
     reopened = MusicVaultDB(path)
     assert reopened.migration_performed and reopened.migrated_from_version == 6
-    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert reopened.conn.execute("PRAGMA user_version").fetchone()[0] == 10
     assert not _single_column_is_unique(reopened.conn, "normalized_name")
     preserved = reopened.conn.execute(
         "SELECT id, artist_id FROM track_artist_credits WHERE track_id=?",

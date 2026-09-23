@@ -93,10 +93,21 @@ retention deletion or cloud export. Removed-library history remains unavailable
 rather than silently rebinding to another track; unavailable favorites can be
 explicitly removed through More → Unavailable favorites.
 
-These structures use additive schema 9. Upgrading schema 8 creates a verified
-backup and two empty listening tables without changing prior metadata,
-memberships or media. Do not use the development EXE for an unapproved live
-migration gate. The public v1.0.0 download and tag remain unchanged.
+Listening structures were introduced in schema 9. The current metadata identity
+foundation uses additive schema 10: upgrades from schema 8/9 create a verified
+backup, empty evidence/history structures, and a nullable credited-as field.
+Existing metadata, memberships, media, and artist display values are not
+repaired or backfilled at startup. Do not use the development EXE for an
+unapproved live migration gate. The public v1.0.0 download and tag remain unchanged.
+
+MusicBrainz and Discogs candidates retain provider-qualified identities and
+ordered credits, separating a track's credited name from the shared artist's
+canonical name. Automatic metadata acceptance checks the analyzed revision
+again inside one transaction before applying fields, identities, credits, and
+final album membership. Conflicting identities stay unresolved. Structured
+evidence and reversible acceptance history remain private database data; Undo
+refuses to overwrite newer or changed shared identities. This foundation does
+not run a library repair, contact a provider at startup, or write media tags.
 
 ## Install the portable release
 

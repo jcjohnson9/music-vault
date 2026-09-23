@@ -66,11 +66,11 @@ def test_schema7_to_8_is_backed_up_preserving_and_idempotent(tmp_path: Path) -> 
 
     db = MusicVaultDB(database_path, backup_dir=backups)
 
-    assert CURRENT_SCHEMA_VERSION == 9
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert CURRENT_SCHEMA_VERSION == 10
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 10
     assert db.migration_performed is True
     assert db.migrated_from_version == 7
-    assert db.migrated_to_version == 9
+    assert db.migrated_to_version == 10
     assert db.last_migration_backup is not None
     assert db.last_migration_backup.is_file()
     with sqlite3.connect(db.last_migration_backup) as backup:

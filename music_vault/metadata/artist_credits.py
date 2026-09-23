@@ -5,7 +5,7 @@ import sqlite3
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from .intelligence_schema import ARTIST_CREDIT_ROLES, ARTIST_ENTITY_TYPES
@@ -40,6 +40,10 @@ def _provider_id(value: object) -> str | None:
     return identifier or None
 
 
+def _credited_name(value: object) -> str | None:
+    return _display_name(value) if str(value or "").strip() else None
+
+
 @dataclass(frozen=True)
 class Artist:
     id: int
@@ -59,6 +63,7 @@ class ArtistCreditInput:
     entity_type: str = "unknown"
     discogs_artist_id: str | None = None
     musicbrainz_artist_id: str | None = None
+    credited_as: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,7 @@ class TrackArtistCredit:
     confidence: float | None
     is_manual: bool
     is_locked: bool
+    credited_as: str | None = None
 
 
 def _artist_from_row(row: sqlite3.Row) -> Artist:
@@ -320,45 +326,39 @@ class ArtistCreditService:
             ):
                 raise ValueError("MusicBrainz artist ID cannot be reassigned.")
 
+        if candidate is not None:
+            # Credits can vary per recording without changing the shared artist.
+            # Do not invalidate other tracks' identity fingerprints merely by
+            # observing the same entity again (including a repaired alias).
+            desired = (
+                candidate["display_name"] if candidate_from_alias else display,
+                candidate["normalized_name"] if candidate_from_alias else normalized,
+                candidate["sort_name"] if candidate_from_alias else normalized,
+                kind if candidate["entity_type"] == "unknown" else candidate["entity_type"],
+                candidate["discogs_artist_id"] if candidate["discogs_artist_id"] is not None else discogs_id,
+                candidate["musicbrainz_artist_id"] if candidate["musicbrainz_artist_id"] is not None else musicbrainz_id,
+            )
+            existing = tuple(candidate[key] for key in (
+                "display_name", "normalized_name", "sort_name", "entity_type",
+                "discogs_artist_id", "musicbrainz_artist_id",
+            ))
+            if desired == existing:
+                return _artist_from_row(candidate)
+
         now = datetime_now()
         with self._transaction(commit=commit):
             if candidate is not None:
                 artist_id = int(candidate["id"])
-                if candidate_from_alias:
-                    # A corrected legacy spelling is lookup evidence, not a
-                    # request to rename the canonical artist back to the
-                    # malformed display string.
-                    self.conn.execute(
-                        """
-                        UPDATE artists SET
-                            entity_type=CASE WHEN entity_type='unknown' THEN ? ELSE entity_type END,
-                            updated_at=?
-                        WHERE id=?
-                        """,
-                        (kind, now, artist_id),
-                    )
-                else:
-                    self.conn.execute(
-                        """
-                        UPDATE artists SET
-                            display_name=?, normalized_name=?, sort_name=?,
-                            entity_type=CASE WHEN entity_type='unknown' THEN ? ELSE entity_type END,
-                            discogs_artist_id=COALESCE(discogs_artist_id, ?),
-                            musicbrainz_artist_id=COALESCE(musicbrainz_artist_id, ?),
-                            updated_at=?
-                        WHERE id=?
-                        """,
-                        (
-                            display,
-                            normalized,
-                            normalized,
-                            kind,
-                            discogs_id,
-                            musicbrainz_id,
-                            now,
-                            artist_id,
-                        ),
-                    )
+                self.conn.execute(
+                    """
+                    UPDATE artists SET
+                        display_name=?, normalized_name=?, sort_name=?,
+                        entity_type=?, discogs_artist_id=?, musicbrainz_artist_id=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (*desired, now, artist_id),
+                )
             else:
                 artist_id = int(
                     self.conn.execute(
@@ -387,7 +387,7 @@ class ArtistCreditService:
     @staticmethod
     def _coerce_credit(value: ArtistCreditInput | Mapping[str, object]) -> ArtistCreditInput:
         if isinstance(value, ArtistCreditInput):
-            return value
+            return replace(value, credited_as=_credited_name(value.credited_as))
         if not isinstance(value, Mapping):
             raise TypeError("Artist credits must be ArtistCreditInput or mapping values.")
         return ArtistCreditInput(
@@ -405,21 +405,23 @@ class ArtistCreditService:
                 if value.get("musicbrainz_artist_id") not in (None, "")
                 else None
             ),
+            credited_as=_credited_name(value.get("credited_as")),
         )
 
     @staticmethod
     def formatted_credit(credits: Sequence[TrackArtistCredit]) -> str:
         parts: list[str] = []
         for index, credit in enumerate(credits):
+            display = credit.credited_as or credit.artist.display_name
             if index == 0:
-                parts.append(credit.artist.display_name)
+                parts.append(display)
                 continue
             join = credit.join_phrase or ", "
             if join and not join[0].isspace() and join not in {",", "/", "&", "x"}:
                 join = f" {join} "
             elif join in {",", "/", "&", "x"}:
                 join = f" {join} " if join != "," else ", "
-            parts.append(f"{join}{credit.artist.display_name}")
+            parts.append(f"{join}{display}")
         return "".join(parts).strip()
 
     def replace_track_credits(
@@ -496,6 +498,42 @@ class ArtistCreditService:
             if provider_reference not in (None, "")
             else None
         )
+        has_credited_as = any(
+            row["name"] == "credited_as"
+            for row in self.conn.execute("PRAGMA table_info(track_artist_credits)")
+        )
+        if not has_credited_as and any(value.credited_as is not None for value in prepared):
+            # Historical raw SQLite tools may intentionally use an older schema.
+            # Ordinary credits remain compatible, but aliases must not silently
+            # become canonical names or appear saved when they cannot persist.
+            raise ValueError("Track-specific credited names require schema 10.")
+        normalized_provenance = str(provenance or "unknown").strip().casefold()
+        # A repeated accepted proposal must not churn artist/credit timestamps,
+        # IDs, display history or canonical album projections. This shortcut is
+        # deliberately exact; it never resolves a different identity by name.
+        same = len(existing_credits) == len(prepared) and all(
+            value.display_name == old.artist.display_name
+            and value.role.strip().casefold() == old.role
+            and value.join_phrase == old.join_phrase
+            and value.credited_as == old.credited_as
+            and _provider_id(value.discogs_artist_id) == old.artist.discogs_artist_id
+            and _provider_id(value.musicbrainz_artist_id) == old.artist.musicbrainz_artist_id
+            and (value.entity_type.strip().casefold() == "unknown"
+                 or value.entity_type.strip().casefold() == old.artist.entity_type)
+            and normalized_provenance == old.provenance
+            and reference == old.provider_reference
+            and score == old.confidence
+            and bool(is_manual) == old.is_manual
+            and bool(is_locked or (is_manual and update_display)) == old.is_locked
+            for value, old in zip(prepared, existing_credits)
+        )
+        if same:
+            display = self.formatted_credit(existing_credits)
+            current_display = self.conn.execute(
+                "SELECT artist FROM tracks WHERE id=?", (int(track_id),)
+            ).fetchone()[0]
+            if not update_display or current_display == display:
+                return existing_credits
         now = datetime_now()
         with self._transaction(commit=commit):
             artist_ids: list[int] = []
@@ -516,12 +554,12 @@ class ArtistCreditService:
             self.conn.execute("DELETE FROM track_artist_credits WHERE track_id=?", (int(track_id),))
             for order, (value, artist_id) in enumerate(zip(prepared, artist_ids, strict=True)):
                 self.conn.execute(
-                    """
+                    f"""
                     INSERT INTO track_artist_credits (
                         track_id, artist_id, role, credit_order, join_phrase,
                         provenance, provider_reference, confidence, is_manual, is_locked,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, updated_at{', credited_as' if has_credited_as else ''}
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{', ?' if has_credited_as else ''})
                     """,
                     (
                         int(track_id),
@@ -529,13 +567,14 @@ class ArtistCreditService:
                         value.role.strip().casefold(),
                         order,
                         value.join_phrase,
-                        str(provenance or "unknown").strip().casefold(),
+                        normalized_provenance,
                         reference,
                         score,
                         int(is_manual),
                         int(is_locked),
                         now,
                         now,
+                        *((value.credited_as,) if has_credited_as else ()),
                     ),
                 )
             stored = self.track_credits(track_id)
@@ -592,6 +631,7 @@ class ArtistCreditService:
                 confidence=(float(row["confidence"]) if row["confidence"] is not None else None),
                 is_manual=bool(row["is_manual"]),
                 is_locked=bool(row["is_locked"]),
+                credited_as=row["credited_as"] if "credited_as" in row.keys() else None,
             )
             for row in rows
         )

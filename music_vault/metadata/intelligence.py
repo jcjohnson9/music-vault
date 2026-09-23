@@ -24,6 +24,12 @@ from .ensemble import (
     build_metadata_ensemble,
     versions_compatible,
 )
+from .evidence import normalize_candidate
+from .materializer import (
+    capture_metadata_state, materialize_proposal, state_fingerprint,
+    structural_change_fields,
+)
+from .resolver import resolve_metadata
 from .intelligence_schema import MetadataIntelligenceJobStore
 from .intelligence_settings import (
     DiscogsTokenStore,
@@ -31,9 +37,9 @@ from .intelligence_settings import (
 )
 from .musicbrainz_enricher import MusicBrainzProvider
 from .providers import ProviderQuery, ProviderReleaseCandidate
-from .review_policy import ReviewOutcome, classify_ensemble_outcome
+from .review_policy import ReviewDecision, ReviewOutcome, classify_ensemble_outcome
 from .schema import EDITABLE_METADATA_FIELDS
-from .service import AutomaticMetadataField, MetadataService
+from .service import AutomaticMetadataField, MetadataChangeResult, MetadataService
 from .soundtrack import classify_soundtrack
 from .tag_writer import MediaBackup, SafeTagWriter, TagWriteError, TagWriteResult
 from .title_parser import (
@@ -684,6 +690,7 @@ class MetadataIntelligenceService:
         if candidate is None:
             return {}
         names = (
+            "provider",
             "title",
             "artist",
             "album",
@@ -702,6 +709,7 @@ class MetadataIntelligenceService:
             "release_family_id",
             "track_position",
             "recording_id",
+            "release_group_id",
         )
         summary = {
             name: _safe_scalar(getattr(candidate, name, None))
@@ -728,6 +736,9 @@ class MetadataIntelligenceService:
                         credit.get("entity_type") or "unknown"
                     ).strip().casefold(),
                 }
+                for name_key in ("provider", "canonical_name", "credited_as"):
+                    if credit.get(name_key):
+                        normalized[name_key] = str(credit[name_key])
                 for identity_key in (
                     "artist_id",
                     "discogs_artist_id",
@@ -884,6 +895,17 @@ class MetadataIntelligenceService:
                     COALESCE(excluded.confidence,0)
                 ),
                 updated_at=excluded.updated_at
+            WHERE (track_release_context.discogs_release_id IS NULL AND excluded.discogs_release_id IS NOT NULL)
+               OR (track_release_context.discogs_master_id IS NULL AND excluded.discogs_master_id IS NOT NULL)
+               OR (track_release_context.provider_release_family_id IS NULL AND excluded.provider_release_family_id IS NOT NULL)
+               OR (track_release_context.release_title IS NULL AND excluded.release_title IS NOT NULL)
+               OR (track_release_context.release_country IS NULL AND excluded.release_country IS NOT NULL)
+               OR (track_release_context.release_format IS NULL AND excluded.release_format IS NOT NULL)
+               OR (track_release_context.label_name IS NULL AND excluded.label_name IS NOT NULL)
+               OR (track_release_context.release_date IS NULL AND excluded.release_date IS NOT NULL)
+               OR (track_release_context.original_release_date IS NULL AND excluded.original_release_date IS NOT NULL)
+               OR (track_release_context.provider_reference IS NULL AND excluded.provider_reference IS NOT NULL)
+               OR COALESCE(excluded.confidence,0)>COALESCE(track_release_context.confidence,0)
             """,
             (
                 int(track_id),
@@ -941,18 +963,20 @@ class MetadataIntelligenceService:
             and family_resolution.value not in (None, "")
             else None
         )
-        db.conn.execute(
-            """
-            UPDATE tracks SET
-                discogs_release_id=COALESCE(?, discogs_release_id),
-                discogs_master_id=COALESCE(?, discogs_master_id),
-                discogs_track_position=COALESCE(?, discogs_track_position),
-                recording_group_key=COALESCE(?, recording_group_key),
-                updated_at=CURRENT_TIMESTAMP
-            WHERE id=?
-            """,
-            (*values.values(), int(track_id)),
-        )
+        current = db.get_track(track_id)
+        if any(value is not None and current[name] != value for name, value in values.items()):
+            db.conn.execute(
+                """
+                UPDATE tracks SET
+                    discogs_release_id=COALESCE(?, discogs_release_id),
+                    discogs_master_id=COALESCE(?, discogs_master_id),
+                    discogs_track_position=COALESCE(?, discogs_track_position),
+                    recording_group_key=COALESCE(?, recording_group_key),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (*values.values(), int(track_id)),
+            )
         self._apply_release_context(
             db,
             track_id,
@@ -1000,16 +1024,19 @@ class MetadataIntelligenceService:
             and release_group_id in (None, "")
         ):
             return
-        db.conn.execute(
-            """
-            UPDATE tracks SET
-                musicbrainz_recording_id=COALESCE(?, musicbrainz_recording_id),
-                musicbrainz_release_id=COALESCE(?, musicbrainz_release_id),
-                updated_at=CURRENT_TIMESTAMP
-            WHERE id=?
-            """,
-            (recording_id, release_id, int(track_id)),
-        )
+        current = db.get_track(track_id)
+        if (recording_id is not None and current["musicbrainz_recording_id"] != recording_id
+                or release_id is not None and current["musicbrainz_release_id"] != release_id):
+            db.conn.execute(
+                """
+                UPDATE tracks SET
+                    musicbrainz_recording_id=COALESCE(?, musicbrainz_recording_id),
+                    musicbrainz_release_id=COALESCE(?, musicbrainz_release_id),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (recording_id, release_id, int(track_id)),
+            )
         if release_group_id not in (None, ""):
             score = getattr(candidate, "provider_score", getattr(candidate, "score", None))
             db.conn.execute(
@@ -1021,6 +1048,7 @@ class MetadataIntelligenceService:
                 ON CONFLICT(track_id) DO UPDATE SET
                     musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,
                     updated_at=excluded.updated_at
+                WHERE track_release_context.musicbrainz_release_group_id IS NOT excluded.musicbrainz_release_group_id
                 """,
                 (
                     int(track_id),
@@ -1033,25 +1061,23 @@ class MetadataIntelligenceService:
 
     @staticmethod
     def _credit_inputs(candidate: ProviderReleaseCandidate) -> list[ArtistCreditInput]:
-        inputs: list[ArtistCreditInput] = []
-        previous_join = ""
-        for index, credit in enumerate(candidate.artist_credits):
-            # Discogs attaches a join phrase to the preceding artist, while
-            # Music Vault stores it as the prefix for the following credit.
-            inputs.append(
-                ArtistCreditInput(
-                    display_name=credit.name,
-                    role=credit.role,
-                    join_phrase=previous_join if index else "",
-                    entity_type=credit.entity_type,
-                    discogs_artist_id=credit.artist_id,
-                )
-            )
-            previous_join = credit.join_phrase
-        return inputs
+        evidence = normalize_candidate(candidate)
+        return [ArtistCreditInput(
+            display_name=credit.canonical_name or credit.credited_as,
+            credited_as=credit.credited_as,
+            role=credit.role,
+            join_phrase=credit.prefix_join,
+            entity_type=credit.entity_type,
+            discogs_artist_id=next((identity.entity_id for identity in credit.identities
+                                    if identity.provider == "discogs"), None),
+            musicbrainz_artist_id=next((identity.entity_id for identity in credit.identities
+                                       if identity.provider == "musicbrainz"), None),
+        ) for credit in evidence.recording_credits]
 
     @staticmethod
-    def _credit_inputs_from_values(values: Sequence[object]) -> list[ArtistCreditInput]:
+    def _credit_inputs_from_values(
+        values: Sequence[object], *, provider: str | None = None,
+    ) -> list[ArtistCreditInput]:
         inputs: list[ArtistCreditInput] = []
         previous_join = ""
         for index, raw in enumerate(values):
@@ -1061,24 +1087,91 @@ class MetadataIntelligenceService:
                 continue
             inputs.append(
                 ArtistCreditInput(
-                    display_name=name,
+                    display_name=str(value.get("canonical_name") or name),
+                    credited_as=str(value.get("credited_as") or name),
                     role=str(value.get("role") or "primary"),
                     join_phrase=previous_join if index else "",
                     entity_type=str(value.get("entity_type") or "unknown"),
                     discogs_artist_id=(
-                        str(value.get("artist_id") or value.get("discogs_artist_id"))
-                        if value.get("artist_id") or value.get("discogs_artist_id")
+                        str(value.get("discogs_artist_id") or value.get("artist_id"))
+                        if value.get("discogs_artist_id") or (
+                            value.get("artist_id")
+                            and str(value.get("provider") or provider or "").casefold() == "discogs"
+                        )
                         else None
                     ),
                     musicbrainz_artist_id=(
-                        str(value.get("musicbrainz_artist_id"))
-                        if value.get("musicbrainz_artist_id")
+                        str(value.get("musicbrainz_artist_id") or value.get("artist_id"))
+                        if value.get("musicbrainz_artist_id") or (
+                            value.get("artist_id")
+                            and str(value.get("provider") or provider or "").casefold() == "musicbrainz"
+                        )
                         else None
                     ),
                 )
             )
             previous_join = str(value.get("join_phrase") or "")
         return inputs
+
+    def _materialize_analysis(self, db, track_id, metadata, proposal, ensemble, automatic):
+        """Commit accepted fields, catalogue identity and credits as one unit."""
+        before = metadata.snapshot(track_id)
+        with materialize_proposal(db.conn, proposal) as transaction:
+            if transaction.already_applied:
+                return MetadataChangeResult(track_id, None, frozenset(), before, before)
+            accepted_fields = {
+                name: value for name, value in automatic.items()
+                if name in proposal.field_names
+                or (name == "artwork" and proposal.allows_provider("discogs"))
+            }
+            result = metadata.apply_automatic_fields(
+                track_id, accepted_fields, minimum_confidence=60,
+                reason="best_available_automatic_metadata", commit=False,
+            )
+            if proposal.allows_provider("discogs"):
+                self._apply_provider_identity(db, track_id, ensemble)
+            if proposal.allows_provider("musicbrainz"):
+                self._apply_musicbrainz_identity(db, track_id, ensemble)
+            credits_field = ensemble.field("artist_credits")
+            credit_inputs = []
+            credit_reference = None
+            credit_provenance = ""
+            if proposal.credits_provider:
+                candidate = (
+                    ensemble.discogs_candidate if proposal.credits_provider == "discogs"
+                    else ensemble.musicbrainz_candidate
+                )
+                if candidate is not None:
+                    credit_inputs = self._credit_inputs(candidate)
+                    credit_reference = getattr(candidate, "provider_reference", None)
+                    credit_provenance = proposal.credits_provider
+            elif proposal.allow_source_credits and credits_field is not None:
+                credit_inputs = self._credit_inputs_from_values(credits_field.value)
+                credit_provenance = "youtube_title_parsed"
+            if credit_inputs and credits_field is not None:
+                ArtistCreditService(db).replace_track_credits(
+                    track_id, credit_inputs, provenance=credit_provenance,
+                    provider_reference=credit_reference, confidence=credits_field.score,
+                    commit=False,
+                )
+            graph_changed = structural_change_fields(
+                transaction.before, capture_metadata_state(db.conn, track_id),
+            )
+            if result.changed or credit_inputs or graph_changed:
+                metadata.finalize_identity(
+                    track_id, reconcile_artist="artist" in result.changed_fields and not credit_inputs,
+                )
+            after = metadata.snapshot(track_id)
+            changed = frozenset(
+                name for name in before.fields
+                if not metadata._same_state(before.fields[name], after.fields[name])
+            )
+            changed |= structural_change_fields(
+                transaction.before, capture_metadata_state(db.conn, track_id),
+            )
+        return MetadataChangeResult(
+            track_id, transaction.identifier if transaction.changed else None, changed, before, after,
+        )
 
     def _write_tags(
         self,
@@ -1219,6 +1312,7 @@ class MetadataIntelligenceService:
             return "cancelled"
         metadata = MetadataService(db)
         snapshot = metadata.snapshot(item.track_id)
+        analyzed_state = capture_metadata_state(db.conn, item.track_id)
         completion_fields = tuple(
             name for name in EDITABLE_METADATA_FIELDS if name != "artwork"
         )
@@ -1411,6 +1505,26 @@ class MetadataIntelligenceService:
             )
         )
         candidate = ensemble.discogs_candidate
+        evidence = tuple(
+            normalize_candidate(candidate_value)
+            for candidate_value in (ensemble.discogs_candidate, ensemble.musicbrainz_candidate)
+            if candidate_value is not None
+        )
+        resolver_values = {**current, **analyzed_state["track"]}
+        if analyzed_state["track_release_context"]:
+            resolver_values.update(analyzed_state["track_release_context"][0])
+        proposal = resolve_metadata(
+            track_id=int(item.track_id),
+            expected_fingerprint=state_fingerprint(analyzed_state),
+            current_values=resolver_values,
+            locked_fields=frozenset(name for name, field in snapshot.fields.items()
+                                    if field.is_manual or field.is_locked),
+            protected_credits=any(credit["is_manual"] or credit["is_locked"]
+                                  for credit in analyzed_state["track_artist_credits"]),
+            ensemble=ensemble, evidence=evidence,
+            rejected_providers=frozenset(name for name, rejected in provider_duration_mismatch.items()
+                                         if rejected),
+        )
         file_write_result = "not_requested"
         committed_tags: _CommittedTagWrite | None = None
         try:
@@ -1450,71 +1564,9 @@ class MetadataIntelligenceService:
                             provider="discogs_high_confidence",
                             provider_reference=artwork_record.provider_page_url,
                         )
-                result = metadata.apply_automatic_fields(
-                    item.track_id,
-                    effective_automatic,
-                    minimum_confidence=60,
-                    reason="best_available_automatic_metadata",
-                    commit=False,
+                result = self._materialize_analysis(
+                    db, int(item.track_id), metadata, proposal, ensemble, effective_automatic,
                 )
-                if not provider_duration_mismatch["discogs"]:
-                    self._apply_provider_identity(db, item.track_id, ensemble)
-                if not provider_duration_mismatch["musicbrainz"]:
-                    self._apply_musicbrainz_identity(db, item.track_id, ensemble)
-                credits_field = ensemble.field("artist_credits")
-                credit_inputs: list[ArtistCreditInput] = []
-                credit_provenance = ""
-                credit_reference = None
-                if (
-                    candidate is not None
-                    and not provider_duration_mismatch["discogs"]
-                    and credits_field is not None
-                    and credits_field.source == "discogs"
-                    and credits_field.score >= 60.0
-                    and not credits_field.conflict
-                    and credits_field.action is not FieldAction.REVIEW
-                    and candidate.artist_credits
-                ):
-                    credit_inputs = self._credit_inputs(candidate)
-                    credit_provenance = "discogs_best_available"
-                    credit_reference = candidate.provider_reference
-                elif (
-                    credits_field is not None
-                    and credits_field.source == "youtube_title_parsed"
-                    and credits_field.score >= 60.0
-                    and not credits_field.conflict
-                    and credits_field.action is not FieldAction.REVIEW
-                    and isinstance(credits_field.value, Sequence)
-                ):
-                    credit_inputs = self._credit_inputs_from_values(
-                        credits_field.value
-                    )
-                    credit_provenance = "youtube_title_parsed"
-                latest_artist = metadata.snapshot(item.track_id).fields["artist"]
-                protected_credit = db.conn.execute(
-                    "SELECT 1 FROM track_artist_credits "
-                    "WHERE track_id=? AND (is_manual=1 OR is_locked=1) LIMIT 1",
-                    (int(item.track_id),),
-                ).fetchone()
-                if (
-                    credit_inputs
-                    and not latest_artist.is_manual
-                    and not latest_artist.is_locked
-                    and protected_credit is None
-                ):
-                    ArtistCreditService(db).replace_track_credits(
-                        item.track_id,
-                        credit_inputs,
-                        provenance=credit_provenance,
-                        provider_reference=credit_reference,
-                        confidence=credits_field.score,
-                        commit=False,
-                    )
-                # Build the album identity only after both durable release IDs
-                # and accepted structured credits are saved.  A fallback album
-                # must use the new primary credit, never the legacy combined
-                # artist display that the accepted evidence just replaced.
-                upsert_track_canonical_album(db.conn, int(item.track_id))
                 if settings.get("metadata_writeback_enabled") is True and result.changed:
                     file_write_result, committed_tags = self._write_tags(
                         db,
@@ -1564,9 +1616,24 @@ class MetadataIntelligenceService:
                 else None
             ),
         )
+        # A source-only version qualifier is not a rejected catalogue match.
+        # Keep its established conservative fallback classification; override
+        # the outcome only when identity evidence actually blocked a provider.
+        if proposal.blocked_providers and any(
+            reason.endswith("_identity_conflict") for reason in proposal.blocked_reasons
+        ):
+            decision = ReviewDecision(
+                ReviewOutcome.NEEDS_REVIEW, "identity_conflict",
+                critical_conflicts=proposal.blocked_reasons,
+            )
         state = decision.outcome.value
         review_reason = decision.reason
         proposals["_review_policy"] = decision.to_dict()
+        proposals["_resolution"] = {
+            "policy_version": proposal.policy_version,
+            "blocked_providers": list(proposal.blocked_providers),
+            "reasons": list(proposal.blocked_reasons),
+        }
         candidate = ensemble.discogs_candidate
         mb = ensemble.musicbrainz_candidate
         store.mark_item(
