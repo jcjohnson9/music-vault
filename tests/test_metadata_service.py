@@ -166,12 +166,15 @@ def test_candidate_selected_fields_lock_and_ids_persist(tmp_path):
         release_id="release",
         confidence=97,
     )
-    assert result.changed_fields == {"title", "artist"}
+    # The artist change also invalidates its fallback album grouping, without
+    # authorizing a different catalogue release or changing the album text.
+    assert result.changed_fields == {"title", "artist", "album"}
+    assert result.after.value("album") == result.before.value("album")
     assert result.after.fields["title"].provenance == "musicbrainz_confirmed"
     assert result.after.fields["title"].is_locked
     track = db.get_track(track_id)
     assert track["musicbrainz_recording_id"] == "recording"
-    assert track["musicbrainz_release_id"] == "release"
+    assert track["musicbrainz_release_id"] is None
     db.close()
 
 

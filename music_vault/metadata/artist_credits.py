@@ -438,6 +438,7 @@ class ArtistCreditService:
         reason: str = "artist_credit_update",
         update_display: bool = True,
         commit: bool = True,
+        confirmed_override: bool = False,
     ) -> tuple[TrackArtistCredit, ...]:
         if self.conn.execute("SELECT 1 FROM tracks WHERE id=?", (int(track_id),)).fetchone() is None:
             raise KeyError(f"Track {track_id} does not exist.")
@@ -466,20 +467,25 @@ class ArtistCreditService:
         if score is not None and not 0 <= score <= 100:
             raise ValueError("Artist-credit confidence must be between 0 and 100.")
 
-        # Structured automatic credits must never bypass the effective artist lock.
+        if confirmed_override and (
+            provenance not in {"musicbrainz_confirmed", "discogs_confirmed", "provider_confirmed"}
+            or not is_locked or is_manual
+        ):
+            raise ValueError("Explicit confirmed credits require confirmed provenance and a lock.")
+        # Only explicit user confirmation/manual editing may replace protected credits.
         field = self.conn.execute(
             "SELECT is_manual,is_locked FROM track_metadata_fields "
             "WHERE track_id=? AND field_name='artist'",
             (int(track_id),),
         ).fetchone()
         if (
-            not is_manual
+            not is_manual and not confirmed_override
             and field is not None
             and (bool(field["is_manual"]) or bool(field["is_locked"]))
         ):
             return self.track_credits(track_id)
         existing_credits = self.track_credits(track_id)
-        if not is_manual and any(
+        if not is_manual and not confirmed_override and any(
             credit.is_manual or credit.is_locked for credit in existing_credits
         ):
             return existing_credits
@@ -583,7 +589,13 @@ class ArtistCreditService:
                 from .service import MetadataAction, MetadataService
 
                 metadata = MetadataService(self.conn)
-                if is_manual:
+                if confirmed_override:
+                    metadata.apply_approved_metadata_patch(
+                        track_id, {"artist": display}, provenance=provenance,
+                        provider_reference=reference, confidence=score,
+                        actor=actor, reason=reason, commit=False,
+                    )
+                elif is_manual:
                     metadata.apply_actions(
                         track_id,
                         {"artist": MetadataAction.set(display)},
