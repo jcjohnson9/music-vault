@@ -1,8 +1,8 @@
-"""Gap-only Discogs release-artwork retrieval and private runtime caching.
+"""Guarded Discogs release-artwork retrieval and private runtime caching.
 
 Discogs images are restricted provider content.  This module therefore has a
 deliberately narrow boundary: it accepts only the front image attached to the
-already accepted release candidate, never replaces valid/manual/locked art,
+already accepted release candidate, never itself replaces effective art,
 never embeds an image in media, and stores only private runtime cache files
 plus the attribution needed to display them responsibly.
 """
@@ -550,6 +550,29 @@ class DiscogsArtworkCache:
             locked=locked,
         ):
             return None
+        return self.stage_accepted_front(
+            candidate, accepted_release_id=accepted_release_id, provider_score=provider_score,
+        )
+
+    def attribution_for_release(self, release_id: object) -> tuple[str, str] | None:
+        """Return the normal Discogs attribution label/link for cached art."""
+
+        identity = str(release_id or "").strip()
+        with self._lock:
+            raw = self._load()["entries"].get(identity)
+            if not isinstance(raw, Mapping):
+                return None
+            try:
+                url = validate_discogs_release_url(raw.get("provider_page_url"), identity)
+            except DiscogsArtworkError:
+                return None
+            return DISCOGS_ATTRIBUTION_TEXT, url
+
+    def stage_accepted_front(
+        self, candidate: ProviderArtworkCandidate, *, accepted_release_id: object,
+        provider_score: float,
+    ) -> DiscogsArtworkRecord:
+        """Acquire accepted front bytes; replacement authority is separate."""
         accepted_id = str(accepted_release_id or "").strip()
         if (
             not _RELEASE_ID_RE.fullmatch(accepted_id)
@@ -583,20 +606,6 @@ class DiscogsArtworkCache:
             return self._store(
                 candidate, prepared, validated_source_url=final_url
             )
-
-    def attribution_for_release(self, release_id: object) -> tuple[str, str] | None:
-        """Return the normal Discogs attribution label/link for cached art."""
-
-        identity = str(release_id or "").strip()
-        with self._lock:
-            raw = self._load()["entries"].get(identity)
-            if not isinstance(raw, Mapping):
-                return None
-            try:
-                url = validate_discogs_release_url(raw.get("provider_page_url"), identity)
-            except DiscogsArtworkError:
-                return None
-            return DISCOGS_ATTRIBUTION_TEXT, url
 
 
 __all__ = [

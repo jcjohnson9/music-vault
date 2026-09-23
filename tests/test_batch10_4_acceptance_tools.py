@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -207,6 +208,82 @@ def test_artist_cache_audit_detects_traversal_secret_fields_and_partial_payload(
     assert result["issues"]["temporary_file"] > 0
     assert result["issues"]["unexpected_payload"] > 0
     assert "synthetic-forbidden-value" not in json.dumps(result)
+
+
+def _selection_cache(root: Path):
+    cache = ArtistImageCache(root)
+    identity = ArtistIdentity.from_display_name("Synthetic Selection", canonical_artist_id=1,
+        musicbrainz_artist_id="11111111-1111-4111-8111-111111111111", discogs_artist_id="123")
+    provider = SyntheticArtistImageProvider()
+    cache.store(provider.resolve(identity))
+    second = provider.resolve(ArtistIdentity.from_display_name("Synthetic Other Color"))
+    cache.store(replace(second, identity=identity), replace_existing=True)
+    return cache, identity
+
+
+def test_artist_cache_audit_accepts_legacy_pin_and_bounded_restore(tmp_path):
+    legacy = _cache(tmp_path / "legacy", synthetic=True)
+    payload = json.loads(legacy.index_path.read_text(encoding="utf-8"))
+    record = next(iter(payload["entries"].values()))
+    record.pop("requested_musicbrainz_artist_id")
+    record.pop("requested_discogs_artist_id")
+    legacy.index_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert batch104.audit_artist_cache(legacy.root, allow_synthetic=True)["ok"]
+    cache, identity = _selection_cache(tmp_path / "selected")
+    for action in ("pin", "unpin", "restore"):
+        revision = cache.selection(identity).revision
+        if action == "restore":
+            cache.restore_previous(identity, expected_revision=revision)
+        else:
+            cache.set_pinned(identity, action == "pin", expected_revision=revision)
+        before = {path: path.read_bytes() for path in cache.root.rglob("*") if path.is_file()}
+        result = batch104.audit_artist_cache(cache.root, allow_synthetic=True)
+        assert result["ok"], result["issues"]
+        assert result["counts"]["referenced_image_count"] == 2
+        assert result["counts"]["orphan_image_count"] == 0
+        assert "Synthetic Selection" not in json.dumps(result)
+        assert before == {path: path.read_bytes() for path in before}
+
+
+@pytest.mark.parametrize("field,value,issue", [
+    ("cache_file", "../outside.png", "path_violation"),
+    ("api_token", "synthetic-forbidden-value", "secret_field"),
+    ("source_page_url", "https://example.invalid/?token=synthetic", "unsafe_url"),
+    ("selection_revision", "C:/private/location", "unexpected_entry"),
+    ("pin_override", "true", "unexpected_entry"),
+    ("requested_discogs_artist_id", "../private", "unexpected_entry"),
+    ("requested_musicbrainz_artist_id", "not-an-identifier", "unexpected_entry"),
+    ("previous_selection", {}, "unexpected_entry"),
+])
+def test_artist_cache_audit_checks_previous_selection_privacy_and_bounds(tmp_path, field, value, issue):
+    cache, _ = _selection_cache(tmp_path / "selected")
+    payload = json.loads(cache.index_path.read_text(encoding="utf-8"))
+    previous = next(iter(payload["entries"].values()))["previous_selection"]
+    previous[field] = value
+    cache.index_path.write_text(json.dumps(payload), encoding="utf-8")
+    result = batch104.audit_artist_cache(cache.root, allow_synthetic=True)
+    assert not result["ok"] and result["issues"][issue] > 0
+    assert "synthetic-forbidden-value" not in json.dumps(result)
+    assert "outside.png" not in json.dumps(result)
+
+
+def test_artist_cache_audit_accepts_cleared_alias_marker_but_rejects_bad_reference(tmp_path):
+    cache = _cache(tmp_path / "selected", synthetic=True)
+    legacy = ArtistIdentity.from_display_name("Synthetic Acceptance Artist")
+    first = ArtistIdentity.from_display_name(legacy.display_name, canonical_artist_id=1)
+    other = ArtistIdentity.from_display_name(legacy.display_name, canonical_artist_id=2)
+    cache.set_pinned(legacy, True, expected_revision=cache.selection(legacy).revision)
+    for identity in (first, other):
+        cache._load()["aliases"][cache._entry_key(identity)] = [cache._entry_key(legacy)]
+    cache._write_manifest()
+    cache.set_pinned(first, False, expected_revision=cache.selection(first).revision)
+    cache.clear()
+    result = batch104.audit_artist_cache(cache.root, allow_synthetic=True)
+    assert result["ok"], result["issues"]
+    payload = json.loads(cache.index_path.read_text(encoding="utf-8"))
+    payload["entries"][cache._entry_key(first)]["protected_selection_keys"] = ["../bad"]
+    cache.index_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert not batch104.audit_artist_cache(cache.root, allow_synthetic=True)["ok"]
 
 
 def test_artist_cache_audit_rejects_duplicate_json_keys_without_identity_output(

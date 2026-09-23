@@ -8,6 +8,7 @@ import os
 import time
 from functools import partial
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -2882,6 +2883,12 @@ class MusicVaultWindow(QMainWindow):
         model = self._browser_model(kind)
         proxy = self._browser_proxy(kind)
         changed = self._browser_model_revisions.get(kind) != revision
+        if changed and kind == "artists":
+            # A canonical card can acquire new provider identity while its old
+            # request is in flight. Retire that generation before replacing the
+            # summaries; rejecting its stale callback must not strand the card.
+            self.artist_image_service.cancel_all()
+            self._pending_artist_image_keys.clear()
         self._browser_summary_maps[kind] = {
             summary.browser_key: summary for summary in summaries
         }
@@ -2974,6 +2981,28 @@ class MusicVaultWindow(QMainWindow):
             item = self.artist_browser_model.item_for_key(browser_key)
             if item is not None:
                 menu.addSeparator()
+                identity = self.artist_image_identity(summary)
+                selection = self.artist_image_cache.selection(identity)
+                local_selection_allowed = not self._current_runtime_policy().migration_performed
+                if selection.result is not None and (selection.result.resolved or selection.pinned):
+                    pin_action = menu.addAction(
+                        "Unpin Artist Photo" if selection.pinned else "Keep This Artist Photo"
+                    )
+                    pin_action.setEnabled(local_selection_allowed)
+                    pin_action.triggered.connect(
+                        lambda: self.change_artist_photo_selection(
+                            browser_key, "unpin" if selection.pinned else "pin",
+                            identity, selection.revision,
+                        )
+                    )
+                if selection.can_restore:
+                    restore_action = menu.addAction("Restore Previous Artist Photo")
+                    restore_action.setEnabled(local_selection_allowed)
+                    restore_action.triggered.connect(
+                        lambda: self.change_artist_photo_selection(
+                            browser_key, "restore", identity, selection.revision,
+                        )
+                    )
                 if self.config.get("artist_image_fetch_enabled") is True:
                     summary = self._browser_summary_maps["artists"].get(browser_key)
                     if (
@@ -2984,7 +3013,7 @@ class MusicVaultWindow(QMainWindow):
                             ui_icon("refresh", 18),
                             "Refresh Artist Photo",
                         )
-                        refresh_action.setEnabled(self._provider_work_allowed())
+                        refresh_action.setEnabled(self._provider_work_allowed() and not selection.pinned)
                         refresh_action.triggered.connect(
                             lambda: self.refresh_artist_photo(browser_key)
                         )
@@ -2996,6 +3025,7 @@ class MusicVaultWindow(QMainWindow):
                     clear_action.triggered.connect(
                         lambda: self.clear_cached_artist_photo(browser_key)
                     )
+                    clear_action.setEnabled(not selection.pinned)
                 if item.source_url and is_safe_artist_source_url(item.source_url):
                     source_action = menu.addAction(
                         ui_icon("folder", 18),
@@ -3075,6 +3105,10 @@ class MusicVaultWindow(QMainWindow):
                     ArtistIdentity.from_display_name(summary.display_name),
                     repair=False,
                 )
+                if cached is not None:
+                    # The canonical browser proved this legacy name unambiguous;
+                    # bind this cache-only result to that exact current identity.
+                    cached = replace(cached, identity=identity)
             if cached is not None and cached.status is ArtistImageStatus.RESOLVED:
                 self._artist_image_result(browser_key, cached)
                 continue
@@ -3182,13 +3216,17 @@ class MusicVaultWindow(QMainWindow):
         browser_key: str,
         result: ArtistImageResult,
     ) -> None:
-        self._pending_artist_image_keys.discard(browser_key)
         summary = self._browser_summary_maps["artists"].get(browser_key)
         item = self.artist_browser_model.item_for_key(browser_key)
         if not isinstance(summary, ArtistSummary) or item is None:
             return
-        if result.identity.normalized_key != summary.key.normalized_name:
+        if not self._same_artist_image_identity(result.identity, self.artist_image_identity(summary)):
             return
+        self._pending_artist_image_keys.discard(browser_key)
+        if not result.resolved:
+            retained = self.artist_image_cache.lookup(result.identity, repair=False)
+            if retained is not None and retained.resolved:
+                result = retained
 
         if (
             result.status is ArtistImageStatus.RESOLVED
@@ -3223,6 +3261,47 @@ class MusicVaultWindow(QMainWindow):
             source_url=None,
         )
 
+    @staticmethod
+    def _same_artist_image_identity(left: ArtistIdentity, right: ArtistIdentity) -> bool:
+        return (
+            left.normalized_key, left.canonical_artist_id,
+            left.discogs_artist_id, left.musicbrainz_artist_id,
+        ) == (
+            right.normalized_key, right.canonical_artist_id,
+            right.discogs_artist_id, right.musicbrainz_artist_id,
+        )
+
+    def change_artist_photo_selection(
+        self, browser_key: str, action: str, identity: ArtistIdentity, revision: str,
+    ) -> None:
+        """Change only a revision-bound local portrait selection, never media."""
+        if self._current_runtime_policy().migration_performed:
+            self._show_provider_deferred()
+            return
+        summary = self._browser_summary_maps["artists"].get(browser_key)
+        item = self.artist_browser_model.item_for_key(browser_key)
+        if (not isinstance(summary, ArtistSummary) or item is None
+                or not self._same_artist_image_identity(identity, self.artist_image_identity(summary))):
+            return
+        try:
+            if action == "restore":
+                result = self.artist_image_cache.restore_previous(identity, expected_revision=revision)
+            elif action in {"pin", "unpin"}:
+                result = self.artist_image_cache.set_pinned(identity, action == "pin", expected_revision=revision)
+            else:
+                return
+        except Exception:
+            self.statusBar().showMessage("Photo selection changed or is unavailable. Reopen the menu to try again.", 7000)
+            return
+        if item.artwork_path:
+            self.thumbnail_cache.invalidate_source(item.artwork_path)
+        self._artist_image_result(browser_key, result)
+        self.refresh_artist_cache_status()
+        self.statusBar().showMessage(
+            {"restore": "Previous artist photo restored.", "pin": "Artist photo pinned; automatic replacement is disabled.",
+             "unpin": "Artist photo unpinned."}[action], 6000,
+        )
+
     def refresh_artist_photo(self, browser_key: str) -> None:
         if not self._provider_work_allowed():
             self._show_provider_deferred()
@@ -3237,6 +3316,9 @@ class MusicVaultWindow(QMainWindow):
             or item is None
             or browser_key in self._pending_artist_image_keys
         ):
+            return
+        if self.artist_image_cache.selection(self.artist_image_identity(summary)).pinned:
+            self.statusBar().showMessage("Unpin this artist photo before refreshing it.", 6000)
             return
         self._pending_artist_image_keys.add(browser_key)
         self.artist_browser_model.replace_item(
@@ -3322,6 +3404,9 @@ class MusicVaultWindow(QMainWindow):
             has_cached_image=False,
             source_url=None,
         )
+        retained = self.artist_image_cache.lookup(self.artist_image_identity(summary), repair=False)
+        if retained is not None:
+            self._artist_image_result(browser_key, retained)
         if self.current_view_kind == "artists":
             self.load_visible_browser_images(
                 tuple(
@@ -5124,7 +5209,7 @@ class MusicVaultWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Clear artist-photo cache?",
-            "Delete cached artist photos and lookup results only? Your music, "
+            "Delete unpinned cached artist photos and lookup results only? Pinned photos are kept. Your music, "
             "metadata, database, and album artwork will not be changed.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -5144,11 +5229,16 @@ class MusicVaultWindow(QMainWindow):
                 has_cached_image=False,
                 source_url=None,
             )
+            summary = self._browser_summary_maps["artists"].get(item.key)
+            if isinstance(summary, ArtistSummary):
+                retained = self.artist_image_cache.lookup(self.artist_image_identity(summary), repair=False)
+                if retained is not None:
+                    self._artist_image_result(item.key, retained)
         self.refresh_artist_cache_status()
         QMessageBox.information(
             self,
             "Artist photos cleared",
-            "The local artist-photo cache was cleared.",
+            "Unpinned cached photos were cleared. Pinned photos were kept.",
         )
 
     def open_artist_image_cache_folder(self) -> None:
