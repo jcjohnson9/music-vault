@@ -16,6 +16,7 @@ from music_vault.metadata.intelligence import (
     MetadataIntelligenceService,
 )
 from music_vault.metadata.intelligence_schema import MetadataIntelligenceJobStore
+from music_vault.metadata.materializer import capture_metadata_state
 from music_vault.metadata.service import MetadataService
 from music_vault.ui.metadata_intelligence import MetadataIntelligenceDialog
 
@@ -263,6 +264,8 @@ def test_field_checkboxes_apply_only_selected_scalars_with_locks_and_history(
     assert all(checkbox.isChecked() for checkbox in dialog.field_checks.values())
     assert dialog.apply_fields_button.isEnabled()
     dialog.field_checks["album"].setChecked(False)
+    before_graph = capture_metadata_state(db.conn, track_id)
+    before_album = MetadataService(db).snapshot(track_id).fields["album"]
     dialog._apply_selected_fields()
 
     snapshot = MetadataService(db).snapshot(track_id)
@@ -281,13 +284,16 @@ def test_field_checkboxes_apply_only_selected_scalars_with_locks_and_history(
         "AND reason='metadata_intelligence_review_selection' ORDER BY field_name",
         (track_id,),
     ).fetchall()
-    assert {str(row["field_name"]) for row in history} == selected_fields
+    # Version selection changes canonical album grouping, not the unchecked
+    # album's scalar authority. The complete journal also audits that structure.
+    assert {str(row["field_name"]) for row in history} == selected_fields | {"album"}
+    assert snapshot.fields["album"] == before_album
     assert len({str(row["change_group_id"]) for row in history}) == 1
     assert all(
         row["actor"] == "user"
         and int(row["new_is_manual"]) == 1
         and int(row["new_is_locked"]) == 1
-        for row in history
+        for row in history if row["field_name"] in selected_fields
     )
     item = db.conn.execute(
         "SELECT state,review_reason,applied_history_group "
@@ -299,6 +305,8 @@ def test_field_checkboxes_apply_only_selected_scalars_with_locks_and_history(
     assert item["review_reason"] is None
     assert item["applied_history_group"] == history[0]["change_group_id"]
     assert emitted == [track_id]
+    MetadataService(db).undo_last_change(track_id)
+    assert capture_metadata_state(db.conn, track_id) == before_graph
 
 
 def test_resume_signal_emits_only_after_a_successful_persisted_resume(

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from music_vault.core.safety import sanitize_error_text
+from music_vault.metadata.materializer import StaleMetadataProposal
 from music_vault.metadata.review_policy import classify_stored_review_evidence
 from music_vault.metadata.schema import EDITABLE_METADATA_FIELDS
 
@@ -213,7 +214,7 @@ class MetadataIntelligenceDialog(QDialog):
         self.table.setHorizontalHeaderLabels(
             [
                 "State",
-                "Current Metadata",
+                "Metadata Snapshot",
                 "YouTube Title Hint",
                 "Uploader Provenance",
                 "Discogs Proposal",
@@ -548,6 +549,8 @@ class MetadataIntelligenceDialog(QDialog):
         )
 
     def _clear_field_choices(self) -> None:
+        self._review_item_id = None
+        self._review_revision = None
         for checkbox in self.field_checks.values():
             self.field_choice_layout.removeWidget(checkbox)
             checkbox.deleteLater()
@@ -555,6 +558,11 @@ class MetadataIntelligenceDialog(QDialog):
 
     def _populate_field_choices(self) -> None:
         self._clear_field_choices()
+        self.field_choice_hint.setText(
+            "Select a legacy pending row to choose individual saved proposals. "
+            "Selected values become manual, locked corrections; provider identities "
+            "and audio-file tags are not imported."
+        )
         self._refresh_discogs_attribution()
         rows = self.table.selectionModel().selectedRows()
         if len(rows) != 1:
@@ -567,6 +575,26 @@ class MetadataIntelligenceDialog(QDialog):
             (item_id,),
         ).fetchone() if item_id is not None else None
         proposal = _decoded(row["field_proposal"] if row is not None else None)
+        reviewable = row is not None and str(row["state"]) in {"review", "ready"}
+        if reviewable and self.service is not None:
+            try:
+                prepared = self.service.prepare_review_fields(item_id)
+            except (KeyError, ValueError, RuntimeError) as exc:
+                self.field_choice_hint.setText(
+                    "Saved review is unavailable. Refresh before applying: "
+                    + sanitize_error_text(exc)
+                )
+                self.field_choice_hint.show()
+                self.apply_fields_button.setEnabled(False)
+                return
+            proposal = prepared.values
+            self._review_item_id = item_id
+            self._review_revision = prepared.revision
+            self.field_choice_hint.setText(
+                "Current now: " + self._summary_text(prepared.current_values)
+                + "\nApply only the saved fields you want to make manual and locked. "
+                "Provider identities and audio-file tags are not imported."
+            )
         for name in EDITABLE_METADATA_FIELDS:
             value = proposal.get(name)
             if value in (None, "") or isinstance(value, (Mapping, list, tuple)):
@@ -577,17 +605,32 @@ class MetadataIntelligenceDialog(QDialog):
             self.field_checks[name] = checkbox
             index = len(self.field_checks) - 1
             self.field_choice_layout.addWidget(checkbox, index // 3, index % 3)
-        reviewable = row is not None and str(row["state"]) in {"review", "ready"}
-        self.field_choice_hint.setVisible(not bool(self.field_checks))
-        self.apply_fields_button.setEnabled(reviewable and bool(self.field_checks))
+        self.field_choice_hint.setVisible(reviewable or not bool(self.field_checks))
+        self.apply_fields_button.setEnabled(
+            self._review_revision is not None and bool(self.field_checks)
+        )
 
     def _apply_selected_fields(self) -> None:
         item_id = self._selected_item_id()
         if item_id is None or self.service is None:
             return
+        if item_id != self._review_item_id or self._review_revision is None:
+            self.apply_fields_button.setEnabled(False)
+            return
         selected = [name for name, checkbox in self.field_checks.items() if checkbox.isChecked()]
         try:
-            result = self.service.apply_review_fields(item_id, selected)
+            result = self.service.apply_review_fields(
+                item_id, selected, expected_revision=self._review_revision,
+            )
+        except StaleMetadataProposal:
+            self._review_revision = None
+            self.apply_fields_button.setEnabled(False)
+            QMessageBox.warning(
+                self, "Review changed",
+                "The saved proposal or library metadata changed after these choices "
+                "were shown. Nothing was applied. Refresh and review the choices again.",
+            )
+            return
         except Exception as exc:
             QMessageBox.warning(
                 self,

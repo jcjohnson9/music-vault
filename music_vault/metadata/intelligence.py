@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from music_vault.core.db import MusicVaultDB
@@ -26,7 +28,7 @@ from .ensemble import (
 )
 from .evidence import normalize_candidate
 from .materializer import (
-    capture_metadata_state, materialize_proposal, state_fingerprint,
+    StaleMetadataProposal, _writer, capture_metadata_state, materialize_proposal, state_fingerprint,
     structural_change_fields,
 )
 from .resolver import resolve_metadata
@@ -39,7 +41,7 @@ from .musicbrainz_enricher import MusicBrainzProvider
 from .providers import ProviderQuery, ProviderReleaseCandidate
 from .review_policy import ReviewDecision, ReviewOutcome, classify_ensemble_outcome
 from .schema import EDITABLE_METADATA_FIELDS
-from .service import AutomaticMetadataField, MetadataChangeResult, MetadataService
+from .service import AutomaticMetadataField, MetadataAction, MetadataChangeResult, MetadataService
 from .soundtrack import classify_soundtrack
 from .tag_writer import MediaBackup, SafeTagWriter, TagWriteError, TagWriteResult
 from .title_parser import (
@@ -64,6 +66,16 @@ class IntelligenceRunResult:
     cancelled: bool = False
     applied_with_gaps: int = 0
     source_fallback: int = 0
+
+
+@dataclass(frozen=True)
+class ReviewFieldSelection:
+    """One immutable, freshly read scalar review and its complete revision."""
+
+    track_id: int
+    values: Mapping[str, str]
+    current_values: Mapping[str, str | None]
+    revision: str
 
 
 @dataclass(frozen=True)
@@ -1801,15 +1813,10 @@ class MetadataIntelligenceService:
     def pause_job(self, job_id: str) -> None:
         MetadataIntelligenceJobStore(self.database).pause(job_id)
 
-    def apply_review_fields(
-        self,
-        item_id: int,
-        field_names: Sequence[str],
-    ):
-        """Apply a user's explicit field selection as locked manual metadata."""
-
+    def _capture_review_fields(self, item_id: int):
+        """Read inside a caller-held SQLite snapshot; never trust saved _current."""
         row = self.database.conn.execute(
-            "SELECT track_id,state,field_proposal FROM metadata_intelligence_items WHERE id=?",
+            "SELECT * FROM metadata_intelligence_items WHERE id=?",
             (int(item_id),),
         ).fetchone()
         if row is None:
@@ -1822,40 +1829,94 @@ class MetadataIntelligenceService:
             raise ValueError("The saved review proposal is invalid.") from exc
         if not isinstance(proposal, Mapping):
             raise ValueError("The saved review proposal is invalid.")
-        selected = list(dict.fromkeys(str(name) for name in field_names))
-        values = {
-            name: proposal[name]
-            for name in selected
-            if name in EDITABLE_METADATA_FIELDS
-            and name in proposal
-            and proposal[name] not in (None, "")
-            and not isinstance(proposal[name], (Mapping, list, tuple))
-        }
-        if not values:
-            raise ValueError("Select at least one proposed metadata field.")
+        job = self.database.conn.execute(
+            "SELECT * FROM metadata_intelligence_jobs WHERE id=?", (row["job_id"],),
+        ).fetchone()
+        if job is None:
+            raise ValueError("The saved review job is unavailable.")
+        metadata = MetadataService(self.database)
+        graph = capture_metadata_state(self.database.conn, int(row["track_id"]))
+        values = {}
+        for name in EDITABLE_METADATA_FIELDS:
+            value = proposal.get(name)
+            if (not isinstance(value, (str, int, float)) or isinstance(value, bool)
+                    or (isinstance(value, float) and not math.isfinite(value))):
+                continue
+            try:
+                normalized = metadata._normalized_value(name, value)
+            except (TypeError, ValueError):
+                continue
+            if normalized is not None:
+                values[name] = normalized
+        current = {name: state.value for name, state in metadata.snapshot(int(row["track_id"])).fields.items()}
+        fingerprint = state_fingerprint(graph)
+        selection = ReviewFieldSelection(
+            int(row["track_id"]), MappingProxyType(values), MappingProxyType(current),
+            state_fingerprint({"review_revision": 1, "item": dict(row), "job": dict(job), "metadata": graph}),
+        )
+        return selection, row, dict(proposal), fingerprint
+
+    def prepare_review_fields(self, item_id: int) -> ReviewFieldSelection:
+        """Prepare explicit saved scalars against one consistent read snapshot.
+
+        This does not re-run provider analysis or authorize hidden identities.
+        The UI must retain this revision until the selected fields are accepted.
+        A legacy saved proposal is reviewed against today's complete graph.
+        """
+        conn = self.database.conn
+        owns_snapshot = not conn.in_transaction
+        if owns_snapshot:
+            conn.execute("BEGIN")
+        try:
+            return self._capture_review_fields(item_id)[0]
+        finally:
+            if owns_snapshot:
+                conn.rollback()  # A read snapshot only; no caller work is owned.
+
+    def apply_review_fields(
+        self, item_id: int, field_names: Sequence[str], *, expected_revision: str | None = None,
+    ):
+        """Atomically accept visible selected scalars, without provider linkage.
+
+        Legacy synchronous callers may omit the revision; delayed/UI decisions
+        must pass the revision prepared when their choices were displayed.
+        """
         store = MetadataIntelligenceJobStore(self.database)
-        with self.database.conn:
-            result = MetadataService(self.database).apply_manual_patch(
-                int(row["track_id"]),
-                values,
+        with _writer(self.database.conn):
+            selection, row, proposal, fingerprint = self._capture_review_fields(item_id)
+            if expected_revision is not None and expected_revision != selection.revision:
+                raise StaleMetadataProposal("The review or library changed. Refresh the review before applying selected fields.")
+            selected = tuple(dict.fromkeys(str(name) for name in field_names))
+            if not selected or any(name not in selection.values for name in selected):
+                raise ValueError("Select only available proposed metadata fields.")
+            result = MetadataService(self.database).apply_manual_actions(
+                selection.track_id,
+                {name: MetadataAction.set(selection.values[name]) for name in selected},
+                expected_fingerprint=fingerprint,
                 actor="user",
                 reason="metadata_intelligence_review_selection",
                 commit=False,
             )
+            previous_group = row["applied_history_group"]
+            if previous_group and previous_group != result.change_group_id:
+                # Retain prior automatic acceptance provenance without claiming
+                # a no-op review created that old metadata history group.
+                key = "_review_previous_applied_history_groups"
+                previous = proposal.get(key, [])
+                if not isinstance(previous, list) or any(not isinstance(value, str) for value in previous):
+                    raise ValueError("The saved review history is invalid.")
+                proposal[key] = list(dict.fromkeys((*previous, str(previous_group))))
             self.database.conn.execute(
                 """
                 UPDATE metadata_intelligence_items
                 SET state='applied', review_reason=NULL,
-                    applied_history_group=COALESCE(?, applied_history_group),
+                    applied_history_group=?, field_proposal=?,
                     completed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
-                (result.change_group_id, int(item_id)),
+                (result.change_group_id, json.dumps(proposal, ensure_ascii=False, sort_keys=True), int(item_id)),
             )
-            store._refresh_job(str(self.database.conn.execute(
-                "SELECT job_id FROM metadata_intelligence_items WHERE id=?",
-                (int(item_id),),
-            ).fetchone()[0]))
+            store._refresh_job(str(row["job_id"]))
         return result
 
     def resume_job(self, job_id: str) -> None:
@@ -1890,5 +1951,6 @@ class MetadataIntelligenceService:
 __all__ = [
     "AUTOMATIC_IMPORT_JOB_ID",
     "IntelligenceRunResult",
+    "ReviewFieldSelection",
     "MetadataIntelligenceService",
 ]

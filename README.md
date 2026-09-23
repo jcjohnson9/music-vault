@@ -130,6 +130,13 @@ metadata graph, not just displayed strings. A later identity/credit change
 blocks rollback before any media restoration; historical scalar-only jobs
 retain their separate compatibility path.
 
+Saved intelligence reviews show the current metadata alongside the saved
+proposal. Applying selected fields creates locked manual corrections, not
+approval of hidden provider identities or audio-tag changes. If the review,
+job, or metadata changes after display, refresh is required before applying.
+Selected corrections and review completion commit together; History Undo
+restores the complete metadata state rather than only displayed strings.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the
