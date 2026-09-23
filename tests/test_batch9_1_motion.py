@@ -437,7 +437,7 @@ def test_firework_particles_expand_drag_fall_fade_and_expire() -> None:
     assert simulation.active_burst_count == 0
 
 
-def test_firework_countdown_is_one_to_sixty_four_beats_after_each_event() -> None:
+def test_firework_countdown_is_prompt_then_bar_aligned() -> None:
     simulation = FireworksSimulation(seed=51)
     state = _established_clock(seed=51).state_at(2.2)
     simulation.update(
@@ -450,7 +450,7 @@ def test_firework_countdown_is_one_to_sixty_four_beats_after_each_event() -> Non
         total_beat_count=state.total_beat_count,
     )
     countdown = simulation.next_firework_in_beats(state.total_beat_count)
-    assert countdown is not None and 1 <= countdown <= 64
+    assert countdown == 1
     event_beat = state.total_beat_count + countdown
     particles = simulation.update(
         0.0,
@@ -462,8 +462,10 @@ def test_firework_countdown_is_one_to_sixty_four_beats_after_each_event() -> Non
         total_beat_count=event_beat,
     )
     assert particles
+    assert particles[0].phase == "comet"
     next_countdown = simulation.next_firework_in_beats(event_beat)
-    assert next_countdown is not None and 1 <= next_countdown <= 64
+    assert next_countdown is not None and 1 <= next_countdown <= 4
+    assert (event_beat + next_countdown) % 4 == 0
 
 
 def test_firework_caps_and_reduced_motion_are_strict() -> None:
