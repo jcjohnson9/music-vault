@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import ipaddress
 import json
 import os
@@ -219,10 +220,24 @@ class ArtistImageResult:
     height: int | None = None
     portrait_kind: str | None = None
     pinned: bool = False
+    refresh_error: str | None = None
 
     @property
     def resolved(self) -> bool:
         return self.status is ArtistImageStatus.RESOLVED and self.cache_file is not None
+
+
+@dataclass(frozen=True)
+class PortraitSelection:
+    identity: ArtistIdentity
+    revision: str
+    pinned: bool
+    can_restore: bool
+    result: ArtistImageResult | None
+
+
+class StalePortraitSelection(ValueError):
+    """The portrait selection changed while a request or UI action was pending."""
 
 
 class ArtistImageProvider(Protocol):
@@ -1578,6 +1593,8 @@ class ArtistImageCache:
         self.clock = clock
         self._lock = threading.RLock()
         self._manifest: dict[str, Any] | None = None
+        self._clear_epoch = 0
+        self._identity_epochs: dict[str, int] = {}
 
     @staticmethod
     def _entry_key(identity: ArtistIdentity) -> str:
@@ -1643,6 +1660,9 @@ class ArtistImageCache:
 
     def _drop_broken_entry(self, entry_key: str, file_path: Path | None = None) -> None:
         entries = self._load()["entries"]
+        record = entries.get(entry_key)
+        if isinstance(record, Mapping) and (self._record_is_pinned(record) or record.get("previous_selection")):
+            return  # Missing content never removes selection/restore authority.
         entries.pop(entry_key, None)
         aliases = self._load().get("aliases") or {}
         for alias_key, targets in tuple(aliases.items()):
@@ -1655,7 +1675,7 @@ class ArtistImageCache:
         if file_path is not None and file_path.parent == self.files_dir:
             referenced_elsewhere = any(
                 isinstance(record, Mapping)
-                and self._safe_cached_path(record.get("cache_file")) == file_path
+                and file_path in self._record_files(record)
                 for record in entries.values()
             )
             if not referenced_elsewhere:
@@ -1663,15 +1683,21 @@ class ArtistImageCache:
         self._write_manifest()
 
     @staticmethod
-    def _record_priority(record: Mapping[str, Any]) -> int:
-        if any(
+    def _record_is_pinned(record: Mapping[str, Any]) -> bool:
+        if "pin_override" in record:
+            return record["pin_override"] is True
+        return any(
             record.get(key) is True
             for key in ("pinned", "manual", "is_pinned", "is_manual")
         ) or str(record.get("portrait_kind") or "").casefold() in {
             "manual",
             "pinned",
             "manual_pinned",
-        }:
+        }
+
+    @staticmethod
+    def _record_priority(record: Mapping[str, Any]) -> int:
+        if ArtistImageCache._record_is_pinned(record):
             return 0
         kind = str(record.get("portrait_kind") or "").strip().casefold()
         explicit = {
@@ -1692,6 +1718,120 @@ class ArtistImageCache:
         ):
             return 3
         return 4
+
+    @staticmethod
+    def _record_matches_identity(record: Mapping[str, Any], identity: ArtistIdentity) -> bool:
+        for name in ("musicbrainz_artist_id", "discogs_artist_id"):
+            expected = getattr(identity, name)
+            for known in (record.get("requested_" + name), record.get(name)):
+                if expected and known and str(expected).casefold() != str(known).casefold():
+                    return False
+        return True
+
+    def _record_files(self, record: Mapping[str, Any]) -> set[Path]:
+        records = (record, record.get("previous_selection"))
+        return {path for item in records if isinstance(item, Mapping)
+                if (path := self._safe_cached_path(item.get("cache_file"))) is not None}
+
+    def _selection_record(self, identity: ArtistIdentity, result: ArtistImageResult | None):
+        entries = self._load()["entries"]
+        direct = entries.get(self._entry_key(identity))
+        if isinstance(direct, dict) and direct.get("selection_revision") and self._record_matches_identity(direct, identity):
+            return direct
+        for key in self._candidate_entry_keys((identity,)):
+            record = entries.get(key)
+            if not isinstance(record, dict) or not self._record_matches_identity(record, identity):
+                continue
+            if result is not None and (
+                (result.cache_file is not None and self._safe_cached_path(record.get("cache_file")) == result.cache_file)
+                or (result.pinned and self._record_is_pinned(record))
+            ):
+                return record
+        return None
+
+    def selection(self, identity: ArtistIdentity) -> PortraitSelection:
+        """Read selection authority without repairing/deleting missing assets."""
+        with self._lock:
+            result = self.lookup(identity, repair=False)
+            record = self._selection_record(identity, result)
+            key = self._entry_key(identity)
+            payload = {"identity": (identity.cache_identity, identity.normalized_key, identity.discogs_artist_id, identity.musicbrainz_artist_id),
+                       "record": record, "clear": self._clear_epoch, "epoch": self._identity_epochs.get(key, 0)}
+            revision = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+            previous = record.get("previous_selection") if record else None
+            previous_path = self._safe_cached_path(previous.get("cache_file")) if isinstance(previous, Mapping) else None
+            return PortraitSelection(identity, revision, bool(record and self._record_is_pinned(record)),
+                                     bool(previous_path and previous_path.is_file()), result)
+
+    def _commit_selection_record(self, identity: ArtistIdentity, record: dict, *, supersede_alias_pins: bool = False) -> ArtistImageResult:
+        before = copy.deepcopy(self._load())
+        record = copy.deepcopy(record)
+        record.update(selection_revision=uuid.uuid4().hex, identity_key=identity.cache_identity,
+                      canonical_artist_id=identity.canonical_artist_id, requested_display_name=identity.display_name,
+                      normalized_key=identity.normalized_key)
+        if supersede_alias_pins:
+            aliases = self._load().get("aliases", {})
+            permitted_aliases = {self._identity_key(value) for value in identity.cache_identities}
+            for candidate_key in self._candidate_entry_keys((identity,)):
+                candidate = self._load()["entries"].get(candidate_key)
+                if (not isinstance(candidate, dict) or not self._record_is_pinned(candidate)
+                        or candidate.get("cache_file") != record.get("cache_file")
+                        or not self._record_matches_identity(candidate, identity)):
+                    continue
+                # A legacy source alias may be retired only when no different
+                # canonical/provider alias still claims its pinned authority.
+                own_aliases = permitted_aliases | {self._identity_key(str(candidate.get("identity_key") or ""))}
+                outside_owner = any(alias not in own_aliases and candidate_key in ([targets] if isinstance(targets, str) else targets)
+                                    for alias, targets in aliases.items())
+                if not outside_owner:
+                    self._load()["entries"][candidate_key] = dict(candidate, pinned=False, pin_override=False)
+        self._load()["entries"][self._entry_key(identity)] = record
+        for cache_identity in identity.cache_identities:
+            alias_key = self._identity_key(cache_identity)
+            targets = self._load().setdefault("aliases", {}).get(alias_key, [])
+            targets = [targets] if isinstance(targets, str) else list(targets)
+            if self._entry_key(identity) not in targets:
+                targets.append(self._entry_key(identity))
+            self._load()["aliases"][alias_key] = targets
+        try:
+            self._write_manifest()
+        except Exception:
+            self._manifest = before
+            raise
+        result = self.lookup(identity, repair=False)
+        if result is None:
+            raise ArtistImageContentError("portrait_selection_unavailable")
+        return result
+
+    def set_pinned(self, identity: ArtistIdentity, pinned: bool, *, expected_revision: str) -> ArtistImageResult:
+        with self._lock:
+            selection = self.selection(identity)
+            if selection.revision != expected_revision:
+                raise StalePortraitSelection("portrait_selection_changed")
+            record = self._selection_record(identity, selection.result)
+            if record is None:
+                raise ArtistImageContentError("portrait_selection_unavailable")
+            if bool(pinned) == selection.pinned:
+                return selection.result
+            updated = dict(record, pinned=bool(pinned), pin_override=bool(pinned))
+            return self._commit_selection_record(identity, updated, supersede_alias_pins=not pinned)
+
+    def restore_previous(self, identity: ArtistIdentity, *, expected_revision: str) -> ArtistImageResult:
+        with self._lock:
+            selection = self.selection(identity)
+            if selection.revision != expected_revision:
+                raise StalePortraitSelection("portrait_selection_changed")
+            record = self._selection_record(identity, selection.result)
+            previous = record.get("previous_selection") if record else None
+            if not isinstance(previous, dict) or not self._record_matches_identity(previous, identity):
+                raise ArtistImageContentError("portrait_previous_selection_unavailable")
+            path = self._safe_cached_path(previous.get("cache_file"))
+            if path is None or not path.is_file() or path.stat().st_size > MAX_IMAGE_BYTES:
+                raise ArtistImageContentError("portrait_previous_selection_unavailable")
+            validate_image_payload(path.read_bytes(), str(previous.get("content_type") or ""))
+            restored = dict(previous)
+            restored["previous_selection"] = {key: value for key, value in record.items() if key != "previous_selection"}
+            return self._commit_selection_record(identity, restored)
 
     @classmethod
     def _selection_key(
@@ -1755,6 +1895,9 @@ class ArtistImageCache:
         """
         with self._lock:
             entries = self._load()["entries"]
+            direct = entries.get(self._entry_key(identity))
+            if isinstance(direct, Mapping) and direct.get("selection_cleared"):
+                return None
             allowed_names = {
                 identity.normalized_key,
                 *identity.historical_aliases,
@@ -1770,11 +1913,14 @@ class ArtistImageCache:
             ] = []
             negative: list[tuple[str, Mapping[str, Any], ArtistImageStatus]] = []
             broken: list[tuple[str, Path | None]] = []
+            missing_authority: list[tuple[str, Mapping[str, Any]]] = []
             for entry_key in self._candidate_entry_keys((identity,)):
                 record = entries.get(entry_key)
                 if not isinstance(record, Mapping):
                     continue
                 if str(record.get("normalized_key") or "") not in allowed_names:
+                    continue
+                if not self._record_matches_identity(record, identity):
                     continue
                 try:
                     status = ArtistImageStatus(str(record.get("status")))
@@ -1791,6 +1937,9 @@ class ArtistImageCache:
                     continue
                 cache_file = self._safe_cached_path(record.get("cache_file"))
                 if cache_file is None or not cache_file.is_file():
+                    if self._record_is_pinned(record) or record.get("selection_revision") or record.get("previous_selection"):
+                        missing_authority.append((entry_key, record))
+                        continue
                     broken.append((entry_key, cache_file))
                     continue
                 try:
@@ -1801,6 +1950,9 @@ class ArtistImageCache:
                         str(record.get("content_type") or ""),
                     )
                 except (OSError, ArtistImageContentError):
+                    if self._record_is_pinned(record) or record.get("selection_revision") or record.get("previous_selection"):
+                        missing_authority.append((entry_key, record))
+                        continue
                     broken.append((entry_key, cache_file))
                     continue
                 resolved.append(
@@ -1817,8 +1969,18 @@ class ArtistImageCache:
                 for broken_key, broken_path in broken:
                     self._drop_broken_entry(broken_key, broken_path)
 
-            if resolved:
-                _, _, record, cache_file, image = min(resolved, key=lambda item: item[0])
+            direct_key = self._entry_key(identity)
+            missing_selected = next((record for key, record in missing_authority if key == direct_key and record.get("selection_revision")), None)
+            explicit_resolved = any(key == direct_key and record.get("selection_revision") for _, key, record, _, _ in resolved)
+            if missing_selected is None and not explicit_resolved:
+                missing_selected = next((record for _, record in missing_authority if self._record_is_pinned(record)), None)
+            if missing_selected is not None:
+                record, cache_file, image = missing_selected, None, None
+                status = ArtistImageStatus.UNAVAILABLE
+            elif resolved:
+                _, _, record, cache_file, image = min(resolved, key=lambda item: (
+                    0 if item[1] == direct_key and item[2].get("selection_revision") else 1, item[0],
+                ))
                 status = ArtistImageStatus.RESOLVED
             elif negative:
                 _, record, status = negative[0]
@@ -1850,7 +2012,7 @@ class ArtistImageCache:
                 width=image.width if image is not None else record.get("width"),
                 height=image.height if image is not None else record.get("height"),
                 portrait_kind=record.get("portrait_kind"),
-                pinned=bool(record.get("pinned")),
+                pinned=self._record_is_pinned(record),
                 from_cache=True,
             )
 
@@ -1859,13 +2021,24 @@ class ArtistImageCache:
         result: ArtistImageResult,
         *,
         replace_existing: bool = False,
+        expected_revision: str | None = None,
     ) -> ArtistImageResult:
         if result.status is ArtistImageStatus.DISABLED:
             return result
         now = self.clock().astimezone(timezone.utc)
         with self._lock:
-            existing = self.lookup(result.identity, repair=False)
-            if existing is not None and existing.resolved and not replace_existing:
+            if not self._record_matches_identity({"musicbrainz_artist_id": result.musicbrainz_artist_id,
+                                                 "discogs_artist_id": result.discogs_artist_id}, result.identity):
+                raise ArtistImageContentError("portrait_identity_mismatch")
+            selection = self.selection(result.identity)
+            if expected_revision is not None and expected_revision != selection.revision:
+                raise StalePortraitSelection("portrait_selection_changed")
+            existing = selection.result
+            if selection.pinned:
+                return existing
+            if existing is not None and existing.resolved and (not replace_existing or result.status is not ArtistImageStatus.RESOLVED):
+                if result.status is not ArtistImageStatus.RESOLVED:
+                    return replace(existing, refresh_error=_safe_error_code(result.error_code or result.status.value))
                 return existing
             cache_file: Path | None = None
             relative_file: str | None = None
@@ -1919,6 +2092,8 @@ class ArtistImageCache:
                 "normalized_key": result.identity.normalized_key,
                 "identity_key": result.identity.cache_identity,
                 "canonical_artist_id": result.identity.canonical_artist_id,
+                "requested_musicbrainz_artist_id": result.identity.musicbrainz_artist_id,
+                "requested_discogs_artist_id": result.identity.discogs_artist_id,
                 "historical_aliases": list(result.identity.historical_aliases),
                 "matched_artist_name": result.matched_artist_name,
                 "musicbrainz_artist_id": musicbrainz_id,
@@ -1947,7 +2122,15 @@ class ArtistImageCache:
                 "error_code": _safe_error_code(result.error_code) if result.error_code else None,
             }
             manifest = self._load()
+            before_manifest = copy.deepcopy(manifest)
             entry_key = self._entry_key(result.identity)
+            if replace_existing and existing is not None and existing.resolved:
+                previous = self._selection_record(result.identity, existing)
+                if previous and previous.get("cache_file") == relative_file:
+                    return existing
+                if previous:
+                    record["previous_selection"] = {key: value for key, value in previous.items() if key != "previous_selection"}
+                    record["selection_revision"] = uuid.uuid4().hex
             manifest["entries"][entry_key] = record
             aliases = manifest.setdefault("aliases", {})
             for cache_identity in result.identity.cache_identities:
@@ -1957,7 +2140,11 @@ class ArtistImageCache:
                 if entry_key not in targets:
                     targets.append(entry_key)
                 aliases[alias_key] = targets
-            self._write_manifest()
+            try:
+                self._write_manifest()
+            except Exception:
+                self._manifest = before_manifest
+                raise
             return replace(
                 result,
                 musicbrainz_artist_id=musicbrainz_id,
@@ -1972,13 +2159,59 @@ class ArtistImageCache:
                 width=record["width"],
                 height=record["height"],
                 portrait_kind=record["portrait_kind"],
-                pinned=record["pinned"],
+                pinned=self._record_is_pinned(record),
             )
 
     def clear(self, identity: ArtistIdentity | None = None) -> None:
-        """Clear only this cache's manifest/files, never neighboring runtime data."""
+        """Clear unpinned cache selections; explicit unpin precedes removal."""
         with self._lock:
             if identity is None:
+                self._clear_epoch += 1
+                entries = self._load()["entries"]
+                pinned_keys = {key for key, record in entries.items() if isinstance(record, Mapping) and self._record_is_pinned(record)}
+                if pinned_keys:
+                    before = copy.deepcopy(self._load())
+                    cleared_records: list[Mapping[str, Any]] = []
+                    pinned_keys.update(key for key, record in entries.items()
+                                       if isinstance(record, Mapping) and record.get("selection_cleared")
+                                       and pinned_keys.intersection(record.get("protected_selection_keys") or ()))
+                    # Keep explicit canonical choices linked to a legacy pinned
+                    # entry too, so clearing cannot resurrect an older pin.
+                    for targets in self._load().get("aliases", {}).values():
+                        targets = [targets] if isinstance(targets, str) else list(targets or ())
+                        if pinned_keys.intersection(targets):
+                            owners = [key for key in targets if isinstance(entries.get(key), Mapping)
+                                      and self._record_is_pinned(entries[key])]
+                            for key in targets:
+                                record = entries.get(key)
+                                if (owners and isinstance(record, Mapping) and record.get("selection_revision")
+                                        and not self._record_is_pinned(record) and not record.get("selection_cleared")):
+                                    cleared_records.append(record)
+                                    entries[key] = {
+                                        "status": ArtistImageStatus.UNAVAILABLE.value, "selection_cleared": True,
+                                        "selection_revision": uuid.uuid4().hex,
+                                        "normalized_key": record.get("normalized_key"),
+                                        "identity_key": record.get("identity_key"),
+                                        "canonical_artist_id": record.get("canonical_artist_id"),
+                                        "pinned": False, "pin_override": False,
+                                        "protected_selection_keys": sorted(owners),
+                                    }
+                            pinned_keys.update(key for key in targets if isinstance(entries.get(key), Mapping) and entries[key].get("selection_revision"))
+                    removed = cleared_records + [record for key, record in entries.items() if key not in pinned_keys and isinstance(record, Mapping)]
+                    self._load()["entries"] = {key: record for key, record in entries.items() if key in pinned_keys}
+                    aliases = self._load().get("aliases", {})
+                    self._load()["aliases"] = {key: [target for target in ([value] if isinstance(value, str) else value) if target in pinned_keys]
+                                               for key, value in aliases.items()}
+                    try:
+                        self._write_manifest()
+                    except Exception:
+                        self._manifest = before
+                        raise
+                    retained = set().union(*(self._record_files(record) for record in self._load()["entries"].values()))
+                    for record in removed:
+                        for path in self._record_files(record) - retained:
+                            path.unlink(missing_ok=True)
+                    return
                 if self.files_dir.is_symlink():
                     self.files_dir.unlink(missing_ok=True)
                 elif self.files_dir.exists():
@@ -1989,32 +2222,56 @@ class ArtistImageCache:
                 self._manifest = self._empty_manifest()
                 return
 
+            key = self._entry_key(identity)
+            self._identity_epochs[key] = self._identity_epochs.get(key, 0) + 1
+            if self.selection(identity).pinned:
+                return
+            before = copy.deepcopy(self._load())
             entry_keys = set(self._candidate_entry_keys((identity,)))
+            aliases = self._load().get("aliases") or {}
+            own_aliases = {self._identity_key(value) for value in identity.cache_identities}
+            protected_keys = {
+                entry_key for entry_key in entry_keys
+                if isinstance(self._load()["entries"].get(entry_key), Mapping)
+                and self._record_is_pinned(self._load()["entries"][entry_key])
+                and any(alias not in own_aliases and entry_key in ([targets] if isinstance(targets, str) else targets)
+                        for alias, targets in aliases.items())
+            }
+            removed_keys = entry_keys - protected_keys
             records = [
                 self._load()["entries"].pop(entry_key, None)
-                for entry_key in entry_keys
+                for entry_key in removed_keys
             ]
-            aliases = self._load().get("aliases") or {}
             for alias_key, targets in tuple(aliases.items()):
                 values = [targets] if isinstance(targets, str) else list(targets or ())
-                remaining_targets = [value for value in values if value not in entry_keys]
+                excluded = entry_keys if alias_key in own_aliases else removed_keys
+                remaining_targets = [value for value in values if value not in excluded]
                 if remaining_targets:
                     aliases[alias_key] = remaining_targets
                 else:
                     aliases.pop(alias_key, None)
-            remaining = {
-                candidate.get("cache_file")
-                for candidate in self._load()["entries"].values()
-                if isinstance(candidate, dict)
-            }
+            if protected_keys:
+                # A different canonical selection still owns a shared pin.
+                # Clear this identity without deleting that record or allowing
+                # a legacy name alias to resurrect it for the cleared subject.
+                self._load()["entries"][key] = {
+                    "status": ArtistImageStatus.UNAVAILABLE.value, "selection_cleared": True,
+                    "selection_revision": uuid.uuid4().hex, "normalized_key": identity.normalized_key,
+                    "identity_key": identity.cache_identity, "canonical_artist_id": identity.canonical_artist_id,
+                    "pinned": False, "pin_override": False,
+                    "protected_selection_keys": sorted(protected_keys),
+                }
+            remaining = set().union(*(self._record_files(candidate) for candidate in self._load()["entries"].values() if isinstance(candidate, dict)))
+            try:
+                self._write_manifest()
+            except Exception:
+                self._manifest = before
+                raise
             for record in records:
                 if not isinstance(record, dict):
                     continue
-                relative_file = record.get("cache_file")
-                file_path = self._safe_cached_path(relative_file)
-                if file_path is not None and relative_file not in remaining:
+                for file_path in self._record_files(record) - remaining:
                     file_path.unlink(missing_ok=True)
-            self._write_manifest()
 
     def rekey(self, old_identity: ArtistIdentity, new_identity: ArtistIdentity) -> bool:
         """Expose an old cache entry through a canonical identity without loss.
@@ -2297,7 +2554,7 @@ class ArtistImageService(QObject):
             thread_name_prefix="artist-images",
         )
         self._lock = threading.RLock()
-        self._pending: dict[tuple[str, bool, bool], _PendingRequest] = {}
+        self._pending: dict[tuple[tuple, bool, bool], _PendingRequest] = {}
         self._generation = 0
         self._closed = False
         self._completed.connect(self._deliver)
@@ -2315,42 +2572,67 @@ class ArtistImageService(QObject):
         network_enabled: bool,
         cancel_event: threading.Event,
         generation: int,
+        expected_revision: str | None = None,
     ) -> ArtistImageResult:
-        cached = (
-            None
-            if force and network_enabled
-            else self.cache.lookup(identity, repair=network_enabled)
-        )
-        if cached is not None:
+        selection = self.cache.selection(identity)
+        cached = selection.result
+        if expected_revision is not None and selection.revision != expected_revision:
+            return cached or ArtistImageResult(ArtistImageStatus.UNAVAILABLE, identity, error_code="portrait_selection_changed")
+        expected_revision = selection.revision
+        if selection.pinned or (cached is not None and not (force and network_enabled)):
             return cached
         if not network_enabled:
             return ArtistImageResult(ArtistImageStatus.DISABLED, identity)
         if cancel_event.is_set():
             raise CancelledError()
-        provider = self.provider
-        if provider is None:
-            with self._lock:
-                provider = self.provider
-                if provider is None:
-                    factory = self._provider_factory
-                    if factory is None:
-                        return ArtistImageResult(ArtistImageStatus.DISABLED, identity)
-                    provider = factory()
-                    self.provider = provider
-        result = provider.resolve(identity, cancel_event)
+        try:
+            provider = self.provider
+            if provider is None:
+                with self._lock:
+                    provider = self.provider
+                    if provider is None:
+                        factory = self._provider_factory
+                        if factory is None:
+                            return cached or ArtistImageResult(ArtistImageStatus.DISABLED, identity)
+                        provider = factory()
+                        self.provider = provider
+            result = provider.resolve(identity, cancel_event)
+            subject = lambda value: (value.cache_identity, value.normalized_key, value.discogs_artist_id, value.musicbrainz_artist_id)
+            if not isinstance(result, ArtistImageResult) or subject(result.identity) != subject(identity):
+                raise ArtistImageContentError("portrait_identity_mismatch")
+            # Provider success is not authority to create a user pin.
+            result = replace(result, pinned=False, portrait_kind=(
+                None if str(result.portrait_kind or "").strip().casefold() in {"manual", "pinned", "manual_pinned"}
+                else result.portrait_kind
+            ))
+        except CancelledError:
+            raise
+        except Exception as exc:
+            result = ArtistImageResult(ArtistImageStatus.TEMPORARY_ERROR, identity,
+                                       error_code=_safe_error_code(exc) if isinstance(exc, ArtistImageError) else "service_error")
         with self._lock:
             if cancel_event.is_set() or generation != self._generation or self._closed:
                 raise CancelledError()
             try:
-                return self.cache.store(result, replace_existing=force)
+                return self.cache.store(result, replace_existing=force, expected_revision=expected_revision)
+            except StalePortraitSelection:
+                return self.cache.selection(identity).result or ArtistImageResult(
+                    ArtistImageStatus.UNAVAILABLE, identity, error_code="portrait_selection_changed",
+                )
             except ArtistImageContentError as exc:
                 return self.cache.store(
                     ArtistImageResult(
                         ArtistImageStatus.UNAVAILABLE,
                         identity,
                         error_code=_safe_error_code(exc),
-                    )
+                    ),
+                    expected_revision=expected_revision,
                 )
+            except Exception:
+                current = self.cache.selection(identity).result
+                if current is not None and current.resolved:
+                    return replace(current, refresh_error="portrait_cache_write_failed")
+                return ArtistImageResult(ArtistImageStatus.TEMPORARY_ERROR, identity, error_code="portrait_cache_write_failed")
 
     def request(
         self,
@@ -2372,7 +2654,8 @@ class ArtistImageService(QObject):
                 musicbrainz_artist_id=musicbrainz_artist_id,
             )
         )
-        key = (identity.cache_identity, bool(force), bool(network_enabled))
+        subject = (identity.cache_identity, identity.normalized_key, identity.discogs_artist_id, identity.musicbrainz_artist_id)
+        key = (subject, bool(force), bool(network_enabled))
         with self._lock:
             if self._closed:
                 return False
@@ -2383,6 +2666,7 @@ class ArtistImageService(QObject):
                 return False
             cancel_event = threading.Event()
             generation = self._generation
+            expected_revision = self.cache.selection(identity).revision
             if network_enabled:
                 record_provider_task_dispatch()
             future = self._executor.submit(
@@ -2392,6 +2676,7 @@ class ArtistImageService(QObject):
                 network_enabled=bool(network_enabled),
                 cancel_event=cancel_event,
                 generation=generation,
+                expected_revision=expected_revision,
             )
             pending = _PendingRequest(
                 future,
@@ -2423,12 +2708,12 @@ class ArtistImageService(QObject):
     @Slot(object, object, int)
     def _deliver(
         self,
-        key: tuple[str, bool, bool],
+        key: tuple[tuple, bool, bool],
         result: ArtistImageResult,
         generation: int,
     ) -> None:
         with self._lock:
-            pending = self._pending.pop(key, None)
+            pending = self._pending.get(key)
             if (
                 pending is None
                 or self._closed
@@ -2436,7 +2721,13 @@ class ArtistImageService(QObject):
                 or generation != pending.generation
             ):
                 return
+            self._pending.pop(key)
             callbacks = tuple(pending.callbacks)
+        current = self.cache.selection(result.identity).result
+        if current is not None:
+            result = replace(current, refresh_error=result.refresh_error)
+        elif result.resolved:
+            result = ArtistImageResult(ArtistImageStatus.UNAVAILABLE, result.identity, error_code="portrait_selection_changed")
         self.result_ready.emit(result.identity.normalized_key, result)
         for callback in callbacks:
             try:

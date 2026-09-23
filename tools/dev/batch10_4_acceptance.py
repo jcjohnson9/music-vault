@@ -69,6 +69,8 @@ EXPECTED_CACHE_RECORD_FIELDS = frozenset(
         "matched_artist_name",
         "musicbrainz_artist_id",
         "discogs_artist_id",
+        "requested_musicbrainz_artist_id",
+        "requested_discogs_artist_id",
         "match_score",
         "image_provider",
         "attribution_text",
@@ -80,6 +82,11 @@ EXPECTED_CACHE_RECORD_FIELDS = frozenset(
         "height",
         "portrait_kind",
         "pinned",
+        "pin_override",
+        "selection_revision",
+        "previous_selection",
+        "selection_cleared",
+        "protected_selection_keys",
         "fetched_at",
         "retry_after",
         "error_code",
@@ -88,6 +95,11 @@ EXPECTED_CACHE_RECORD_FIELDS = frozenset(
 REQUIRED_CACHE_RECORD_FIELDS = frozenset(
     {"status", "normalized_key", "cache_file", "content_type"}
 )
+CLEARED_SELECTION_FIELDS = frozenset({
+    "status", "normalized_key", "identity_key", "canonical_artist_id",
+    "selection_revision", "selection_cleared", "pinned", "pin_override",
+    "protected_selection_keys",
+})
 PRIVATE_STATUS_PATH_FIELDS = frozenset(
     {"project_root", "data_dir", "database", "downloads", "config", "status_file"}
 )
@@ -399,7 +411,6 @@ def audit_artist_cache(
         values = [targets] if isinstance(targets, str) else targets
         if (
             not isinstance(values, list)
-            or not values
             or len(values) > 256
             or len(set(str(value) for value in values)) != len(values)
             or any(
@@ -412,18 +423,51 @@ def audit_artist_cache(
     referenced: dict[Path, str] = {}
     validated_physical: set[Path] = set()
 
-    for entry_key, record in entries.items():
+    # Previous selections are flattened, bounded records, not arbitrary history.
+    # Run the same path, content-address, URL and privacy checks on both levels.
+    records = [(key, record, False) for key, record in entries.items()]
+    for entry_key, record, is_previous in records:
         if not ENTRY_KEY_RE.fullmatch(str(entry_key)) or not isinstance(record, dict):
             issues["unexpected_entry"] += 1
             continue
         record_fields = set(record)
-        if (
-            not REQUIRED_CACHE_RECORD_FIELDS <= record_fields
-            or not record_fields <= EXPECTED_CACHE_RECORD_FIELDS
-        ):
+        cleared = record.get("selection_cleared") is True
+        required_fields = CLEARED_SELECTION_FIELDS if cleared else REQUIRED_CACHE_RECORD_FIELDS
+        allowed_fields = CLEARED_SELECTION_FIELDS if cleared else EXPECTED_CACHE_RECORD_FIELDS
+        if not required_fields <= record_fields or not record_fields <= allowed_fields:
             issues["unexpected_entry"] += 1
         if _contains_secret_field(record) or _contains_secret_marker(record):
             issues["secret_field"] += 1
+
+        for field in ("pinned", "pin_override", "selection_cleared"):
+            if field in record and type(record[field]) is not bool:
+                issues["unexpected_entry"] += 1
+        if "selection_revision" in record and not re.fullmatch(r"[0-9a-f]{32}", str(record["selection_revision"])):
+            issues["unexpected_entry"] += 1
+        for field, pattern in (("requested_musicbrainz_artist_id", r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"),
+                               ("requested_discogs_artist_id", r"[1-9]\d{0,17}")):
+            value = record.get(field)
+            if value not in (None, "") and (not isinstance(value, str) or not re.fullmatch(pattern, value)):
+                issues["unexpected_entry"] += 1
+        if cleared:
+            protected = record.get("protected_selection_keys")
+            if (is_previous or record.get("status") != ArtistImageStatus.UNAVAILABLE.value
+                    or record.get("pinned") is not False or record.get("pin_override") is not False
+                    or not isinstance(protected, list) or not 1 <= len(protected) <= 256
+                    or any(not isinstance(key, str) or not ENTRY_KEY_RE.fullmatch(key) or key not in entries for key in protected)
+                    or len(set(str(key) for key in protected)) != len(protected)):
+                issues["unexpected_entry"] += 1
+        elif "protected_selection_keys" in record or "selection_cleared" in record:
+            issues["unexpected_entry"] += 1
+        if "previous_selection" in record:
+            previous = record["previous_selection"]
+            if (is_previous or not isinstance(previous, dict)
+                    or previous.get("status") != ArtistImageStatus.RESOLVED.value
+                    or "previous_selection" in previous or "selection_cleared" in previous):
+                issues["unexpected_entry"] += 1
+            else:
+                previous_identity = previous.get("identity_key") or previous.get("normalized_key")
+                records.append((_sha256_bytes(str(previous_identity).encode("utf-8")), previous, True))
 
         identity_key = record.get("identity_key")
         normalized_key = record.get("normalized_key")

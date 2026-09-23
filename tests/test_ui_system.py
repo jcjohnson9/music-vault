@@ -945,7 +945,7 @@ def test_artist_result_maps_to_dedicated_photo_not_album_cover(
         summary.browser_key,
         ArtistImageResult(
             ArtistImageStatus.RESOLVED,
-            ArtistIdentity.from_display_name(f"  {summary.display_name}  "),
+            window.artist_image_identity(summary),
             cache_file=portrait,
         ),
     )

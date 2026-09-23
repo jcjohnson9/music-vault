@@ -81,6 +81,35 @@ def _image_bytes() -> bytes:
     return bytes(data)
 
 
+@pytest.mark.parametrize("alteration", ["none", "changed", "foreign", "source"])
+def test_discard_prepared_requires_owned_unchanged_staging_file(synthetic_mp3, alteration):
+    from dataclasses import replace
+    writer = SafeTagWriter()
+    original = synthetic_mp3.read_bytes()
+    prepared = writer.prepare(synthetic_mp3, {"title": "Prepared title"})
+    temporary = prepared.temporary_path
+    if alteration == "changed":
+        tags = ID3(temporary)
+        tags.add(TIT2(encoding=3, text=["Someone else's change"]))
+        tags.save(temporary)
+    elif alteration == "foreign":
+        foreign = temporary.with_name("unrelated.mp3")
+        temporary.rename(foreign)
+        temporary = foreign
+        prepared = replace(prepared, temporary_path=foreign)
+    elif alteration == "source":
+        prepared = replace(prepared, temporary_path=synthetic_mp3)
+    if alteration == "none":
+        writer.discard_prepared(prepared, source=synthetic_mp3)
+        assert not temporary.exists()
+        writer.discard_prepared(prepared, source=synthetic_mp3)
+    else:
+        with pytest.raises(TagWriteError, match="prepared_file_(changed|ownership_conflict)"):
+            writer.discard_prepared(prepared, source=synthetic_mp3)
+        assert temporary.exists()
+    assert synthetic_mp3.read_bytes() == original
+
+
 def _text(tags: ID3, frame_id: str) -> str | None:
     frames = tags.getall(frame_id)
     if not frames or not frames[0].text:

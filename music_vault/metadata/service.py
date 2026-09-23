@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import math
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -1593,7 +1594,162 @@ class MetadataService:
             int(track_id), group_id, frozenset(pending), before, after
         )
 
+    def prepare_high_confidence_candidate(
+        self, track_id: int, values: Mapping[str, object], *,
+        recording_id: str | None, release_id: str | None, confidence: float | None,
+        release_group_id: str | None = None, artwork_path: str | None = None,
+        expected_fingerprint: str | None = None, proposal_revision: str | None = None,
+    ):
+        """Read-only, restrictive authority check before artwork or media work.
+
+        This accepts an already strictly assessed patch, not a raw match score.
+        Returned values exclude every protected field; callers must not write
+        tags for a broader original patch. Missing structured facts stay absent.
+        """
+        from .automatic_remediation import automatic_remediation_proposal
+        from .materializer import StaleMetadataProposal, capture_metadata_state, state_fingerprint
+
+        if not self._has_materialization_journal():
+            raise RuntimeError("automatic_metadata_proposal_requires_schema10")
+        if confidence is not None and (not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 100):
+            raise ValueError("Invalid automatic metadata confidence.")
+        if proposal_revision is not None and (not isinstance(proposal_revision, str) or not proposal_revision.strip()):
+            raise ValueError("Invalid automatic metadata proposal revision.")
+        graph = capture_metadata_state(self.conn, track_id)
+        fingerprint = state_fingerprint(graph)
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise StaleMetadataProposal("metadata_changed_since_analysis")
+        before = self.snapshot(track_id)
+        selected = dict(values)
+        if artwork_path is not None:
+            selected["artwork"] = artwork_path
+        protected_credit = any(
+            row["is_manual"] or row["is_locked"] or str(row["provenance"]).endswith("_confirmed")
+            for row in graph["track_artist_credits"]
+        )
+        structured_artist = any(row.get("musicbrainz_artist_id") or row.get("discogs_artist_id") for row in graph["artists"])
+        eligible = {}
+        for raw_name, raw_value in selected.items():
+            name = self._validate_field(raw_name)
+            value = self._normalized_value(name, raw_value)
+            old = before.fields[name]
+            if (value is None or old.is_locked or old.is_manual or old.provenance == "manual"
+                    or old.provenance.endswith("_confirmed")):
+                continue
+            # Scalar-only remediation cannot faithfully replace structured
+            # catalogue credits, even when their displayed text is identical.
+            if name == "artist" and (protected_credit or structured_artist):
+                continue
+            eligible[name] = value
+        recording_reference, release_reference = _clean_optional(recording_id), _clean_optional(release_id)
+        recording = recording_reference if {"title", "artist", "version_type", "version_label"} & eligible.keys() else None
+        release_scope = bool({"album", "album_artist", "release_date", "original_release_date"} & eligible.keys())
+        release = release_reference if release_scope else None
+        family = _clean_optional(release_group_id) if release_scope else None
+        track = graph["track"]
+        for column, supplied in (("musicbrainz_recording_id", recording), ("musicbrainz_release_id", release)):
+            if supplied and track.get(column) and track[column] != supplied:
+                raise ValueError("Automatic metadata conflicts with the current catalogue identity; review is required.")
+        known_families = {row.get("musicbrainz_release_group_id") for row in (*graph["track_release_context"], *graph["canonical_albums"])} - {None, ""}
+        if family and known_families and known_families != {family}:
+            raise ValueError("Automatic metadata conflicts with the current release family; review is required.")
+        new_release = bool(release and release != track.get("musicbrainz_release_id"))
+        if new_release and known_families and not family:
+            raise ValueError("The new edition's release family is unproven; review is required.")
+        other_catalogue = any(row.get(name) for row in (track, *graph["track_release_context"], *graph["canonical_albums"])
+                              for name in ("discogs_release_id", "discogs_master_id", "provider_release_family_id"))
+        if other_catalogue and (new_release or (family and family not in known_families)):
+            raise ValueError("The release's cross-catalogue relationship is unproven; review is required.")
+        context_family = next((row.get("musicbrainz_release_group_id") for row in graph["track_release_context"]), None)
+        changed = any(track.get(column) != supplied for column, supplied in (
+            ("musicbrainz_recording_id", recording), ("musicbrainz_release_id", release),
+        ) if supplied is not None) or bool(family and family != context_family)
+        for name, value in eligible.items():
+            old = before.fields[name]
+            reference = release_reference if name in {"album", "album_artist", "release_date", "original_release_date", "version_type", "version_label", "artwork"} else recording_reference
+            new = MetadataFieldState(name, value, "cover_art_archive_high_confidence" if name == "artwork" else "musicbrainz_high_confidence",
+                                     reference, confidence, False, False, old.updated_at)
+            changed = changed or not self._same_state(old, new)
+        # Preparation is pure and can run outside a writer. A concurrent change
+        # while assembling the read model must fail before callers touch media.
+        if state_fingerprint(capture_metadata_state(self.conn, track_id)) != fingerprint:
+            raise StaleMetadataProposal("metadata_changed_since_analysis")
+        return automatic_remediation_proposal(
+            track_id=int(track_id), fingerprint=fingerprint, values=eligible,
+            recording_id=recording, release_id=release, release_group_id=family,
+            recording_reference=recording_reference, release_reference=release_reference,
+            confidence=confidence, effective_change=changed, proposal_revision=proposal_revision,
+        )
+
     def apply_high_confidence_candidate(
+        self, track_id: int, values: Mapping[str, object], *,
+        recording_id: str | None, release_id: str | None, confidence: float | None,
+        release_group_id: str | None = None, artwork_path: str | None = None,
+        commit: bool = True, expected_fingerprint: str | None = None,
+        proposal_revision: str | None = None,
+    ) -> MetadataChangeResult:
+        """Journal a strict automatic candidate without user-override authority."""
+        from .materializer import capture_metadata_state, materialize_proposal, structural_change_fields
+
+        if not commit and not self.conn.in_transaction:
+            raise RuntimeError("automatic_metadata_requires_caller_transaction")
+        if not self._has_materialization_journal():
+            if expected_fingerprint is not None or proposal_revision is not None:
+                raise RuntimeError("automatic_metadata_proposal_requires_schema10")
+            # Historical scalar-only schemas cannot accept richer catalogue
+            # transitions. Existing locked/manual protections still apply.
+            current = self.snapshot(track_id)
+            if any(old and new and old != new for old, new in (
+                (current.musicbrainz_recording_id, recording_id), (current.musicbrainz_release_id, release_id),
+            )) or release_group_id:
+                raise ValueError("Catalogue identity review requires the current metadata schema.")
+            return self._apply_high_confidence_candidate_legacy(
+                track_id, values, recording_id=recording_id, release_id=release_id,
+                confidence=confidence, artwork_path=artwork_path, commit=commit,
+            )
+        before = self.snapshot(track_id)
+        proposal = self.prepare_high_confidence_candidate(
+            track_id, values, recording_id=recording_id, release_id=release_id, confidence=confidence,
+            release_group_id=release_group_id, artwork_path=artwork_path,
+            proposal_revision=proposal_revision,
+        )
+        if expected_fingerprint is not None and proposal.expected_fingerprint != expected_fingerprint:
+            # Reconstruct only the key of an exact previous acceptance. The
+            # materializer permits a retry solely when its saved after-state
+            # is still current; otherwise it rejects before any write.
+            from .automatic_remediation import automatic_remediation_proposal
+
+            proposal = automatic_remediation_proposal(
+                track_id=int(track_id), fingerprint=expected_fingerprint, values=dict(proposal.values),
+                recording_id=proposal.recording_id, release_id=proposal.release_id,
+                release_group_id=proposal.release_group_id, recording_reference=proposal.recording_reference,
+                release_reference=proposal.release_reference, confidence=confidence,
+                effective_change=proposal.effective_change, proposal_revision=proposal_revision,
+            )
+        with materialize_proposal(self.conn, proposal) as transaction:
+            if transaction.already_applied:
+                return MetadataChangeResult(track_id, None, frozenset(), before, before)
+            result = self._apply_high_confidence_candidate_legacy(
+                track_id, proposal.values, recording_id=proposal.recording_reference,
+                release_id=proposal.release_reference, confidence=confidence, commit=False, _skip_identity=True,
+            )
+            for column, supplied in (("musicbrainz_recording_id", proposal.recording_id), ("musicbrainz_release_id", proposal.release_id)):
+                if supplied is not None and transaction.before["track"].get(column) != supplied:
+                    self.conn.execute(f"UPDATE tracks SET {column}=? WHERE id=?", (supplied, int(track_id)))
+            family = proposal.release_group_id
+            if family is not None:
+                existing = self.conn.execute("SELECT musicbrainz_release_group_id FROM track_release_context WHERE track_id=?", (track_id,)).fetchone()
+                if existing is None or existing[0] != family:
+                    self.conn.execute(
+                        "INSERT INTO track_release_context(track_id,musicbrainz_release_group_id,release_title,provider_reference,confidence,updated_at) "
+                        "VALUES(?,?,?,?,?,?) ON CONFLICT(track_id) DO UPDATE SET musicbrainz_release_group_id=excluded.musicbrainz_release_group_id,updated_at=excluded.updated_at",
+                        (track_id, family, proposal.values.get("album"), proposal.release_reference, confidence, utc_now()),
+                    )
+            if result.changed or structural_change_fields(transaction.before, capture_metadata_state(self.conn, track_id)):
+                self.finalize_identity(track_id, reconcile_artist="artist" in result.changed_fields)
+        return self._user_write_result(track_id, before, transaction)
+
+    def _apply_high_confidence_candidate_legacy(
         self,
         track_id: int,
         values: Mapping[str, object],
@@ -1604,6 +1760,7 @@ class MetadataService:
         release_group_id: str | None = None,
         artwork_path: str | None = None,
         commit: bool = True,
+        _skip_identity: bool = False,
     ) -> MetadataChangeResult:
         """Apply only unlocked fields from a strict remediation assessment.
 
@@ -1622,6 +1779,7 @@ class MetadataService:
             "manual",
             "musicbrainz_confirmed",
             "provider_confirmed",
+            "discogs_confirmed",
         }
         with self._transaction(commit=commit):
             for raw_name, raw_value in selected.items():
@@ -1630,7 +1788,7 @@ class MetadataService:
                 if value is None:
                     continue
                 old = self._state(track_id, field_name, track)
-                if old.is_locked or old.provenance in protected_provenance:
+                if old.is_locked or old.is_manual or old.provenance in protected_provenance or old.provenance.endswith("_confirmed"):
                     continue
                 reference = (
                     release_id
@@ -1673,7 +1831,10 @@ class MetadataService:
                 actor="remediation",
                 reason="musicbrainz_high_confidence",
             )
-            if pending:
+            if pending and not _skip_identity:
+                recording_id = recording_id if {"title", "artist", "version_type", "version_label"} & pending.keys() else None
+                release_scope = bool({"album", "album_artist", "release_date", "original_release_date"} & pending.keys())
+                release_id = release_id if release_scope else None
                 self.conn.execute(
                     """
                     UPDATE tracks SET
@@ -1683,7 +1844,7 @@ class MetadataService:
                     """,
                     (_clean_optional(recording_id), _clean_optional(release_id), int(track_id)),
                 )
-                normalized_release_group_id = _clean_optional(release_group_id)
+                normalized_release_group_id = _clean_optional(release_group_id) if release_scope else None
                 if normalized_release_group_id is not None:
                     self.conn.execute(
                         """

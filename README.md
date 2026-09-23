@@ -130,6 +130,38 @@ metadata graph, not just displayed strings. A later identity/credit change
 blocks rollback before any media restoration; historical scalar-only jobs
 retain their separate compatibility path.
 
+Saved intelligence reviews show the current metadata alongside the saved
+proposal. Applying selected fields creates locked manual corrections, not
+approval of hidden provider identities or audio-tag changes. If the review,
+job, or metadata changes after display, refresh is required before applying.
+Selected corrections and review completion commit together; History Undo
+restores the complete metadata state rather than only displayed strings.
+
+Strict high-confidence remediation uses the same complete journal with narrower
+automatic authority: manual/confirmed values and protected structured credits
+remain authoritative, and conflicting catalogue identities require review.
+Saved analysis is checked again before applying; legacy pending jobs without
+complete metadata revisions need fresh analysis or explicit review. Database
+changes, their exact job linkage and counters commit together. Existing verified
+media-backup and compensation checks remain in force; database-only apply never
+writes audio tags. This development work does not automatically run remediation.
+
+Artist-photo refresh retains the last good selection when a provider fails.
+The artist menu offers **Keep This Artist Photo**, **Unpin Artist Photo**, and
+one-level **Restore Previous Artist Photo**. These are local cache selections,
+not metadata or media edits. Pinned photos survive cache clearing; unpin first
+to remove one. Late responses cannot replace a newer selection or another
+artist with the same display name.
+
+The existing opted-in metadata worker can upgrade an unlocked YouTube thumbnail
+to a validated front cover only for an already accepted, still-matching release.
+Unaccepted suggestions, manual/confirmed artwork and unrelated catalogue art
+remain unchanged. Presentation-art changes have their own conflict-aware
+History Undo; existing image bytes and audio tags are not rewritten. This does
+not start a scan, enable a provider or repair the personal library on startup.
+Older catalogue IDs without an accepted identity journal are not sufficient
+proof for this upgrade and keep their existing image.
+
 ## Install the portable release
 
 1. Download `MusicVault-v1.0.0-Windows-x64-Portable.zip` from the

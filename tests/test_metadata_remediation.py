@@ -1347,13 +1347,13 @@ def test_rollback_database_failure_compensates_media_to_applied_file(
     harness.service.apply_high_confidence(job.id, confirmed=True, write_files=True)
     applied_bytes = media.read_bytes()
 
-    def fail_database_restore(*_args, **_kwargs):
-        raise RuntimeError("synthetic rollback database failure")
-
-    monkeypatch.setattr(
-        harness.service.metadata,
-        "restore_remediation_snapshot",
-        fail_database_restore,
+    # Automatic writes now use the complete graph journal before file restore.
+    # Fail the final item persistence after the file restore, retaining the
+    # original test's real compensation boundary rather than a legacy helper.
+    harness.db.conn.execute(
+        f"CREATE TEMP TRIGGER reject_rollback_item BEFORE UPDATE ON {REMEDIATION_ITEMS_TABLE} "
+        "WHEN NEW.status='rolled_back' BEGIN "
+        "SELECT RAISE(ABORT, 'synthetic rollback database failure'); END"
     )
     result = harness.service.rollback(job.id, confirmed=True)
 
