@@ -67,6 +67,12 @@ or a new addition expires Undo. “Add to queue” appends in FIFO order, and th
 original playback context resumes after queued tracks finish. Search and
 navigation do not start synchronization or metadata-provider work.
 
+Right-click a song and choose **Show in Folder** to open its containing folder
+in File Explorer (also available in playlist, album, and artist track views).
+Saved YouTube sources keep separate stable-ID download folders; renaming a
+playlist does not move music. A track shared by sources retains one canonical
+file. Showing a folder never moves files, edits metadata, or starts playback.
+
 Windows taskbar Previous / Play-Pause / Next and the Windows media surface use
 the same player and captured queue context. Native Play/Pause never starts an
 unselected track from an empty player. Canonical Now Playing metadata and bounded

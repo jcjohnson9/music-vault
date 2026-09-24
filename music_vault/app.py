@@ -4479,6 +4479,8 @@ class MusicVaultWindow(QMainWindow):
         except Exception:
             favorite_action = None
         menu.addSeparator()
+        show_folder_action = menu.addAction("Show in Folder")
+        show_folder_action.setIcon(ui_icon("folder", 18))
         edit_metadata_action = menu.addAction("Edit Metadata")
         edit_metadata_action.setIcon(ui_icon("metadata", 18))
 
@@ -4492,8 +4494,40 @@ class MusicVaultWindow(QMainWindow):
             self.add_selected_to_playlist()
         elif action == edit_metadata_action:
             self.open_metadata_editor()
+        elif action == show_folder_action:
+            self.show_track_in_folder(track_id)
         elif favorite_action is not None and action == favorite_action:
             self.listening_library.toggle_favorite(track_id)
+
+    def show_track_in_folder(self, track_id: int | None) -> None:
+        """Open the stored track's containing folder without moving or playing it."""
+        if track_id is None:
+            return
+        try:
+            track = self.db.get_track(track_id)
+            if track is None or not track["path"]:
+                self.statusBar().showMessage("This song no longer has a file location.", 5000)
+                return
+            path = Path(track["path"]).expanduser()
+            # Imported media paths are absolute. Never guess a location from CWD.
+            if not path.is_absolute() or path.is_dir():
+                self.statusBar().showMessage("This song has an invalid file location.", 5000)
+                return
+            folder = path.parent
+            if not folder.is_dir():
+                self.statusBar().showMessage("This song's folder is missing or unavailable.", 5000)
+                return
+            file_exists = path.is_file()
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+                self.statusBar().showMessage("Could not open this song's folder.", 5000)
+                return
+            self.statusBar().showMessage(
+                "Opened song folder." if file_exists
+                else "Opened song folder, but the song file is missing or unavailable.",
+                5000,
+            )
+        except (OSError, RuntimeError, ValueError):
+            self.statusBar().showMessage("Could not open this song's folder.", 5000)
 
     def visible_track_rows(self) -> list[int]:
         return list(range(self.library_table.visible_track_count()))
