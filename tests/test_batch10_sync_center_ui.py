@@ -58,6 +58,16 @@ def _source(
     }
 
 
+def test_source_detail_shows_bound_named_download_folder(qapp):
+    widget = SyncCenterWidget()
+    value = _source(1)
+    value["download_folder"] = "Home Trip"
+    widget.set_source_detail(value)
+    assert widget.detail_folder.text() == "Stable Download Folder: Home Trip"
+    assert value["storage_key"] not in widget.detail_folder.text()
+    widget.close()
+
+
 def _three_sources() -> list[dict[str, object]]:
     return [
         _source(1),
@@ -128,7 +138,7 @@ def test_sync_center_empty_and_three_source_states_are_lightweight(qapp) -> None
     )
     assert widget.detail_name.text() == "Synthetic Source 2"
     assert "Managed Synthetic Mix" in widget.detail_destination.text()
-    assert "sources" in widget.detail_folder.text()
+    assert "playlist title" in widget.detail_folder.text()
     assert "Synthetic unavailable item" in widget.failure_history.item(0).text()
     assert widget.summary_cards["enabled_sources"].value_label.text() == "2"
     assert widget.summary_cards["failed_items"].value_label.text() == "3"

@@ -90,6 +90,7 @@ from music_vault.core.acceptance_network import (
 _BOOTSTRAP_ACCEPTANCE_NETWORK_GUARD = install_acceptance_network_guard()
 
 from music_vault.core.db import MusicVaultDB
+from music_vault.core.source_download_folders import SourceDownloadFolders
 from music_vault.core.desktop_shortcut import create_or_update_desktop_shortcut
 from music_vault.core.ffmpeg import FFmpegDiscoveryResult, discover_ffmpeg
 from music_vault.core.acquisition_runtime import acquisition_readiness
@@ -1533,6 +1534,7 @@ class MusicVaultWindow(QMainWindow):
             orchestrator_factory=self.create_multi_source_orchestrator,
             playlist_provider=self.db.list_playlists,
             playlist_creator=self.db.create_playlist,
+            download_folder_provider=self.saved_source_download_folder,
             dialog_parent=self,
         )
         self.sync_center_controller.sources_changed.connect(
@@ -1585,6 +1587,15 @@ class MusicVaultWindow(QMainWindow):
             self.sync_center.sync_selected_button.setEnabled(False)
 
         return page
+
+    def saved_source_download_folder(self, source) -> str | None:
+        try:
+            folder = SourceDownloadFolders(
+                self.db, self.config.get("download_folder") or default_downloads_dir()
+            ).get(source)
+            return str(folder) if folder is not None else None
+        except (OSError, ValueError):
+            return "Unavailable — check the download folder in Settings"
 
     def create_multi_source_orchestrator(self, progress, transition):
         """Create a worker-thread-owned database/service/orchestrator graph."""

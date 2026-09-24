@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QRect, QSize, Qt, QThread, Signal
@@ -154,6 +153,7 @@ class SyncSourceView:
     unresolved_failure_count: int
     last_error: str | None
     download_quality_profile: str = INHERIT_PROFILE
+    download_folder: str | None = None
 
     @property
     def display_label(self) -> str:
@@ -236,6 +236,7 @@ class SyncSourceView:
             download_quality_profile=normalize_source_download_quality_profile(
                 _value(source, "download_quality_profile", default=INHERIT_PROFILE)
             ),
+            download_folder=_value(source, "download_folder"),
         )
 
 
@@ -747,11 +748,7 @@ class SyncCenterWidget(QWidget):
             f"{_friendly_source_kind(view.source_kind)} • ID {view.shortened_external_id}"
         )
         self.detail_destination.setText(f"Destination: {view.destination_label}")
-        relative_folder = (
-            str(Path("sources") / view.storage_key)
-            if view.storage_key
-            else "Assigned after the source is saved"
-        )
+        relative_folder = view.download_folder or "Assigned from the YouTube playlist title on next sync"
         self.detail_folder.setText(f"Stable Download Folder: {relative_folder}")
         self.detail_quality_profile.setText(
             f"Future Download Quality: {view.quality_profile_label}"
@@ -1505,6 +1502,7 @@ class SyncCenterController(QObject):
         playlist_provider: Callable[[], Iterable[object]],
         playlist_creator: Callable[[str], int],
         dialog_parent: QWidget,
+        download_folder_provider: Callable[[object], str | None] | None = None,
     ) -> None:
         super().__init__(dialog_parent)
         self.widget = widget
@@ -1514,6 +1512,7 @@ class SyncCenterController(QObject):
         self.playlist_provider = playlist_provider
         self.playlist_creator = playlist_creator
         self.dialog_parent = dialog_parent
+        self.download_folder_provider = download_folder_provider
         self.worker: MultiSourceSyncWorker | None = None
         self._activity_by_source: dict[int, list[str]] = {}
 
@@ -1544,6 +1543,8 @@ class SyncCenterController(QObject):
             view = replace(
                 view,
                 destination_playlist_name=names.get(view.destination_playlist_id or -1),
+                download_folder=(self.download_folder_provider(source)
+                                 if self.download_folder_provider else None),
                 unresolved_failure_count=_integer(
                     self.source_service.unresolved_failure_count(view.id)
                 ),
@@ -1596,6 +1597,8 @@ class SyncCenterController(QObject):
                     destination_playlist_name=self._playlist_names().get(
                         view.destination_playlist_id or -1
                     ),
+                    download_folder=(self.download_folder_provider(source)
+                                     if self.download_folder_provider else None),
                     unresolved_failure_count=_integer(
                         self.source_service.unresolved_failure_count(source_id)
                     ),

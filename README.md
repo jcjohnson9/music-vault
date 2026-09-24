@@ -69,9 +69,15 @@ navigation do not start synchronization or metadata-provider work.
 
 Right-click a song and choose **Show in Folder** to open its containing folder
 in File Explorer (also available in playlist, album, and artist track views).
-Saved YouTube sources keep separate stable-ID download folders; renaming a
-playlist does not move music. A track shared by sources retains one canonical
-file. Showing a folder never moves files, edits metadata, or starts playback.
+New downloads from saved YouTube sources use separate playlist-named folders
+directly inside the configured downloads folder. A folder is assigned from the
+remote playlist title on first sync and stays bound to that source across
+single-source and multi-source syncs. Conflicting or unsafe names get a safe
+identity suffix; renaming a playlist does not silently move existing music.
+A track shared by sources retains one canonical file and all its memberships.
+Existing legacy folders are not moved by sync; relocating them requires an
+explicit backed-up path update. Showing a folder never moves files, edits
+metadata, or starts playback.
 
 Windows taskbar Previous / Play-Pause / Next and the Windows media surface use
 the same player and captured queue context. Native Play/Pause never starts an

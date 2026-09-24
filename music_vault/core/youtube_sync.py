@@ -180,6 +180,9 @@ class YouTubeSyncConfig:
     acquisition_circuit: AcquisitionCircuitBreaker | None = field(
         default=None, repr=False, compare=False
     )
+    source_destination_resolver: Callable[[str, str], Path] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 def scan_existing_downloads(
@@ -340,7 +343,11 @@ class AuthorizedYouTubePlaylistSyncer:
         return found
 
     def _download_destination(self, playlist_title: str, playlist_id: str) -> Path:
-        configured = self.config.source_destination_dir
+        configured = (
+            self.config.source_destination_resolver(playlist_title, playlist_id)
+            if self.config.source_destination_resolver is not None
+            else self.config.source_destination_dir
+        )
         if configured is None:
             return playlist_output_directory(
                 self.config.output_dir, playlist_title, playlist_id
@@ -827,6 +834,8 @@ class AuthorizedYouTubePlaylistSyncer:
             stage = AcquisitionStage.ENUMERATION
             playlist_id = self._playlist_id()
             playlist_id, playlist_title, entries = self._extract_playlist_entries_via_api()
+            if self.config.source_destination_resolver is not None:
+                self._download_destination(playlist_title, playlist_id)
             snapshot = self._snapshot_from_entries(playlist_id, playlist_title, entries)
         except Exception as exc:
             diagnostic = classify_acquisition_error(exc, stage)

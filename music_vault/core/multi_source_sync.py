@@ -22,7 +22,7 @@ from .audio_quality_config import (
 from .ffmpeg import discover_ffmpeg
 from .importer import ImportSourceContext, import_file
 from .paths import youtube_download_archive_path
-from .safety import sanitize_error_text
+from .safety import safe_playlist_component, sanitize_error_text
 from .sync_result import (
     MultiSourceSyncResult,
     PlaylistSnapshot,
@@ -32,6 +32,7 @@ from .sync_result import (
     utc_now,
 )
 from .sync_sources import SyncSource, SyncSourceError, SyncSourceService
+from .source_download_folders import SourceDownloadFolders
 from .youtube_sync import (
     AuthorizedYouTubePlaylistSyncer,
     YouTubeSyncConfig,
@@ -100,7 +101,7 @@ class MultiSourceSyncOrchestrator:
     ) -> None:
         self.db = db
         self.conn: sqlite3.Connection = db.conn
-        self.download_root = Path(download_root).expanduser().resolve()
+        self.download_root = SourceDownloadFolders(db, download_root).root
         self.archive_file = Path(archive_file or youtube_download_archive_path())
         # Retain the former setting for source compatibility while all new
         # acquisitions use the explicit, honest quality-profile contract.
@@ -323,7 +324,17 @@ class MultiSourceSyncOrchestrator:
         valid_database_ids: set[str],
         acquisition_evidence: dict[str, _AcquisitionEvidence],
     ) -> SyncResult:
-        source_destination = self.download_root / "sources" / source.storage_key
+        folders = SourceDownloadFolders(self.db, self.download_root)
+        # The real provider resolves after remote enumeration, before media
+        # acquisition. The path remains available to older synthetic adapters.
+        source_destination = folders.get(source) or self.download_root / safe_playlist_component(
+            source.remote_title or source.display_label, source.external_id
+        )
+
+        def resolve_destination(title: str, playlist_id: str) -> Path:
+            if playlist_id != source.external_id:
+                raise ValueError("The provider returned a different playlist identity.")
+            return folders.resolve(source, title)
         source_profile = normalize_source_download_quality_profile(
             source.download_quality_profile
         )
@@ -341,6 +352,7 @@ class MultiSourceSyncOrchestrator:
             existing_video_ids=frozenset(valid_database_ids),
             ffmpeg_location=self.ffmpeg_location,
             source_destination_dir=source_destination,
+            source_destination_resolver=resolve_destination,
             saved_source_id=source.id,
             source_label=source.display_label,
             # Keep the legacy explicit-index sentinel for older provider

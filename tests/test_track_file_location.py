@@ -120,3 +120,14 @@ def test_right_click_empty_space_does_not_create_menu(isolated_ui_window, monkey
     fixture = isolated_ui_window
     monkeypatch.setattr(fixture.app_module, "QMenu", lambda *_: pytest.fail("no track menu"))
     fixture.window.open_song_context_menu(QPoint(0, -10))
+
+
+@pytest.mark.parametrize("error", [OSError("unavailable"), ValueError("invalid")])
+def test_source_folder_display_tolerates_unavailable_root(isolated_ui_window, monkeypatch, error):
+    fixture = isolated_ui_window
+    def unavailable(*_args):
+        raise error
+    monkeypatch.setattr(fixture.app_module, "SourceDownloadFolders", unavailable)
+    assert fixture.window.saved_source_download_folder(None) == (
+        "Unavailable — check the download folder in Settings"
+    )

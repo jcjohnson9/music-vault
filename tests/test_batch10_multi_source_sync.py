@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -51,6 +52,13 @@ class SyntheticSyncer:
                 playlist_id=snapshot.playlist_id,
                 saved_source_id=self.config.saved_source_id,
                 snapshot=snapshot,
+            )
+        if self.config.source_destination_resolver is not None:
+            self.config = replace(
+                self.config,
+                source_destination_dir=self.config.source_destination_resolver(
+                    snapshot.playlist_title, snapshot.playlist_id
+                ),
             )
         result = SyncResult(
             "complete",
@@ -219,6 +227,41 @@ def test_sequential_sync_reuses_cross_source_identity_and_keeps_occurrences(tmp_
     assert playlist_b_ids == [
         db.canonical_track_id("youtube", VIDEOS[key]) for key in ("B", "D")
     ]
+    db.close()
+
+
+def test_named_folders_survive_alternating_and_multiple_source_sync(tmp_path):
+    db, service, sources, playlists, _ = _fixture(tmp_path)
+    a, b, _ = sources
+    snapshots = {
+        a.id: PlaylistSnapshot.completed(a.external_id, "Home Trip", [_item("a1", "A", 0)]),
+        b.id: PlaylistSnapshot.completed(b.external_id, "Second Trip", [_item("b1", "B", 0), _item("b2", "A", 1)]),
+    }
+    calls = []
+    root = tmp_path / "downloads"
+    orchestrator = MultiSourceSyncOrchestrator(
+        db, root, archive_file=tmp_path / "archive.txt", source_service=service,
+        syncer_factory=lambda config, report: SyntheticSyncer(config, report, snapshots, calls),
+        importer=_import,
+    )
+    assert orchestrator.sync_selected([a.id]).status == "complete"
+    assert orchestrator.sync_selected([b.id]).status == "complete"
+    snapshots[a.id] = PlaylistSnapshot.completed(
+        a.external_id, "Home Trip", [_item("a1", "A", 0), _item("a2", "C", 1)]
+    )
+    snapshots[b.id] = PlaylistSnapshot.completed(
+        b.external_id, "Second Trip", [_item("b1", "B", 0), _item("b2", "A", 1), _item("b3", "D", 2)]
+    )
+    assert orchestrator.sync_selected([a.id, b.id]).status == "complete"
+    paths = {row["source_video_id"]: Path(row["path"]) for row in db.conn.execute(
+        "SELECT path, source_video_id FROM tracks WHERE source_kind='youtube'"
+    )}
+    assert paths[VIDEOS["A"]].parent == paths[VIDEOS["C"]].parent == root / "Home Trip"
+    assert paths[VIDEOS["B"]].parent == paths[VIDEOS["D"]].parent == root / "Second Trip"
+    assert len(calls) == 4
+    shared = db.canonical_track_id("youtube", VIDEOS["A"])
+    assert all(shared in [row["id"] for row in db.get_playlist_tracks(pid)] for pid in playlists)
+    assert not (root / "sources").exists()
     db.close()
 
 
